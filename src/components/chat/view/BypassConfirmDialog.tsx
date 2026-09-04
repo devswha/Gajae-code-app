@@ -18,7 +18,7 @@ export default function BypassConfirmDialog({ open, onCancel, onConfirm }: Bypas
   const { t } = useTranslation('chat');
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next) onCancel(); }}>
-      <DialogContent className="max-w-md p-5" data-testid="bypass-confirm">
+      <DialogContent className="max-w-md animate-none p-5" data-testid="bypass-confirm">
         <DialogTitle className="not-sr-only flex items-center gap-2 text-base font-semibold text-destructive">
           <TriangleAlert className="size-4" aria-hidden />
           {t('permissionMode.bypassConfirm.title')}

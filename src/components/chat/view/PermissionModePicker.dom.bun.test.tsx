@@ -58,6 +58,7 @@ test('the first switch to bypass asks for confirmation and only then reports it,
 
   const dialog = await screen.findByRole('dialog');
   assert.match(dialog.textContent ?? '', /run any command without asking/);
+  assert.match(dialog.className, /animate-none/, 'the bypass warning opens at its final centered position');
   assert.deepEqual(updates, [], 'nothing is sent before the user confirms');
 
   fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
