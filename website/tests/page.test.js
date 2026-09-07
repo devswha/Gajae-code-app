@@ -25,8 +25,7 @@ test('landing page exposes the pinned GitHub download buttons', () => {
     assert.ok(html.includes(`href="${DOWNLOADS[key].href}"`), `${key} download is linked`);
     assert.ok(html.includes(`href="${DOWNLOADS[key].checksumHref}"`), `${key} checksum is linked`);
   }
-  assert.match(html, /Download for macOS/);
-  assert.match(html, /Download for Linux/);
+  assert.match(html, /Download app/);
   assert.equal(html.includes('Windows용 내려받기'), false);
   assert.equal(html.includes('Download for Windows'), false);
   assert.equal(html.includes('/latest/download/'), false);
@@ -40,11 +39,17 @@ test('introduces the desktop app for Gajae Code without positioning it as a sepa
   assert.ok(hero.includes(`href="${GAJAE_CODE_URL}">About Gajae Code</a>`));
 });
 
-test('makes the two desktop platforms primary and source and server setup secondary', () => {
+test('groups all desktop formats in one download disclosure and keeps source and server secondary', () => {
   const hero = section(renderLandingPage(), 'top');
   const primary = hero.slice(hero.indexOf('class="cta-row"'), hero.indexOf('class="hero-links"'));
+  assert.equal([...hero.matchAll(/<button\b/g)].length, 1);
+  assert.match(primary, /aria-expanded="false" aria-controls="desktop-download-options"/);
+  assert.match(primary, /id="desktop-download-options" data-download-panel hidden/);
   assert.ok(primary.includes(`href="${DOWNLOADS.macosArm64.href}"`));
-  assert.match(primary, /href="#linux-download"/);
+  assert.ok(primary.includes(`href="${DOWNLOADS.linuxDeb.href}"`));
+  assert.ok(primary.includes(`href="${DOWNLOADS.linuxAppImage.href}"`));
+  assert.match(primary, /Installation &amp; checksums/);
+  assert.match(primary, /Previous releases/);
   assert.equal(primary.includes(DOWNLOADS.linuxServer.href), false);
   assert.equal(primary.includes(REPOSITORY_URL + '"'), false);
   assert.equal(hero.includes('button-icon'), false);
@@ -86,7 +91,7 @@ test('every in-page link and accessibility reference has a unique target', () =>
   const html = renderLandingPage();
   const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
   assert.equal(new Set(ids).size, ids.length);
-  for (const [, target] of html.matchAll(/(?:href="#|aria-describedby="|aria-labelledby=")([^"]+)"/g)) {
+  for (const [, target] of html.matchAll(/(?:href="#|aria-describedby="|aria-labelledby="|aria-controls=")([^"]+)"/g)) {
     assert.ok(ids.includes(target), `#${target} exists`);
   }
   assert.match(html, /id="linux-download" tabindex="-1"/);

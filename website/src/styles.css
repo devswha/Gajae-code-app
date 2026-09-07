@@ -41,6 +41,7 @@ a {
 }
 
 a:focus-visible,
+button:focus-visible,
 summary:focus-visible {
   outline: 2px solid var(--foreground);
   outline-offset: 4px;
@@ -57,7 +58,8 @@ img {
   height: auto;
 }
 
-summary {
+summary,
+button {
   font: inherit;
 }
 
@@ -134,21 +136,11 @@ summary {
 }
 
 .cta-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1.25rem 2rem;
   margin-top: 1.5rem;
 }
 
-.platform-cta {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.5rem;
-}
-
 .platform-note {
-  margin: 0;
+  margin: 0.75rem 0 0;
   color: var(--secondary);
   font-size: 0.75rem;
 }
@@ -165,6 +157,7 @@ summary {
   border-radius: 0.5rem;
   font-size: 0.875rem;
   font-weight: 500;
+  cursor: pointer;
   transition:
     background 150ms ease,
     border-color 150ms ease;
@@ -196,6 +189,116 @@ summary {
   flex-wrap: wrap;
   gap: 0.5rem 1.25rem;
   margin-top: 1.25rem;
+}
+
+.download-picker {
+  position: relative;
+  width: 22rem;
+  max-width: 100%;
+}
+
+.download-toggle {
+  gap: 1.5rem;
+}
+
+.download-chevron {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+}
+
+.download-toggle[aria-expanded="true"] .download-chevron {
+  transform: translateY(2px) rotate(225deg);
+}
+
+.download-panel {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 0.65rem);
+  left: 0;
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+}
+
+.download-panel-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  color: var(--secondary);
+  font-size: 0.75rem;
+}
+
+.download-options {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.download-choice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 4rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: 0.5rem;
+}
+
+.download-choice:hover,
+.download-choice:focus-visible {
+  background: var(--background);
+}
+
+.download-choice:focus-visible {
+  outline-offset: -2px;
+}
+
+.download-label {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.download-detail {
+  color: var(--secondary);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.download-format {
+  flex-shrink: 0;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+}
+
+.download-panel-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.1rem 0.5rem;
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.download-panel-footer a {
+  display: flex;
+  align-items: center;
+  min-height: 2.25rem;
+  font-size: 0.75rem;
 }
 
 .product-overview {

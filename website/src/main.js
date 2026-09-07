@@ -1,5 +1,6 @@
 import './styles.css';
 import { renderLandingPage } from './page.js';
+import { initDownloadPicker } from './download-picker.js';
 
 function el(html) {
   const template = document.createElement('template');
@@ -8,3 +9,6 @@ function el(html) {
 }
 
 document.getElementById('app').replaceChildren(el(renderLandingPage()));
+const disposeDownloadPicker = initDownloadPicker(document);
+
+if (import.meta.hot) import.meta.hot.dispose(disposeDownloadPicker);

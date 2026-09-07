@@ -13,10 +13,6 @@ import {
   REPOSITORY_URL,
 } from './releases.js';
 
-function appleIcon() {
-  return `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg>`;
-}
-
 function faqItem(question, answer) {
   return `
     <details class="faq">
@@ -55,18 +51,41 @@ export function renderLandingPage() {
             Open projects, resume sessions, and review changes—all in one local workspace.
           </p>
           <div class="cta-row">
-            <div class="platform-cta">
-              <a class="button button-primary" href="${DOWNLOADS.macosArm64.href}" aria-describedby="macos-beta-notice">
-                ${appleIcon()}
-                Download for macOS
-              </a>
-              <p class="platform-note" id="macos-beta-notice">Apple Silicon · macOS 11+ · Notarized by Apple</p>
-            </div>
-            <div class="platform-cta">
-              <a class="button button-secondary" href="#linux-download" aria-describedby="linux-desktop-notice">Download for Linux</a>
-              <p class="platform-note" id="linux-desktop-notice">x86_64 · .deb / AppImage</p>
+            <div class="download-picker" data-download-picker>
+              <button class="button button-primary download-toggle" type="button" data-download-toggle aria-expanded="false" aria-controls="desktop-download-options" aria-describedby="desktop-platforms">
+                Download app
+                <span class="download-chevron" aria-hidden="true"></span>
+              </button>
+              <div class="download-panel" id="desktop-download-options" data-download-panel hidden>
+                <p class="download-panel-heading">Desktop app <span>v${RELEASE.version}</span></p>
+                <ul class="download-options">
+                  <li>
+                    <a class="download-choice" href="${DOWNLOADS.macosArm64.href}" aria-describedby="macos-beta-notice">
+                      <span class="download-label"><span>macOS</span><span class="download-detail">Apple Silicon · macOS 11+</span></span>
+                      <span class="download-format">DMG</span>
+                    </a>
+                  </li>
+                  <li>
+                    <a class="download-choice" href="${DOWNLOADS.linuxDeb.href}">
+                      <span class="download-label"><span>Linux</span><span class="download-detail">Ubuntu 22.04 / 24.04 · x86_64</span></span>
+                      <span class="download-format">DEB</span>
+                    </a>
+                  </li>
+                  <li>
+                    <a class="download-choice" href="${DOWNLOADS.linuxAppImage.href}">
+                      <span class="download-label"><span>Linux</span><span class="download-detail">x86_64</span></span>
+                      <span class="download-format">AppImage</span>
+                    </a>
+                  </li>
+                </ul>
+                <div class="download-panel-footer">
+                  <a class="quiet-link" href="#download">Installation &amp; checksums</a>
+                  <a class="quiet-link" href="${RELEASES_URL}">Previous releases</a>
+                </div>
+              </div>
             </div>
           </div>
+          <p class="platform-note" id="desktop-platforms">macOS (Apple Silicon) · Linux (x86_64)</p>
           <div class="hero-links">
             <a class="quiet-link" href="${GAJAE_CODE_URL}">About Gajae Code</a>
             <a class="quiet-link" href="${REPOSITORY_URL}">Source code</a>
@@ -112,7 +131,7 @@ export function renderLandingPage() {
             <div class="download-row">
               <div>
                 <h3>macOS</h3>
-                <p>Apple Silicon · macOS 11+</p>
+                <p id="macos-beta-notice">Apple Silicon · macOS 11+ · Notarized by Apple</p>
                 <a class="quiet-link" href="#macos-install">First-launch instructions</a>
               </div>
               <div class="download-actions">
