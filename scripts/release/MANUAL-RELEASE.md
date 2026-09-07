@@ -39,8 +39,11 @@ Existing assets are never removed or replaced to make the set pass.
 
 ## Verify the local DMG before parent-owned smoke/GUI acceptance
 
-From the frozen release checkout, after signing/notarization/stapling are
-complete, use the existing helper with the explicit manual flag:
+After signing/notarization/stapling are complete, use the helper with the
+explicit manual flag. A separately versioned verifier-only correction does
+not change the frozen app/Linux source or release-tag target. For beta.10 those
+remain `a6b06a25bdcc8fc7e4980175fc757d93b28becc5`; record the verifier revision
+separately, and read identity/config/manifest pins from that frozen source.
 
 ```js
 import { createHash } from 'node:crypto';
@@ -49,7 +52,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { verifyMacosRelease } from './scripts/release/local-release-macos.mjs';
 
-// Verify HEAD and these source files against the frozen commit first.
+// Verify these source files against the frozen release commit first;
+// verifier-only HEAD may differ and must be recorded separately.
 const source = JSON.parse(await readFile('package.json', 'utf8'));
 const config = JSON.parse(await readFile('src-tauri/tauri.conf.json', 'utf8'));
 const runtimeManifestSha256 = createHash('sha256')
@@ -65,7 +69,8 @@ const verified = await verifyMacosRelease({
   manualDisabled: true,
   runtimeManifestSha256,
 });
-console.log(JSON.stringify({ root, copiedApp: verified.copiedApp, buildInfo: verified.buildInfo }, null, 2));
+console.log(JSON.stringify({ root, copiedApp: verified.copiedApp,
+  buildInfo: verified.buildInfo, deployment: verified.deployment }, null, 2));
 ```
 
 Do not pass `updaterArchivePath` with `manualDisabled: true`; even a null or
@@ -76,8 +81,19 @@ The helper verifies the DMG and both mounted/copied apps: expected Developer ID
 team, hardened app signatures, staples, Gatekeeper, package and desktop versions,
 arm64 executables, and the pinned macOS minimum. Every inventoried regular file
 is checked for Mach-O magic (including universal binaries and extensionless
-helpers); every discovered binary must have supported macOS loader stamps no
-newer than the declared minimum. Named required runtimes/modules remain required.
+helpers). macOS binaries must have supported macOS loader stamps no newer than
+the declared minimum, including any MACOS binary placed in an iOS folder.
+The sole non-Mac resource exception is beneath the canonical
+`Contents/Resources/resources/server-payload/node_modules/` path:
+`bare-*/prebuilds/ios-(arm64|x64)(-simulator)?/*.bare`. Each discovered resource
+is still inspected with vtool and must have structurally valid, uniform `IOS`
+stamps for device folders or `IOSSIMULATOR` stamps for simulator folders.
+Unknown platforms, malformed/duplicate/mixed evidence, mismatched folders and
+foreign binaries anywhere else fail. Named required runtimes/modules remain required.
+`deployment.nonMacResourceCount` and `deployment.nonMacResources` record the
+inspected exclusions (path, platform and minimum versions), separately from
+macOS-only `deployment.stamps` and `maximumStampedMinimumSystemVersion`.
+These resource exclusions are not macOS runtime qualification or a signature exemption.
 Full mounted/copy inventories must match in bytes, modes and internal symlinks.
 
 Only **after all copied-app validation** does the helper execute

@@ -18,6 +18,30 @@ import { createUpdaterArchive, inventoryApp } from './updater-archive.mjs';
 
 const teamId = 'AB12345678';
 const signature = `Authority=Developer ID Application: Fixture (${teamId})\nTeamIdentifier=${teamId}\nCodeDirectory v=20500 size=400 flags=0x10000(runtime) hashes=12\n`;
+const payloadModules = 'Contents/Resources/resources/server-payload/node_modules';
+const simulatorResource = `${payloadModules}/bare-fs/prebuilds/ios-arm64-simulator/bare-fs.bare`;
+
+function vtoolStamp(platform, minimum = '14.0', header = 'x:') {
+  return `${header}\nLoad command 9\n      cmd LC_BUILD_VERSION\n  cmdsize 32\n platform ${platform}\n    minos ${minimum}\n      sdk 17.5\n   ntools 1\n     tool LD\n  version 1053.12\n`;
+}
+
+async function addMachO(state, app, relativePath, output) {
+  const path = join(app, relativePath);
+  await mkdir(join(path, '..'), { recursive: true });
+  await writeFile(path, Buffer.from('cffaedfe00000000', 'hex'), { mode: 0o600 });
+  state.vtoolOutputByPath ??= new Map();
+  state.vtoolOutputByPath.set(path, output);
+  return path;
+}
+
+async function deploymentFixture(t) {
+  const state = await fixture(t);
+  await state.run('hdiutil', ['attach']);
+  const app = join(state.input.root, 'mount/Gajae Code App.app');
+  return { state, app, verify: async () => verifyMacosDeploymentFloor({
+    app, minimumSystemVersion: '13.0', inventory: await inventoryApp(app),
+  }, { run: state.run }) };
+}
 
 async function fixture(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'gajae-macos-validation-test-')));
@@ -60,6 +84,7 @@ async function fixture(t) {
         await mkdir(join(file, '..'), { recursive: true });
         await writeFile(file, 'Mach-O fixture');
       }
+      if (state.afterMount) await state.afterMount(app);
     }
     if (program === 'ditto') {
       await cp(args[0], args[1], { recursive: true });
@@ -86,6 +111,7 @@ async function fixture(t) {
     if (program === 'codesign' && args[0] === '--display') return { stdout: '', stderr: state.signature ?? signature };
     if (program === 'spctl') return { stdout: '', stderr: `${args.at(-1)}: accepted\nsource=Notarized Developer ID\n` };
     if (program === 'xcrun' && args[0] === 'vtool') {
+      if (state.vtoolOutputByPath?.has(args.at(-1))) return { stdout: state.vtoolOutputByPath.get(args.at(-1)), stderr: '' };
       if (state.vtoolOutput !== undefined) return { stdout: state.vtoolOutput, stderr: '' };
       const minimum = state.vtoolMinimumByPath?.get(args.at(-1)) ?? state.vtoolMinimum ?? '13.0';
       return {
@@ -196,6 +222,135 @@ test('deployment floor includes dylib and shared-object runtime modules', async 
   }, { run: state.run }), /libfixture\.dylib|requires macOS 14\.0/);
 });
 
+test('only matching vendor iOS bare prebuilds are reported separately from qualified macOS stamps', async t => {
+  const { state, app, verify } = await deploymentFixture(t);
+  const expected = [];
+  for (const arch of ['arm64', 'x64']) {
+    for (const simulator of [false, true]) {
+      const path = `${payloadModules}/bare-fs/prebuilds/ios-${arch}${simulator ? '-simulator' : ''}/bare-fs.bare`;
+      const platform = simulator ? 'IOSSIMULATOR' : 'IOS';
+      await addMachO(state, app, path, vtoolStamp(platform));
+      expected.push({ path: `Gajae Code App.app/${path}`, platform, minimumSystemVersions: ['14.0'] });
+    }
+  }
+  const result = await verify();
+  assert.equal(result.nonMacResourceCount, 4);
+  assert.deepEqual(result.nonMacResources, expected.sort((a, b) => a.path < b.path ? -1 : 1));
+  assert.equal(result.maximumStampedMinimumSystemVersion, '13.0');
+  assert.equal(result.stamps.length, 7);
+  assert.ok(result.stamps.every(stamp => !stamp.path.endsWith('.bare') && stamp.minimumSystemVersion === '13.0'));
+  assert.equal(state.calls.filter(call => call.args[0] === 'vtool').length, 11);
+});
+
+test('uniform universal slices count as one non-Mac resource; public parser remains strictly MACOS', async t => {
+  const { state, app, verify } = await deploymentFixture(t);
+  const output = vtoolStamp('IOSSIMULATOR', '14.0', 'x (architecture arm64):')
+    + vtoolStamp('IOSSIMULATOR', '15.0', 'x (architecture x86_64):');
+  await addMachO(state, app, simulatorResource, output);
+  const result = await verify();
+  assert.equal(result.nonMacResourceCount, 1);
+  assert.deepEqual(result.nonMacResources[0].minimumSystemVersions, ['14.0', '15.0']);
+  for (const platform of ['IOS', 'IOSSIMULATOR', 'TVOS', 'UNKNOWN']) {
+    assert.throws(() => parseVtoolBuildMinimums(vtoolStamp(platform)), /unsupported/);
+  }
+  assert.throws(() => parseVtoolBuildMinimums(output, 'resource', { allowForeign: true }), /unsupported/);
+  assert.deepEqual(parseVtoolBuildMinimums(vtoolStamp('MACOS', '12.0', 'x (architecture arm64):')
+    + vtoolStamp('MACOS', '13.0', 'x (architecture x86_64):')), ['12.0', '13.0']);
+});
+
+test('foreign binaries outside the exact canonical resource path fail closed', async t => {
+  for (const path of [
+    'Contents/Resources/node_modules/bare-fs/prebuilds/ios-arm64-simulator/bare-fs.bare',
+    'Contents/Resources/server-payload/node_modules/bare-fs/prebuilds/ios-arm64-simulator/bare-fs.bare',
+    `${payloadModules}/other/prebuilds/ios-arm64-simulator/bare-fs.bare`,
+    `${payloadModules}/@vendor/bare-fs/prebuilds/ios-arm64-simulator/bare-fs.bare`,
+    `${payloadModules}/nested/node_modules/bare-fs/prebuilds/ios-arm64-simulator/bare-fs.bare`,
+    `${payloadModules}/bare-fs/prebuilds/darwin-arm64/bare-fs.bare`,
+    `${payloadModules}/bare-fs/prebuilds/ios-armv7-simulator/bare-fs.bare`,
+    `${payloadModules}/bare-fs/prebuilds/ios-arm64-simulator/nested/bare-fs.bare`,
+    `${payloadModules}/bare-fs/prebuilds/ios-arm64-simulator/bare-fs.node`,
+    `${simulatorResource}.backup`,
+    'Contents/Resources/unlisted-helper',
+  ]) {
+    await t.test(path, async t => {
+      const { state, app, verify } = await deploymentFixture(t);
+      await addMachO(state, app, path, vtoolStamp('IOSSIMULATOR'));
+      await assert.rejects(verify(), /unsupported foreign platform/);
+    });
+  }
+});
+
+test('iOS paths never exempt MACOS binaries from the declared macOS 13 floor', async t => {
+  const { state, app, verify } = await deploymentFixture(t);
+  const path = await addMachO(state, app, simulatorResource, vtoolStamp('MACOS'));
+  await assert.rejects(verify(), /bare-fs\.bare requires macOS 14\.0/);
+  state.vtoolOutputByPath.set(path, vtoolStamp('MACOS', '13.0'));
+  const result = await verify();
+  assert.equal(result.nonMacResourceCount, 0);
+  assert.deepEqual(result.nonMacResources, []);
+  assert.ok(result.stamps.some(stamp => stamp.path.endsWith(simulatorResource)));
+});
+
+test('iOS resources reject unexpected, malformed, duplicate and mixed platform evidence', async t => {
+  const valid = vtoolStamp('IOSSIMULATOR');
+  for (const [name, output] of [
+    ['device stamp in simulator folder', vtoolStamp('IOS')],
+    ['unknown platform', vtoolStamp('UNKNOWN')],
+    ['other foreign platform', vtoolStamp('TVOS')],
+    ['missing platform', valid.replace(' platform IOSSIMULATOR\n', '')],
+    ['missing minimum', valid.replace('    minos 14.0\n', '')],
+    ['invalid minimum', valid.replace('minos 14.0', 'minos 14.0garbage')],
+    ['unbounded minimum', valid.replace('minos 14.0', 'minos 1000.0')],
+    ['noncanonical minimum', valid.replace('minos 14.0', 'minos 014.0')],
+    ['duplicate platform', `${valid} platform IOSSIMULATOR\n`],
+    ['duplicate minimum', `${valid} minos 14.0\n`],
+    ['malformed extra platform', `${valid} platform MACOS garbage\n`],
+    ['malformed extra minimum', `${valid} minos invalid\n`],
+    ['orphan evidence', ` platform IOSSIMULATOR\n${valid}`],
+    ['missing load-command boundary', valid.replace('Load command 9\n', '')],
+    ['missing command', valid.replace('      cmd LC_BUILD_VERSION\n', '')],
+    ['duplicate command', `${valid} cmd LC_BUILD_VERSION\n`],
+    ['duplicate stamp in slice', `${valid}Load command 10\n cmd LC_BUILD_VERSION\n platform IOSSIMULATOR\n minos 14.0\n`],
+    ['duplicate thin slice', valid + valid],
+    ['duplicate architecture', vtoolStamp('IOSSIMULATOR', '14.0', 'x (architecture arm64):').repeat(2)],
+    ['truncated second slice', `${vtoolStamp('IOSSIMULATOR', '14.0', 'x (architecture arm64):')}x (architecture x86_64):\n`],
+    ['mixed iOS platforms', vtoolStamp('IOSSIMULATOR', '14.0', 'x (architecture arm64):')
+      + vtoolStamp('IOS', '14.0', 'x (architecture x86_64):')],
+    ['mixed Mac and iOS platforms', vtoolStamp('MACOS', '13.0', 'x (architecture arm64):')
+      + vtoolStamp('IOSSIMULATOR', '14.0', 'x (architecture x86_64):')],
+    ['unsupported legacy command', valid.replace('LC_BUILD_VERSION', 'LC_VERSION_MIN_IPHONEOS')],
+    ['unexpected text', `${valid}not vtool output\n`],
+  ]) {
+    await t.test(name, async t => {
+      const { state, app, verify } = await deploymentFixture(t);
+      await addMachO(state, app, simulatorResource, output);
+      await assert.rejects(verify(), /evidence|vtool|unsupported|bounded|mixed/);
+    });
+  }
+  const { state, app, verify } = await deploymentFixture(t);
+  await addMachO(state, app, simulatorResource.replace('-simulator', ''), valid);
+  await assert.rejects(verify(), /unsupported foreign platform/);
+});
+
+test('required executables and runtime modules never qualify as non-Mac resources', async t => {
+  for (const path of [
+    'Contents/MacOS/gajae-app-desktop',
+    'Contents/MacOS/gajae-app-server',
+    'Contents/Resources/resources/server-payload/dist-native/bun',
+    'Contents/Resources/resources/server-payload/dist-native/gajae-core',
+    `${payloadModules}/test-addon/addon.node`,
+    `${payloadModules}/@vscode/ripgrep/bin/rg`,
+    `${payloadModules}/node-pty/build/Release/spawn-helper`,
+  ]) {
+    await t.test(path, async t => {
+      const { state, app, verify } = await deploymentFixture(t);
+      await addMachO(state, app, simulatorResource, vtoolStamp('IOSSIMULATOR'));
+      await addMachO(state, app, path, vtoolStamp('IOS'));
+      await assert.rejects(verify(), /unsupported foreign platform/);
+    });
+  }
+});
+
 test('deployment floor rejects vtool diagnostics and malformed command results', async t => {
   const state = await fixture(t);
   const app = join(state.input.root, 'mount/Gajae Code App.app');
@@ -301,6 +456,8 @@ test('explicit manual mode validates DMG and both apps before the bounded copied
   assert.equal(result.updateMode, 'disabled');
   assert.equal(result.buildInfo.updateMode, 'disabled');
   assert.equal(result.buildInfo.runtimeManifestSha256, state.input.runtimeManifestSha256);
+  assert.equal(result.deployment.nonMacResourceCount, 0);
+  assert.equal(result.deployment.maximumStampedMinimumSystemVersion, '13.0');
   assert.equal(result.extractedApp, undefined);
   assert.ok((await readFile(join(result.copiedApp, 'Contents/MacOS/gajae-app-desktop'))).length > 0);
   const diagnosticIndex = state.calls.findIndex(call => call.args.includes('--desktop-build-info'));
@@ -315,6 +472,23 @@ test('explicit manual mode validates DMG and both apps before the bounded copied
   assert.equal(state.calls.filter(call => call.args[0] === '--desktop-build-info').length, 1);
   assert.equal(state.calls.at(-1).args[0], 'detach');
   assert.ok(!state.calls.some(call => call.args.some(arg => /--sign|--qa|--browser|\.app\.tar\.gz/.test(arg))));
+});
+
+test('manual release exposes inspected resource evidence from the validated copy', async t => {
+  const state = await manualFixture(t);
+  state.afterMount = async app => {
+    const output = vtoolStamp('IOSSIMULATOR');
+    await addMachO(state, app, simulatorResource, output);
+    state.vtoolOutputByPath.set(join(state.input.root, 'copy/Gajae Code App.app', simulatorResource), output);
+  };
+  const result = await state.execute();
+  assert.equal(result.deployment.nonMacResourceCount, 1);
+  assert.deepEqual(result.deployment.nonMacResources, [{
+    path: `Gajae Code App.app/${simulatorResource}`, platform: 'IOSSIMULATOR', minimumSystemVersions: ['14.0'],
+  }]);
+  assert.equal(result.deployment.maximumStampedMinimumSystemVersion, '13.0');
+  const resourceChecks = state.calls.filter(call => call.args[0] === 'vtool' && call.args.at(-1).endsWith(simulatorResource));
+  assert.equal(resourceChecks.length, 2);
 });
 
 test('manual flag is explicit, mutually exclusive with updater archives, and requires private root and source hash', async t => {
