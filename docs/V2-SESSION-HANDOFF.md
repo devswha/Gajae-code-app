@@ -33,6 +33,9 @@ not changed. The older session records below are historical.
   under `src/components/chat/hooks/`. This source change is **not included in
   the published/installed beta.10** and requires a new build/release to reach
   that desktop installation.
+- The same unreleased UI follow-up also hides routine `Auto-approved …`
+  information notices in the chat projection. Raw records, permission policy,
+  approval controls, warnings and errors are unchanged.
 
 - **The v2 baseline is complete.** Server/backend/web MVP (Slices 0–4 + 6), the Tauri
   desktop shell (Slice 5 C1–C6), **and the C7 interactive GUI smoke** are all

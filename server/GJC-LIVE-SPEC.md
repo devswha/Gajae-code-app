@@ -206,7 +206,10 @@ method or frame changes; the policy travels inside existing payloads:
 - A call the policy covers (`bypass`, a tool on `allowAlways`, or a file
   mutation under `auto_edits`) is approved inside the worker and recorded once
   per tool per run as a `system_notice` ("Auto-approved bash (always allow)").
-  Nothing crosses to the host, so the run is never reported as awaiting input.
+  The browser omits these routine info lines when projecting chat rows; raw
+  records and permission handling are unchanged. Other info notices, warnings,
+  errors, and actual approval requests remain visible.
+  No permission request crosses to the host, so the run is never reported as awaiting input.
 - Any other gated call is an `ask.presented` event whose message is a
   `permission_request` with `requestId` prefixed `sdk-permission:`, the
   runtime's `toolName`, its `rawInput` as `input`, and a `context` naming the
