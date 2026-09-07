@@ -64,13 +64,6 @@
     "stopSpeaking": "停止",
     "loading": "載入中…"
   },
-  "sessionWorktree": {
-    "label": "執行位置",
-    "project": "專案",
-    "newWorktree": "新增工作樹",
-    "worktree": "工作樹",
-    "preparing": "正在準備工作樹"
-  },
   "input": {
     "placeholder": "請問 {{provider}}，使用 / 進行指令，或 @ 添加檔案…",
     "modelReasoning": {

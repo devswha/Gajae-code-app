@@ -85,6 +85,14 @@ function composer(props: ComposerProps) {
   return createElement(I18nextProvider, { i18n }, createElement(ChatComposer, props));
 }
 
+test('the chat toolbar does not expose a project or worktree selector', async () => {
+  await i18n.changeLanguage('en');
+  const view = render(composer(composerProps()));
+  assert.equal(view.queryByRole('combobox', { name: 'Run location' }), null);
+  assert.equal(view.queryByText('New worktree'), null);
+  assert.equal(view.queryByText('Project', { exact: true }), null);
+});
+
 function slot(container: HTMLElement, name: string) {
   const element = container.querySelector<HTMLElement>(`[data-slot="prompt-input${name ? `-${name}` : ''}"]`);
   assert.ok(element, `missing prompt input ${name || 'form'}`);
@@ -136,11 +144,11 @@ for (const language of ['en', 'ko']) {
   });
 }
 
-test('model and permission slots retain their widths as metadata loads beside a hidden hint', async () => {
+test('model and permission slots retain bounded sizing as metadata loads beside a hidden hint', async () => {
   await i18n.changeLanguage('en');
   const props = composerProps({ input: 'Draft message' });
   const view = render(composer({
-    ...props, modelOptions: [], modelPresetOptions: [], modelPresetsLoading: true, permissions: null,
+    ...props, modelPreset: 'default', modelOptions: [], modelPresetOptions: [], modelPresetsLoading: true, permissions: null,
   }));
   const tools = slot(view.container, 'tools');
   const model = within(tools).getByRole('button', { name: 'Model and reasoning settings' });
@@ -148,10 +156,13 @@ test('model and permission slots retain their widths as metadata loads beside a 
   const permissionSlot = tools.children[3];
   const skills = within(tools).getByRole('button', { name: english.input.skills.label });
 
-  assert.ok(modelSlot.classList.contains('w-40'));
-  assert.ok(modelSlot.classList.contains('sm:w-56'));
+  assert.ok(modelSlot.classList.contains('w-fit'));
   assert.ok(modelSlot.classList.contains('max-w-full'), 'model slot must fit a narrow tools row');
+  assert.ok(modelSlot.classList.contains('sm:max-w-56'));
+  assert.equal(modelSlot.classList.contains('w-40'), false);
+  assert.equal(modelSlot.classList.contains('sm:w-56'), false);
   assert.ok(modelSlot.classList.contains('shrink-0'));
+  assert.ok(model.querySelector('.w-24'), 'loading model slot must keep a visible skeleton width');
   assert.ok(permissionSlot.classList.contains('w-28'));
   assert.ok(permissionSlot.classList.contains('shrink-0'));
   assert.equal(permissionSlot.getAttribute('aria-hidden'), 'true');

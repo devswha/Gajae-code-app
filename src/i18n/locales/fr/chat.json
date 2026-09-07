@@ -64,13 +64,6 @@
     "stopSpeaking": "Arrêter",
     "loading": "Chargement…"
   },
-  "sessionWorktree": {
-    "label": "Dossier d’exécution",
-    "project": "Projet",
-    "newWorktree": "Nouveau worktree",
-    "worktree": "Worktree",
-    "preparing": "Préparation du worktree"
-  },
   "input": {
     "placeholder": "Demandez {{provider}}, utilisez / pour les commandes, ou @ pour ajouter des fichiers…",
     "modelReasoning": {

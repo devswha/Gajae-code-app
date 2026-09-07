@@ -42,8 +42,6 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   const { executionCwd, selectedProject, selectedSession, currentSessionId, gjcModel, reasoningEffort = 'default', isLoading, canAbortSession, tokenBudget, sendMessage, sendByCtrlEnter, onSessionProcessing, onSessionEstablished, onInputFocusChange, onCommandGateChange, onShowSettings, onLogin, scrollToBottom, addMessage, setIsUserScrolledUp, setPendingPermissionRequests } = args;
   const projectId = selectedProject?.projectId;
   const conversation = selectedSession?.id || currentSessionId || null;
-  const [useWorktree, setUseWorktree] = useState(false);
-  useEffect(() => { setUseWorktree(false); }, [projectId, conversation]);
   const [input, setInput] = useState(() => projectId && typeof window !== 'undefined' ? safeLocalStorage.getItem(draftInputKey(projectId, conversation)) || '' : '');
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
   const [uploadingImages, setUploadingImages] = useState<Map<string, number>>(new Map());
@@ -127,7 +125,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     if (!isCurrent()) return null;
     const project = target ? await descend(target) : selectedProject;
     if (!isCurrent()) return null;
-    const response = await authenticatedFetch(useWorktree ? '/api/providers/worktree-sessions' : '/api/providers/sessions', { method: 'POST', body: JSON.stringify({ provider: 'gjc', projectPath: project?.fullPath || project?.path || '' }) });
+    const response = await authenticatedFetch('/api/providers/sessions', { method: 'POST', body: JSON.stringify({ provider: 'gjc', projectPath: project?.fullPath || project?.path || '' }) });
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(typeof body.error === 'string' ? body.error : body.error?.message ?? `Failed to create session (${response.status})`);
@@ -135,7 +133,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     id = (await response.json())?.data?.sessionId || null;
     if (!id) throw new Error('no session id returned.');
     return { id, context: { provider: 'gjc', project: project!, summary } };
-  }, [currentSessionId, descend, resolveForSend, selectedProject, selectedSession, useWorktree]);
+  }, [currentSessionId, descend, resolveForSend, selectedProject, selectedSession]);
 
   const handleSubmit = useCallback(async (event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>, queued?: QueuedDraft) => {
     event.preventDefault(); const text = queued?.content ?? inputRef.current; if (!text.trim() || !selectedProject) return;
@@ -264,5 +262,5 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   const handleAbortSession = useCallback(() => { if (!canAbortSession) return; const id = selectedSession?.id || currentSessionId; if (!id) { console.warn('Abort requested but no session ID is available.'); return; } sendMessage({ type: 'chat.abort', sessionId: id }); }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
   const handlePermissionDecision = useCallback((requestIds: string | string[], decision: PermissionDecision) => { const ids = (Array.isArray(requestIds) ? requestIds : [requestIds]).filter(Boolean); const sent = ids.filter((requestId) => sendMessage(permissionResponseMessage(requestId, decision)) !== false); if (sent.length) setPendingPermissionRequests((requests) => requests.filter((request) => !sent.includes(request.requestId))); }, [sendMessage, setPendingPermissionRequests]);
   const handleInputFocusChange = useCallback((focused: boolean) => { setFocused(focused); onInputFocusChange?.(focused); }, [onInputFocusChange]);
-  return { useWorktree, setUseWorktree, input, setInput, textareaRef, inputHighlightRef, isTextareaExpanded, slashCommandsCount, skillCommands: slashCommands.filter((command) => command.type === 'skill'), filteredCommands, frequentCommands, commandQuery, showCommandMenu, selectedCommandIndex, resetCommandMenuState, handleCommandSelect, handleToggleCommandMenu, showFileDropdown, filteredFiles: filteredFiles as MentionableFile[], selectedFileIndex, renderInputWithMentions, selectFile, attachedImages, setAttachedImages, uploadingImages, imageErrors, getRootProps, getInputProps, isDragActive, openImagePicker: open, handleSubmit, handleSteer, modelPickerTrigger, queuedDrafts, editQueuedDraft, deleteQueuedDraft, moveQueuedDraft, resolveSteerResult, pendingCommandGate, confirmCommandGate, cancelCommandGate, handleVoiceTranscript, insertAtEnd, handleInputChange, handleKeyDown, handlePaste, handleTextareaClick: (event: MouseEvent<HTMLTextAreaElement>) => setCursorPosition(event.currentTarget.selectionStart), handleTextareaInput, syncInputOverlayScroll, handleClearInput, handleAbortSession, handlePermissionDecision, handleInputFocusChange, isInputFocused, commandModalPayload, closeCommandModal: () => setModal(null), showCostModal, isWorkspace: workspaceTarget.isWorkspace, workspaceCandidates: workspaceTarget.candidates, workspaceTargetValue: workspaceTarget.target, pickWorkspaceTarget: workspaceTarget.pickTarget };
+  return { input, setInput, textareaRef, inputHighlightRef, isTextareaExpanded, slashCommandsCount, skillCommands: slashCommands.filter((command) => command.type === 'skill'), filteredCommands, frequentCommands, commandQuery, showCommandMenu, selectedCommandIndex, resetCommandMenuState, handleCommandSelect, handleToggleCommandMenu, showFileDropdown, filteredFiles: filteredFiles as MentionableFile[], selectedFileIndex, renderInputWithMentions, selectFile, attachedImages, setAttachedImages, uploadingImages, imageErrors, getRootProps, getInputProps, isDragActive, openImagePicker: open, handleSubmit, handleSteer, modelPickerTrigger, queuedDrafts, editQueuedDraft, deleteQueuedDraft, moveQueuedDraft, resolveSteerResult, pendingCommandGate, confirmCommandGate, cancelCommandGate, handleVoiceTranscript, insertAtEnd, handleInputChange, handleKeyDown, handlePaste, handleTextareaClick: (event: MouseEvent<HTMLTextAreaElement>) => setCursorPosition(event.currentTarget.selectionStart), handleTextareaInput, syncInputOverlayScroll, handleClearInput, handleAbortSession, handlePermissionDecision, handleInputFocusChange, isInputFocused, commandModalPayload, closeCommandModal: () => setModal(null), showCostModal, isWorkspace: workspaceTarget.isWorkspace, workspaceCandidates: workspaceTarget.candidates, workspaceTargetValue: workspaceTarget.target, pickWorkspaceTarget: workspaceTarget.pickTarget };
 }
