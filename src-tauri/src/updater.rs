@@ -84,6 +84,14 @@ impl Default for Snapshot {
     }
 }
 
+fn startup_snapshot(automatic: bool) -> Snapshot {
+    Snapshot {
+        phase: Phase::Idle,
+        automatic,
+        ..Snapshot::default()
+    }
+}
+
 struct Control {
     snapshot: Snapshot,
     snapshot_generation: u64,
@@ -489,8 +497,10 @@ async fn run(
     {
         let mut control = owner.control.lock().expect("update owner lock poisoned");
         control.store = Some(runtime.store.clone());
-        control.snapshot.automatic = preferences.automatic;
-        control.snapshot.phase = Phase::Idle;
+        // A startup invalidation may have left server_not_ready or an old
+        // target behind. Healthy initialization is fresh even with auto off,
+        // when no later network phase will clear that stale reason for us.
+        control.snapshot = startup_snapshot(preferences.automatic);
         control.snapshot_generation = owner.generation.load(Ordering::Acquire);
     }
     // Every restart re-verifies cache bytes, even when automatic checking is off.
@@ -870,6 +880,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn healthy_startup_with_automatic_off_does_not_keep_a_stale_server_error() {
+        let snapshot = startup_snapshot(false);
+        assert_eq!(snapshot.phase, Phase::Idle);
+        assert!(!snapshot.automatic);
+        assert_eq!(snapshot.reason, None);
+        assert_eq!(snapshot.target_desktop_version, None);
+        assert!(
+            snapshot.discovery_incomplete,
+            "no new discovery was performed"
+        );
+        assert!(!snapshot.installation_available);
     }
 
     #[test]

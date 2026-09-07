@@ -1,5 +1,31 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 사용자 환경 확인 후 실제 QA 앱 검증
+
+사용자는 이전 인증창에서 무엇을 눌렀는지 기억하지 못하며 macOS 13 테스트
+환경도 없는 것 같다고 답했다. 취소 성공과 OS13 검증은 **미확인 그대로**다.
+추가 환경 준비를 사용자에게 요구하지 않고 현재 Mac의 격리 QA 증거를 보강했다.
+
+- ES2020 `Object.hasOwn` 타입 오류를 수정해 원격 Node 22/24 CI를 통과시켰다
+  (`6f99642`, run `34140074184`). 이전 로컬 검사 후의 마지막 편집이 CI에서 실패한
+  것이며, 이전 head의 원격 CI까지 통과했다고 해석하지 않는다.
+- 실제 debug/QA 앱의 기동을 막던 긴 automation socket 경로를 짧은 private
+  `a.sock`으로 수정했다. 길이 한도는 플랫폼 구조체에서 얻고 실제 bind로 검증한다.
+- 실제 About의 503 오류를 재현했다. accepted socket의 nonblocking 모드 때문에
+  HMAC 응답 다음 read가 너무 일찍 실패했다. 인증/peer PID/시간·크기 한도는
+  유지하면서 연결 읽기 모드를 수정했고 실제 Node↔Rust 회귀 테스트를 추가했다.
+- 실제 QA 앱에서 native 상태, 설정의 durable 저장, 자동 확인 off 상태의 수동
+  확인, 잘못된 피드 오류 및 복구, 정상 종료와 같은 origin 재실행/설정 보존을
+  확인했다. auto-off 재기동의 잔존 `server_not_ready` 문구도 수정했다.
+- 설치 시도 journal은 **examples 아래 QA-only 증명 도구**다. fsync 전 live
+  handle 부재, 실패/Drop/crash 뒤 차단 기록 보존 등을 20개 테스트로 검사했다.
+  실제 installer/writer 종료, 적대적 same-UID namespace, 전원 차단 또는 제품
+  설치 resolver 검증이 아니다. 기존 생산 startup guard는 그대로 보수적으로 차단한다.
+
+전체 근거와 재개 방법: `DESKTOP-UPDATER-QA-PREPARATION.md`.
+생산 `/Applications` 앱, 실제 사용자 데이터, public release와 updater key는
+변경하지 않았다. **자동 설치·재시작·공개 배포는 아직 완료되지 않았다.**
+
 ## 추가 구현: 메인 화면 준비 제어와 restart admission 기초
 
 브랜치 `codex/macos-updater-completion`의 미배포 변경이다. **전체 자동

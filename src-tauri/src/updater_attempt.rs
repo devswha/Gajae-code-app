@@ -9,7 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const ATTEMPT_RECORD: &str = "desktop-update-attempt.json";
+pub(crate) const ATTEMPT_RECORD: &str = "desktop-update-attempt.json";
 
 /// Admit a startup only when the update-attempt record is validated absent.
 /// Any present directory entry, regardless of its contents or type, blocks.

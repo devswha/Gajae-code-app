@@ -383,7 +383,45 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         .then_some(pid as u32)
 }
 
-fn serve(mut stream: UnixStream, run: &Run, app: &AppHandle) {
+fn serve(stream: UnixStream, run: &Run, app: &AppHandle) {
+    serve_protocol(stream, run, |request, peer| {
+        // Authority is checked after acquiring the coordinator's operation lock.
+        let admit = || {
+            !app.state::<crate::lifecycle::SidecarLifecycle>()
+                .is_shutting_down()
+                && run
+                    .authority
+                    .lock()
+                    .is_ok_and(|mut authority| authority.admit(request, peer))
+        };
+        let updater = app.state::<crate::updater::Preparation>();
+        match &request.command {
+            Command::Status {} => updater.snapshot(admit),
+            Command::Check {} => updater.manual_check(admit),
+            Command::SetAutomatic { automatic } => updater.set_automatic(*automatic, admit),
+            Command::Restart {} => {
+                if admit() {
+                    Err("updater_installation_unavailable")
+                } else {
+                    Err("updater_unauthorized")
+                }
+            }
+        }
+    });
+}
+
+fn serve_protocol(
+    mut stream: UnixStream,
+    run: &Run,
+    execute: impl FnOnce(&Request, u32) -> Result<crate::updater::Snapshot, &'static str>,
+) {
+    // BSD accepted sockets can retain the listener's nonblocking flag. A read
+    // timeout does not clear O_NONBLOCK: frame 2 then spuriously fails before
+    // the authenticated Node peer has time to send it. Only this accepted
+    // stream becomes blocking; all reads keep their existing total deadline.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let deadline = Instant::now() + DEADLINE;
     let Some(peer) = peer_pid(&stream) else {
         return;
@@ -409,30 +447,7 @@ fn serve(mut stream: UnixStream, run: &Run, app: &AppHandle) {
     let Ok(request) = read_frame::<Request>(&mut stream, deadline) else {
         return;
     };
-    // This closure runs INSIDE the coordinator's command serialization lock,
-    // immediately before the operation. Retirement and later mutation sequence
-    // claims cannot be overtaken by a queued old preference write.
-    let admit = || {
-        !app.state::<crate::lifecycle::SidecarLifecycle>()
-            .is_shutting_down()
-            && run
-                .authority
-                .lock()
-                .is_ok_and(|mut authority| authority.admit(&request, peer))
-    };
-    let updater = app.state::<crate::updater::Preparation>();
-    let result = match &request.command {
-        Command::Status {} => updater.snapshot(admit),
-        Command::Check {} => updater.manual_check(admit),
-        Command::SetAutomatic { automatic } => updater.set_automatic(*automatic, admit),
-        Command::Restart {} => {
-            if admit() {
-                Err("updater_installation_unavailable")
-            } else {
-                Err("updater_unauthorized")
-            }
-        }
-    };
+    let result = execute(&request, peer);
     let response = match result {
         Ok(snapshot) => {
             serde_json::json!({"protocolVersion":1,"sequence":request.sequence,"ok":true,"snapshot":snapshot})
@@ -535,6 +550,86 @@ mod tests {
             origin: "http://127.0.0.1:43123".into(),
             command: Command::Status {},
         }
+    }
+
+    #[test]
+    fn real_node_relay_completes_both_frames_on_a_nonblocking_accepted_socket() {
+        let directory = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gu-{}", &secret().unwrap()[..12]));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let socket_path = directory.join("rpc");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let script = r#"
+            import {PassThrough} from 'node:stream';
+            import {DesktopUpdateRelay} from './server/services/desktop-update-relay.ts';
+            const input=new PassThrough();
+            const relay=new DesktopUpdateRelay({input,platform:'darwin',env:{GJC_DESKTOP:'1',GJC_DESKTOP_UPDATE_PIPE:'1'}});
+            input.write('GJC_DESKTOP_UPDATE_INIT '+JSON.stringify({protocolVersion:1,socket:process.argv[1],secret:'a'.repeat(64),epoch:'b'.repeat(64)})+'\n');
+            try { const state=await relay.request({action:'status'},'c'.repeat(64),'http://127.0.0.1:43123'); if(state.phase!=='disabled')throw Error('wrong state');console.log('verified'); }
+            finally {relay.retire();}
+        "#;
+        let mut child = std::process::Command::new("node")
+            .args(["--import", "tsx", "--input-type=module", "--eval", script])
+            .arg(&socket_path)
+            .current_dir(repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => break None,
+            }
+        };
+        let mut auth = authority();
+        auth.pid = child.id();
+        let run = Run {
+            authority: Mutex::new(auth),
+            retired: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
+            socket: socket_path.clone(),
+        };
+        if let Some(stream) = stream {
+            // Deterministically exercise the BSD accept inheritance, regardless
+            // of the host's default behavior. This must still wait for frame 2.
+            stream.set_nonblocking(true).unwrap();
+            serve_protocol(stream, &run, |request, peer| {
+                if run.authority.lock().unwrap().admit(request, peer) {
+                    Ok(crate::updater::Snapshot::default())
+                } else {
+                    Err("updater_unauthorized")
+                }
+            });
+        } else {
+            let _ = child.kill();
+        }
+        let result = child.wait_with_output().unwrap();
+        drop(listener);
+        fs::remove_file(socket_path).unwrap();
+        fs::remove_dir(directory).unwrap();
+        assert!(
+            result.status.success(),
+            "Node relay failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "verified");
     }
     #[test]
     fn replay_window_is_bounded_and_accepts_reordered_live_requests_only_once() {

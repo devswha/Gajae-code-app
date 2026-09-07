@@ -13,6 +13,23 @@ use serde::{Deserialize, Serialize};
 use tauri::utils::config::{Config, WindowConfig};
 
 const MANIFEST: &str = "desktop-qa-profile.json";
+const AUTOMATION_SOCKET: &str = "a.sock";
+
+fn validate_automation_socket(root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // Use the platform sockaddr layout, not a guessed cross-platform cap.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if root.join(AUTOMATION_SOCKET).as_os_str().as_bytes().len() >= address.sun_path.len() {
+            return Err(
+                "QA root is too long for its private automation socket; choose a shorter path."
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -125,6 +142,7 @@ impl QaProfile {
             private_directory(&path)?;
         }
         let root = path.canonicalize().map_err(|error| error.to_string())?;
+        validate_automation_socket(&root)?;
         let manifest_path = root.join(MANIFEST);
         if fs::symlink_metadata(&manifest_path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err("QA manifest cannot be a symlink.".into());
@@ -268,6 +286,7 @@ impl QaProfile {
             ("TMPDIR", "tmp"),
             ("GAJAE_BROWSER_PROFILE_DIR", "browser/profile"),
             ("GAJAE_BROWSER_CACHE_DIR", "browser/chromium"),
+            ("GAJAE_AUTOMATION_SOCKET", AUTOMATION_SOCKET),
         ] {
             result.insert(
                 name.into(),
@@ -298,6 +317,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn automation_socket_is_short_private_and_really_bindable() {
+        let root = Temp::new();
+        let profile = QaProfile::open(&root.0).unwrap();
+        let environment = profile.environment();
+        let socket = PathBuf::from(&environment["GAJAE_AUTOMATION_SOCKET"]);
+        assert_eq!(socket, profile.root.join(AUTOMATION_SOCKET));
+        #[cfg(unix)]
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            assert!(
+                socket.exists(),
+                "the OS must not silently truncate the bound path"
+            );
+            drop(listener);
+        }
+        assert!(
+            validate_automation_socket(&PathBuf::from(format!("/{}", "x".repeat(200)))).is_err()
+        );
     }
 
     #[test]
