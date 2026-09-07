@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "Aggiornamento disponibile: {{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "La ricerca delle versioni non è riuscita.",
+      "cacheInvalid": "La verifica dell’aggiornamento nella cache non è riuscita.",
+      "preparationCancelled": "La preparazione dell’aggiornamento è stata annullata.",
+      "preferencesNotPersisted": "Impossibile salvare l’impostazione degli aggiornamenti automatici."
+    },
+    "title": "Aggiornamenti desktop",
+    "connecting": "Connessione al servizio di aggiornamento…",
+    "unconfirmed": "L’accesso agli aggiornamenti desktop non è stato confermato.",
+    "lastConfirmed": "Ultimo stato nativo confermato; lo stato attuale non è confermato.",
+    "unknownVersion": "Versione non confermata",
+    "incomplete": "La ricerca delle versioni è incompleta. Non è confermata l’individuazione della versione più recente.",
+    "preparationOnly": "L’installazione non è attualmente disponibile. Un aggiornamento preparato non è ancora installato.",
+    "productVersion": "Versione dell’app",
+    "desktopVersion": "Build desktop",
+    "targetProductVersion": "Versione di destinazione dell’app",
+    "targetDesktopVersion": "Build desktop di destinazione",
+    "progress": "Avanzamento del download",
+    "knownProgress": "{{downloaded}} / {{total}} byte",
+    "unknownTotal": "{{downloaded}} byte scaricati; dimensione totale sconosciuta.",
+    "unknownProgress": "In attesa dell’avanzamento del download.",
+    "automatic": "Aggiornamenti automatici",
+    "automaticHelp": "Le modifiche appaiono solo dopo la conferma dell’app desktop. La disattivazione richiede l’annullamento degli aggiornamenti pianificati.",
+    "confirmingSetting": "In attesa della conferma nativa dell’impostazione…",
+    "confirmingRestart": "Richiesta di riavvio sicuro…",
+    "check": "Cerca aggiornamenti",
+    "refresh": "Aggiorna stato",
+    "retry": "Ripeti ricerca",
+    "restart": "Aggiorna e riavvia",
+    "osPrompt": "macOS potrebbe chiedere l’approvazione dell’amministratore in una finestra di sistema. Approva o annulla lì; non inserire credenziali qui. Il riavvio può essere rinviato durante attività in corso.",
+    "notes": "Note di rilascio",
+    "phases": {
+      "disabled": "Aggiornamenti disattivati",
+      "idle": "In attesa del prossimo controllo",
+      "checking": "Ricerca delle versioni",
+      "downloading": "Download dell’aggiornamento",
+      "verifying": "Verifica dell’aggiornamento",
+      "ready": "Aggiornamento preparato",
+      "deferred": "Aggiornamento rinviato",
+      "error": "Errore di aggiornamento",
+      "applying": "Applicazione dell’aggiornamento",
+      "restarting": "Riavvio in corso",
+      "recovery": "Ripristino necessario"
+    },
+    "errors": {
+      "unavailable": "Il servizio di aggiornamento desktop autenticato non è raggiungibile. Lo stato attuale è sconosciuto.",
+      "invalidResponse": "Il servizio di aggiornamento ha restituito una risposta non supportata. I controlli di installazione restano disabilitati.",
+      "timeout": "Attesa della risposta terminata; l’operazione nativa potrebbe essere ancora in corso. Aggiorna lo stato prima di riprovare."
+    }
+  },
   "close": "Chiudi impostazioni",
   "title": "Opzioni",
   "account": {

@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "Güncelleme mevcut: {{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "Sürüm araması başarısız oldu.",
+      "cacheInvalid": "Önbellekteki güncelleme doğrulanamadı.",
+      "preparationCancelled": "Güncelleme hazırlığı iptal edildi.",
+      "preferencesNotPersisted": "Otomatik güncelleme ayarı kaydedilemedi."
+    },
+    "title": "Masaüstü güncellemeleri",
+    "connecting": "Masaüstü güncelleyicisine bağlanılıyor…",
+    "unconfirmed": "Masaüstü güncelleyicisine erişim doğrulanmadı.",
+    "lastConfirmed": "Son doğrulanmış yerel durum; mevcut durum doğrulanmadı.",
+    "unknownVersion": "Sürüm doğrulanmadı",
+    "incomplete": "Sürüm araması tamamlanmadı. En son sürümün bulunduğu doğrulanmış değildir.",
+    "preparationOnly": "Kurulum şu anda kullanılamıyor. Hazırlanmış bir güncelleme henüz kurulmuş değildir.",
+    "productVersion": "Uygulama sürümü",
+    "desktopVersion": "Masaüstü derlemesi",
+    "targetProductVersion": "Hedef uygulama sürümü",
+    "targetDesktopVersion": "Hedef masaüstü derlemesi",
+    "progress": "İndirme ilerlemesi",
+    "knownProgress": "{{downloaded}} / {{total}} bayt",
+    "unknownTotal": "{{downloaded}} bayt indirildi; toplam boyut bilinmiyor.",
+    "unknownProgress": "İndirme ilerlemesi bekleniyor.",
+    "automatic": "Otomatik güncellemeler",
+    "automaticHelp": "Değişiklikler yalnızca masaüstü uygulaması doğruladıktan sonra görünür. Kapatmak, planlanmış güncellemelerin iptalini ister.",
+    "confirmingSetting": "Ayarın yerel olarak doğrulanması bekleniyor…",
+    "confirmingRestart": "Güvenli yeniden başlatma isteniyor…",
+    "check": "Güncellemeleri denetle",
+    "refresh": "Durumu yenile",
+    "retry": "Yeniden denetle",
+    "restart": "Güncelle ve yeniden başlat",
+    "osPrompt": "macOS kendi sistem penceresinde yönetici onayı isteyebilir. Onayı veya iptali oradan yapın; buraya kimlik bilgileri girmeyin. Etkin işler varken yeniden başlatma ertelenebilir.",
+    "notes": "Sürüm notları",
+    "phases": {
+      "disabled": "Güncelleyici devre dışı",
+      "idle": "Sonraki denetim bekleniyor",
+      "checking": "Sürümler denetleniyor",
+      "downloading": "Güncelleme indiriliyor",
+      "verifying": "Güncelleme doğrulanıyor",
+      "ready": "Güncelleme hazırlandı",
+      "deferred": "Güncelleme ertelendi",
+      "error": "Güncelleme hatası",
+      "applying": "Güncelleme uygulanıyor",
+      "restarting": "Yeniden başlatılıyor",
+      "recovery": "Kurtarma gerekiyor"
+    },
+    "errors": {
+      "unavailable": "Kimliği doğrulanmış masaüstü güncelleyicisine ulaşılamıyor. Mevcut durumu bilinmiyor.",
+      "invalidResponse": "Masaüstü güncelleyicisi desteklenmeyen bir yanıt döndürdü. Kurulum kontrolleri devre dışı kalır.",
+      "timeout": "Yanıt bekleme sona erdi; yerel işlem hâlâ çalışıyor olabilir. Yeniden denemeden önce durumu yenileyin."
+    }
+  },
   "close": "Ayarları kapat",
   "title": "Uygulama ayarları",
   "account": {

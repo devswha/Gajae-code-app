@@ -28,6 +28,8 @@ mod updater_attempt;
 #[cfg(target_os = "macos")]
 mod updater_binding;
 #[cfg(target_os = "macos")]
+mod updater_bridge;
+#[cfg(target_os = "macos")]
 mod updater_discovery;
 #[cfg(target_os = "macos")]
 mod updater_manifest;
@@ -193,6 +195,8 @@ fn route_startup_deep_links(
 }
 
 fn desktop_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+    #[cfg(target_os = "macos")]
+    updater_bridge::page_load(webview, payload);
     if payload.event() == tauri::webview::PageLoadEvent::Finished {
         supervisor::restore_recovery(webview);
     }
@@ -366,6 +370,8 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.manage(updater::Preparation::default());
             #[cfg(target_os = "macos")]
+            app.manage(updater_bridge::Bridge::default());
+            #[cfg(target_os = "macos")]
             if let Some(profile) = app.try_state::<qa_profile::QaProfile>() {
                 profile.create_windows(app, &qa_windows)?;
             }
@@ -447,6 +453,8 @@ fn main() {
                 }
             }
             tauri::RunEvent::Exit => {
+                #[cfg(target_os = "macos")]
+                updater_bridge::retire(app);
                 #[cfg(target_os = "macos")]
                 updater::unhealthy(app);
                 // macOS Quit Apple events (Cmd-Q, AppleScript quit) bypass a

@@ -33,6 +33,7 @@ tauri-runtime = "=2.7.0"
 tauri-runtime-wry = "=2.7.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+hmac = "=0.12.1"
 rustls-webpki = { version = "=0.103.15", default-features = false, features = ["std"] }
 rustls-pki-types = "=1.15.1"
 # Pin the updater release selected for the existing Tauri 2.6/runtime

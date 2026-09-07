@@ -1,6 +1,6 @@
-//! Preparation-only updater owner. Installation, restart, attempt resolution and
-//! browser authority remain deliberately unavailable until their safety gates
-//! are proven. No official plugin install/download API is called here.
+//! Preparation-only updater owner. The authenticated main-view bridge exposes
+//! status, consent and checks. Installation, restart and attempt resolution
+//! remain gated. No official plugin install/download API is called here.
 use std::{
     future::Future,
     sync::{
@@ -48,6 +48,7 @@ pub enum Phase {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    pub protocol_version: u8,
     pub phase: Phase,
     pub automatic: bool,
     pub product_version: &'static str,
@@ -58,11 +59,15 @@ pub struct Snapshot {
     pub reason: Option<&'static str>,
     /// A staged archive is NOT installation permission or installation proof.
     pub installation_available: bool,
+    pub downloaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub notes: Option<String>,
 }
 
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            protocol_version: 1,
             phase: Phase::Disabled,
             automatic: false,
             product_version: env!("GJC_EXPECTED_PAYLOAD_VERSION"),
@@ -72,6 +77,9 @@ impl Default for Snapshot {
             discovery_incomplete: true,
             reason: None,
             installation_available: false,
+            downloaded_bytes: None,
+            total_bytes: None,
+            notes: None,
         }
     }
 }
@@ -119,13 +127,43 @@ struct Coordinator {
 #[derive(Default)]
 pub(crate) struct Preparation(Arc<Coordinator>);
 
+impl Preparation {
+    pub(crate) fn snapshot(&self, admit: impl FnOnce() -> bool) -> Result<Snapshot, &'static str> {
+        let control = self.0.control.lock().map_err(|_| "updater_unavailable")?;
+        if !admit() {
+            return Err("updater_unauthorized");
+        }
+        Ok(self.0.snapshot_from(&control))
+    }
+
+    pub(crate) fn set_automatic(
+        &self,
+        automatic: bool,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Snapshot, &'static str> {
+        self.0.set_automatic_if(automatic, admit)?;
+        Ok(self.0.snapshot())
+    }
+
+    pub(crate) fn manual_check(
+        &self,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Snapshot, &'static str> {
+        self.0.manual_check_if(admit)?;
+        Ok(self.0.snapshot())
+    }
+}
+
 impl Coordinator {
     /// The only snapshot publication boundary. Raw state may have been written
     /// by a worker racing nonblocking invalidation; its epoch cannot be exposed
     /// as Ready after that epoch has retired.
-    #[allow(dead_code)]
     fn snapshot(&self) -> Snapshot {
         let control = self.control.lock().expect("update owner lock poisoned");
+        self.snapshot_from(&control)
+    }
+
+    fn snapshot_from(&self, control: &Control) -> Snapshot {
         let mut snapshot = control.snapshot.clone();
         if snapshot.phase != Phase::Disabled && !self.valid(control.snapshot_generation) {
             snapshot.phase = Phase::Deferred;
@@ -215,11 +253,21 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Used only by a future authenticated native bridge. No remote Tauri grant
-    /// or backend/browser route is installed by this preparation slice.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn set_automatic(&self, automatic: bool) -> Result<(), &'static str> {
+        self.set_automatic_if(automatic, || true)
+    }
+
+    /// Check authority after acquiring the preference serialization lock.
+    fn set_automatic_if(
+        &self,
+        automatic: bool,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<(), &'static str> {
         let mut control = self.control.lock().map_err(|_| "updater_unavailable")?;
+        if !admit() {
+            return Err("updater_unauthorized");
+        }
         let store = control.store.as_ref().ok_or("updater_inactive")?.clone();
         // Serialize the durable preference acknowledgement with ready publication.
         // Even a disk failure cancels this generation in memory, without claiming
@@ -244,9 +292,16 @@ impl Coordinator {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn manual_check(&self) -> Result<(), &'static str> {
+        self.manual_check_if(|| true)
+    }
+
+    fn manual_check_if(&self, admit: impl FnOnce() -> bool) -> Result<(), &'static str> {
         let mut control = self.control.lock().map_err(|_| "updater_unavailable")?;
+        if !admit() {
+            return Err("updater_unauthorized");
+        }
         if control.store.is_none()
             || !self.healthy.load(Ordering::Acquire)
             || !self.started.load(Ordering::Acquire)
@@ -277,6 +332,11 @@ pub(crate) fn after_healthy(app: &AppHandle) {
         .state::<crate::lifecycle::SidecarLifecycle>()
         .is_shutting_down()
     {
+        return;
+    }
+    // Do not begin automatic preparation if the authenticated control path
+    // failed to initialize; that would leave the user without its opt-out UI.
+    if !crate::updater_bridge::available(app) {
         return;
     }
     let binding = Binding::compiled();
@@ -591,6 +651,16 @@ async fn prepare(
         }
     }
     owner.phase(generation, Phase::Downloading)?;
+    {
+        let mut control = owner.control.lock().expect("update owner lock poisoned");
+        if !owner.valid(generation) {
+            return Err(PrepareError::Cancelled);
+        }
+        // The transport is not progress-reporting. Do not synthesize a percent
+        // until the complete, bounded response has actually arrived.
+        control.snapshot.downloaded_bytes = None;
+        control.snapshot.total_bytes = Some(selected.archive_asset.size);
+    }
     let bytes = cancellable(
         owner,
         generation,
@@ -602,6 +672,13 @@ async fn prepare(
         ),
     )
     .await?;
+    {
+        let mut control = owner.control.lock().expect("update owner lock poisoned");
+        if !owner.valid(generation) {
+            return Err(PrepareError::Cancelled);
+        }
+        control.snapshot.downloaded_bytes = Some(bytes.len() as u64);
+    }
     owner.phase(generation, Phase::Verifying)?;
     let key = runtime.binding.public_key.clone();
     let manifest = selected.manifest.clone();
@@ -748,6 +825,11 @@ fn eligible_cached(manifest: &Manifest, os: &str) -> Result<bool, PrepareError> 
 fn set_target(snapshot: &mut Snapshot, manifest: &Manifest) {
     snapshot.target_product_version = Some(manifest.product_version.to_string());
     snapshot.target_desktop_version = Some(manifest.version.to_string());
+    let mut notes: String = manifest.notes.chars().take(4096).collect();
+    if notes.len() < manifest.notes.len() {
+        notes.push('…');
+    }
+    snapshot.notes = Some(notes);
     snapshot.reason = Some("installation_safety_gate_pending");
 }
 
@@ -788,6 +870,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn native_snapshot_keys_match_the_shared_frontend_fixture() {
+        let native = serde_json::to_value(Snapshot::default()).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../shared/fixtures/desktop-update-status.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            native.as_object().unwrap().keys().collect::<Vec<_>>(),
+            fixture.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert_eq!(native["protocolVersion"], fixture["protocolVersion"]);
+        assert_eq!(native["installationAvailable"], false);
+    }
+
+    #[test]
+    fn revoked_authority_is_rechecked_after_waiting_for_the_preference_lock() {
+        let temp = Temp::new();
+        let owner = Arc::new(Coordinator::default());
+        let store = Arc::new(Store::open(&temp.0).unwrap());
+        owner.control.lock().unwrap().store = Some(store.clone());
+        let admission = Arc::new(AtomicBool::new(true));
+        let lock = owner.control.lock().unwrap();
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let worker = {
+            let owner = owner.clone();
+            let admission = admission.clone();
+            std::thread::spawn(move || {
+                entered.send(()).unwrap();
+                owner.set_automatic_if(false, || admission.load(Ordering::Acquire))
+            })
+        };
+        waiting.recv().unwrap();
+        admission.store(false, Ordering::Release);
+        drop(lock);
+        assert_eq!(worker.join().unwrap(), Err("updater_unauthorized"));
+        assert!(store.preferences().unwrap().automatic);
     }
 
     #[test]

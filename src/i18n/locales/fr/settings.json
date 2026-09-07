@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "Mise à jour disponible : {{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "La recherche des versions a échoué.",
+      "cacheInvalid": "La validation de la mise à jour en cache a échoué.",
+      "preparationCancelled": "La préparation de la mise à jour a été annulée.",
+      "preferencesNotPersisted": "Le réglage des mises à jour automatiques n’a pas pu être enregistré."
+    },
+    "title": "Mises à jour du bureau",
+    "connecting": "Connexion au service de mise à jour…",
+    "unconfirmed": "L’accès au service de mise à jour du bureau n’est pas confirmé.",
+    "lastConfirmed": "Dernier état natif confirmé ; l’état actuel n’est pas confirmé.",
+    "unknownVersion": "Version non confirmée",
+    "incomplete": "La recherche des versions est incomplète. Cela ne confirme pas la version la plus récente.",
+    "preparationOnly": "L’installation est actuellement indisponible. Une mise à jour préparée n’est pas une mise à jour installée.",
+    "productVersion": "Version de l’application",
+    "desktopVersion": "Build du bureau",
+    "targetProductVersion": "Version cible de l’application",
+    "targetDesktopVersion": "Build cible du bureau",
+    "progress": "Progression du téléchargement",
+    "knownProgress": "{{downloaded}} / {{total}} octets",
+    "unknownTotal": "{{downloaded}} octets téléchargés ; taille totale inconnue.",
+    "unknownProgress": "En attente de la progression du téléchargement.",
+    "automatic": "Mises à jour automatiques",
+    "automaticHelp": "Les modifications s’affichent après confirmation de l’application de bureau. Désactiver demande l’annulation des mises à jour programmées.",
+    "confirmingSetting": "En attente de la confirmation native du réglage…",
+    "confirmingRestart": "Demande de redémarrage sécurisé…",
+    "check": "Rechercher des mises à jour",
+    "refresh": "Actualiser l’état",
+    "retry": "Relancer la recherche",
+    "restart": "Mettre à jour et redémarrer",
+    "osPrompt": "macOS peut demander une autorisation administrateur dans sa propre boîte de dialogue. Acceptez ou annulez dans celle-ci ; ne saisissez pas d’identifiants ici. Le redémarrage peut être différé si des tâches sont actives.",
+    "notes": "Notes de version",
+    "phases": {
+      "disabled": "Mise à jour désactivée",
+      "idle": "En attente de la prochaine recherche",
+      "checking": "Recherche de versions",
+      "downloading": "Téléchargement de la mise à jour",
+      "verifying": "Vérification de la mise à jour",
+      "ready": "Mise à jour préparée",
+      "deferred": "Mise à jour différée",
+      "error": "Erreur de mise à jour",
+      "applying": "Application de la mise à jour",
+      "restarting": "Redémarrage en cours",
+      "recovery": "Récupération nécessaire"
+    },
+    "errors": {
+      "unavailable": "Le service authentifié de mise à jour du bureau est inaccessible. Son état actuel est inconnu.",
+      "invalidResponse": "Le service de mise à jour a renvoyé une réponse non prise en charge. Les commandes d’installation restent désactivées.",
+      "timeout": "L’attente de la réponse est terminée ; l’opération native peut encore être en cours. Actualisez l’état avant de réessayer."
+    }
+  },
   "close": "Fermer les paramètres",
   "title": "Options",
   "account": {

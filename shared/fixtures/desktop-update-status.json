@@ -1,0 +1,15 @@
+{
+  "protocolVersion": 1,
+  "phase": "ready",
+  "automatic": true,
+  "productVersion": "2.0.0-beta.10",
+  "desktopVersion": "0.2.4",
+  "targetProductVersion": "2.0.0-beta.11",
+  "targetDesktopVersion": "0.2.5",
+  "discoveryIncomplete": false,
+  "reason": null,
+  "installationAvailable": false,
+  "downloadedBytes": 1024,
+  "totalBytes": 1024,
+  "notes": "Signed test fixture. Installation remains gated."
+}

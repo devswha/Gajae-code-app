@@ -1,5 +1,102 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 추가 구현: 메인 화면 준비 제어와 restart admission 기초
+
+브랜치 `codex/macos-updater-completion`의 미배포 변경이다. **전체 자동
+업데이트 완료가 아니며 설치·재시작은 계속 거부한다.** 아래 내용은 이어지는
+이전 진행 기록의 ‘준비 경로 UI/bridge 없음’ 부분을 갱신한다.
+
+- `shared/desktopUpdateProtocol.ts` + 공용 상태 fixture를 기준으로 native
+  snapshot, 준비 상태/설정/수동 확인 명령과 About UI를 연결했다. 웹 알림은
+  별도 SemVer/channel 기준이며 desktop에서는 native snapshot만 사용한다.
+- native가 만든 일회성 stdin 초기화로만 Node relay에 연결 정보가 전달된다.
+  비밀값은 환경변수/로그/브라우저 응답에 넣지 않는다. 혼합 stdout은 제어
+  입력으로 사용하지 않고 소유자 전용 Unix socket을 사용한다.
+- 연결마다 새로운 challenge/HMAC-SHA256 증명으로 native endpoint를 먼저
+  인증한 뒤에만 view capability를 전송한다. macOS `LOCAL_PEERPID`가 실제
+  소유 Node PID와 일치해야 하므로 socket을 바꿔 끼운 다른 프로세스가 진짜
+  native에 challenge를 대신 전달할 수 없다. HMAC은 macOS 대상의 정확히
+  고정한 `hmac=0.12.1`이며 기존 tempfile/getrandom 선택은 유지했다.
+- HTTP는 desktop cookie + 정확한 Origin + 현재 main-view capability를 요구한다.
+  페이지/서버 교체 시 권한을 폐기하고, preference 직렬화 잠금 안에서 다시
+  권한과 mutation sequence를 확인한다. 오래된 요청이 새 opt-out을 덮지 않는다.
+  4개 요청, 2초 relay deadline, 제한된 frame 크기이며 timeout은 취소/저장 성공이 아니다.
+- QA 환경의 `env_clear()` 뒤에 relay flag를 설정한다. disabled/dev/Linux에서는
+  제어 채널을 시작하지 않으며, native bridge 초기화 실패 시 자동 준비도 시작하지 않는다.
+- About에 EN/KO 및 10-locale parity, null progress, 상태/오류/릴리즈 노트,
+  실제 저장 응답 뒤에 반영하는 자동 설정과 수동 확인을 추가했다. 준비 완료를
+  설치 완료로 표시하지 않는다. ordinary web에는 설치 제어가 없다.
+- `DesktopRestartAuthority`는 하나의 가역 fence와 기존 owner snapshot을 합칠
+  안전 기초다. 95개 테스트를 통과했지만 **실제 HTTP/WS/internal producer와
+  아직 연결하지 않았으므로 G3 통과가 아니다.** 필요한 연결 지점은
+  `DESKTOP-UPDATE-ADMISSION.md`에 있다. native `restart`도 명시적으로 거부한다.
+- 검증: 통합 `npm run verify`, native locked tests 179 pass + 1 opt-in ignore,
+  build-binding 10 pass, native clippy `-D warnings`, relay/HTTP/admission 141 tests,
+  frontend DOM 33 tests를 부모가 실행해 통과했다. Browser 스킬의 격리 UI fixture로
+  1024×768/390×844, 한국어/영어, 설정 반영과 미정 progress를 확인했다.
+  이는 native packaged-app/설치 GUI 증거가 아니다.
+
+격리된 About 상태 fixture의 화면(설치 실행 없음):
+
+![자동 설치는 차단된 준비 상태 UI](images/updater/about-preparation-qa.png)
+
+### 실제 installer probe 결과 정정
+
+- 첫 authorization probe는 취소가 아니라 `install()` 성공으로 반환했다.
+  별도 `authorization-approved-verification.json`에서 전체 B inventory,
+  코드 서명·staple·Gatekeeper를 검증했다. 취소 성공으로 기록하지 않는다.
+- 두 번째 probe(시작 `2026-09-07T14:52:06Z`, root suffix `F5tbr5`)는
+  `install_failed`, exit 1/signal 없음으로 반환했다. 전체 A inventory 및
+  서명·staple·Gatekeeper는 그대로였다. 사용자에게 실제 ‘취소’ 클릭 여부를
+  확인 요청했으며 `humanActionConfirmed`는 아직 false다. 원인 구분 및 OS
+  privileged writer 종료 증거를 단순한 PID 종료/오류 문자열로 대체하지 않는다.
+- 로그/receipt/runner는 `/private/tmp/gajae-updater-resume.Ym5u1L/`에 유지했다.
+  기존 승인 결과는 `authorization-approval-result.json`에 따로 보존했다.
+  최신 `authorization-result.json`을 이전 승인 결과로 혼동하지 않는다.
+
+### 그대로 남은 차단 조건
+
+G0 취소·writer 종료/설치 오류 분류, 실제 macOS 13 검증, 전체 producer와
+draft/첨부 보존의 G3 연결, install-attempt writer/resolver/다음 시작 적용,
+safe restart와 embedded applying/recovery, 최종 서명된 제품 QA A→B 및 데이터
+보존, production updater key custody/backup와 배포가 남아 있다. 이 Mac은
+26.6.2이고 등록된 repository self-hosted runner는 0개이며 로컬 macOS 13 VM은
+확인하지 못했다. 지원 하한이나 권한 검사를 낮추지 않았다. Package/desktop
+버전은 beta.10/0.2.4 그대로이고 새 릴리즈·설치·production key 생성은 하지 않았다.
+
+## 2026-09-07 추가 재개: 설치 기능 완성 요청
+
+사용자가 재배포를 통한 업데이트 시험을 요청했고, 기존 beta.10의 updater가
+disabled이고 웹 알림의 `/releases/latest`도 베타 전용 저장소에서 404인 사실을
+설명한 뒤 **자동 업데이트 완성부터 진행**하도록 승인했다. 현재 브랜치는
+`codex/macos-updater-completion`이며 아래 결과는 전체 기능 완료/배포가 아니다.
+
+- 웹 알림 fallback을 releases 목록 + 표준 SemVer/channel 비교로 수정했다.
+  14개 단위 테스트와 8개 DOM 테스트를 부모가 재실행해 통과했다. native 설치
+  권한이나 UI는 추가하지 않았다. 전체 verify는 별도로 실행 중이다.
+- `docs/DESKTOP-UPDATE-ADMISSION.md`에 실제 producer/owner와 zero-gap accounting
+  미검증 지점을 정리했다. 이는 구현지도이며 G3 통과가 아니다.
+- 현재 locked 공식 updater 2.6.0 probe를 다시 빌드했다. 새 private-CA HTTPS
+  격리 fixture에서 역사적 signed beta.8→beta.9의 실제 `install()`이 반환했고,
+  전체 B inventory, codesign, staple, Gatekeeper를 다시 확인했다. 기존 앱은
+  실행하지 않았으며 `/Applications` 또는 실제 사용자 데이터는 수정하지 않았다.
+  역사적 11.0 선언/13.0 loader 불일치는 그대로이므로 이 결과는 설치 primitive
+  증거일 뿐 새 제품 릴리즈, macOS 13 또는 최종 signed QA A→B acceptance가 아니다.
+- 취소 probe는 사용자 응답 대기 중이다. 임시 증거/runner:
+  `/private/tmp/gajae-updater-resume.Ym5u1L/`. `authorization-running.json`이
+  정확한 현재 root, driver, PID를 기록한다. 시작 시 PID는 11927이었다.
+  스택 표본은 공식 `install_inner` → OSAKit `Script::execute`에서 대기함을 보였고,
+  Computer Use의 테스트 앱 AX 읽기는 두 차례 timeout이었다. 창이나 실제 취소를
+  관찰한 것으로 취급하지 않는다. 사용자에게 표시된 시스템 인증창을 취소하고
+  알려 달라고 요청했다. 강제 종료/timeout 후 성공 처리하지 않는다.
+- `replace-result.json`은 정상 교체 증거, `authorization-result.json`은 probe가
+  반환한 뒤 생성된다. 재개 시 먼저 결과/프로세스를 확인하고 사용자의 실제
+  동작과 전체 A 무결성·writer 종료를 별도로 입증한다. PID 숫자만 재사용하여
+  신호를 보내거나, 결과 파일만으로 사용자 취소를 확인했다고 기록하지 않는다.
+- 설치 수명주기/attempt writer·resolver, 좁은 native bridge, 전체 admission,
+  About UI, OS13 실행, production key custody, 최종 QA/배포는 아직 남아 있다.
+  G0/G3 조건을 완화하거나 production updater를 켜지 않았다.
+
 ## 2026-09-07 재개: 준비 경로 구현
 
 사용자가 이 작업에서 구현 재개와 Astra xhigh 병렬 작업을 승인했다. 아래

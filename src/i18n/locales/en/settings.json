@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "Update available: {{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "Release discovery failed.",
+      "cacheInvalid": "The cached update failed validation.",
+      "preparationCancelled": "Update preparation was cancelled.",
+      "preferencesNotPersisted": "The automatic update setting could not be saved."
+    },
+    "title": "Desktop updates",
+    "connecting": "Connecting to the desktop updater…",
+    "unconfirmed": "Desktop updater access has not been confirmed.",
+    "lastConfirmed": "Last confirmed native state; the current state is not confirmed.",
+    "unknownVersion": "Version not confirmed",
+    "incomplete": "Release discovery is incomplete. This is not a claim that the latest version was found.",
+    "preparationOnly": "Installation is currently unavailable. A prepared update is not an installed update.",
+    "productVersion": "App version",
+    "desktopVersion": "Desktop build",
+    "targetProductVersion": "Target app version",
+    "targetDesktopVersion": "Target desktop build",
+    "progress": "Download progress",
+    "knownProgress": "{{downloaded}} / {{total}} bytes",
+    "unknownTotal": "{{downloaded}} bytes downloaded; total size unknown.",
+    "unknownProgress": "Waiting for download progress.",
+    "automatic": "Automatic updates",
+    "automaticHelp": "Changes are shown only after the desktop app confirms them. Turning this off requests cancellation of scheduled updates.",
+    "confirmingSetting": "Waiting for native confirmation of this setting…",
+    "confirmingRestart": "Requesting a safe restart…",
+    "check": "Check for updates",
+    "refresh": "Refresh status",
+    "retry": "Retry check",
+    "restart": "Update and restart",
+    "osPrompt": "macOS may ask for administrator approval in its own system dialog. Approve or cancel there; do not enter credentials here. Restart may be deferred while work is active.",
+    "notes": "Release notes",
+    "phases": {
+      "disabled": "Updater disabled",
+      "idle": "Waiting for the next check",
+      "checking": "Checking releases",
+      "downloading": "Downloading update",
+      "verifying": "Verifying update",
+      "ready": "Update prepared",
+      "deferred": "Update deferred",
+      "error": "Update error",
+      "applying": "Applying update",
+      "restarting": "Restarting",
+      "recovery": "Recovery required"
+    },
+    "errors": {
+      "unavailable": "Cannot reach the authenticated desktop updater. Its current state is unknown.",
+      "invalidResponse": "The desktop updater returned an unsupported response. Installation controls remain disabled.",
+      "timeout": "Stopped waiting for a response; the native operation may still be running. Refresh status before retrying."
+    }
+  },
   "close": "Close settings",
   "title": "Settings",
   "account": {

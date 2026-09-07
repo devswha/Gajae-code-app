@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "새 버전: {{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "릴리즈 탐색에 실패했습니다.",
+      "cacheInvalid": "캐시된 업데이트를 검증하지 못했습니다.",
+      "preparationCancelled": "업데이트 준비가 취소되었습니다.",
+      "preferencesNotPersisted": "자동 업데이트 설정을 저장하지 못했습니다."
+    },
+    "title": "데스크톱 업데이트",
+    "connecting": "데스크톱 업데이트에 연결하는 중…",
+    "unconfirmed": "데스크톱 업데이트 접근 권한이 확인되지 않았습니다.",
+    "lastConfirmed": "마지막으로 확인한 네이티브 상태입니다. 현재 상태는 확인되지 않았습니다.",
+    "unknownVersion": "버전 확인 전",
+    "incomplete": "릴리즈 탐색이 완료되지 않았습니다. 최신 버전을 찾았다는 의미가 아닙니다.",
+    "preparationOnly": "현재 설치 기능을 사용할 수 없습니다. 업데이트 준비 완료는 설치 완료가 아닙니다.",
+    "productVersion": "앱 버전",
+    "desktopVersion": "데스크톱 빌드",
+    "targetProductVersion": "대상 앱 버전",
+    "targetDesktopVersion": "대상 데스크톱 빌드",
+    "progress": "다운로드 진행률",
+    "knownProgress": "{{downloaded}} / {{total}}바이트",
+    "unknownTotal": "{{downloaded}}바이트 다운로드됨 · 전체 크기 알 수 없음",
+    "unknownProgress": "다운로드 진행 정보 대기 중입니다.",
+    "automatic": "자동 업데이트",
+    "automaticHelp": "데스크톱 앱이 확인한 뒤에만 설정을 반영합니다. 끄면 예약된 업데이트 취소를 요청합니다.",
+    "confirmingSetting": "네이티브 설정 확인을 기다리는 중…",
+    "confirmingRestart": "안전한 재시작을 요청하는 중…",
+    "check": "업데이트 확인",
+    "refresh": "상태 새로고침",
+    "retry": "다시 확인",
+    "restart": "업데이트 후 재시작",
+    "osPrompt": "macOS가 별도 시스템 창에서 관리자 승인을 요청할 수 있습니다. 해당 창에서 승인하거나 취소하세요. 여기에 인증 정보를 입력하지 마세요. 작업 중이면 재시작이 보류될 수 있습니다.",
+    "notes": "릴리즈 노트",
+    "phases": {
+      "disabled": "업데이트 비활성화됨",
+      "idle": "다음 확인 대기 중",
+      "checking": "릴리즈 확인 중",
+      "downloading": "업데이트 다운로드 중",
+      "verifying": "업데이트 검증 중",
+      "ready": "업데이트 준비 완료",
+      "deferred": "업데이트 보류됨",
+      "error": "업데이트 오류",
+      "applying": "업데이트 적용 중",
+      "restarting": "재시작 중",
+      "recovery": "복구 필요"
+    },
+    "errors": {
+      "unavailable": "인증된 데스크톱 업데이트에 연결할 수 없습니다. 현재 상태를 알 수 없습니다.",
+      "invalidResponse": "데스크톱 업데이트가 지원하지 않는 응답을 반환했습니다. 설치 조작은 비활성화됩니다.",
+      "timeout": "응답 대기를 종료했지만 네이티브 작업은 아직 실행 중일 수 있습니다. 다시 시도하기 전에 상태를 새로고침하세요."
+    }
+  },
   "close": "설정 닫기",
   "title": "환경설정",
   "account": {

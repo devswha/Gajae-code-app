@@ -4,6 +4,7 @@ import cors from 'cors';
 import express from 'express';
 
 import { parseAllowedHosts } from '../shared/networkHosts.js';
+import { isDesktopUpdateCommand } from '../shared/desktopUpdateProtocol.js';
 
 import { createDesktopAuth, DESKTOP_BOOTSTRAP_PATH } from './middleware/desktop-auth.js';
 import { createWebSocketServer } from './modules/websocket/index.js';
@@ -26,6 +27,7 @@ export function createGjcAppFactory({
   chat,
   shell,
   browser = undefined,
+  desktopUpdateRelay = undefined,
 }) {
   orchestrator.deps.broadcast = (jobId, event) => {
     try { projection.publish(jobId, event); } catch { /* Durable replay recovers isolated websocket fan-out failures. */ }
@@ -89,6 +91,16 @@ export function createGjcAppFactory({
     },
   }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  app.post('/api/desktop/update', (request, response) => {
+    response.set('Cache-Control', 'no-store');
+    if (!desktopAuth.enabled || !desktopUpdateRelay?.isAvailable()) return response.status(404).json({ error: 'updater_unavailable' });
+    if (request.headers.origin !== desktopAuth.expectedOrigin()
+      || typeof request.headers['x-gajae-update-view'] !== 'string') return response.status(403).json({ error: 'updater_unauthorized' });
+    if (!isDesktopUpdateCommand(request.body)) return response.status(400).json({ error: 'updater_invalid_command' });
+    void desktopUpdateRelay.request(request.body, request.headers['x-gajae-update-view'], request.headers.origin)
+      .then((snapshot) => response.json(snapshot))
+      .catch((error) => response.status(error.message === 'updater_unauthorized' ? 403 : 503).json({ error: /^[a-z_]{1,64}$/.test(error.message) ? error.message : 'updater_unavailable' }));
+  });
   app.use('/api', validateApiKey);
   app.use('/api/gjc', authenticateGjcRoute, createGjcJobsRouter({ authority, orchestrator, gitService }));
 

@@ -26,6 +26,14 @@ not changed. The older session records below are historical.
 
 ## TL;DR
 
+- **Unreleased updater preparation controls** now connect About to a native-owned,
+  main-view-bound relay, with endpoint HMAC authentication and kernel peer-PID
+  checks. The web notification fallback handles beta SemVer correctly. A tested
+  reversible restart-admission primitive exists but is not wired to all producers.
+  Actual install/restart still rejects; G0/G3 and final signed A→B qualification,
+  macOS 13 execution and production key custody remain pending. No updater-enabled
+  release is published. See `MACOS-UPDATER-HANDOFF.md` for current evidence and gaps.
+
 - **Unreleased follow-up: tasks above the conversation.** `ChatTasksPanel` now
   shows the session's live todo list above the transcript with collapse,
   progress and bounded scrolling. The right-hand Tasks tab is retired; its

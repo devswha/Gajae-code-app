@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "有可用更新：{{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "發行版搜尋失敗。",
+      "cacheInvalid": "快取的更新未通過驗證。",
+      "preparationCancelled": "更新準備已取消。",
+      "preferencesNotPersisted": "無法儲存自動更新設定。"
+    },
+    "title": "桌面更新",
+    "connecting": "正在連線至桌面更新服務…",
+    "unconfirmed": "尚未確認桌面更新存取權限。",
+    "lastConfirmed": "上次確認的原生狀態；目前狀態尚未確認。",
+    "unknownVersion": "版本未確認",
+    "incomplete": "發行版搜尋尚未完成，不能據此認定已找到最新版本。",
+    "preparationOnly": "目前無法安裝。更新準備完成不代表已安裝。",
+    "productVersion": "應用程式版本",
+    "desktopVersion": "桌面組建版本",
+    "targetProductVersion": "目標應用程式版本",
+    "targetDesktopVersion": "目標桌面組建版本",
+    "progress": "下載進度",
+    "knownProgress": "{{downloaded}} / {{total}} 位元組",
+    "unknownTotal": "已下載 {{downloaded}} 位元組；總大小未知。",
+    "unknownProgress": "正在等待下載進度。",
+    "automatic": "自動更新",
+    "automaticHelp": "僅在桌面應用程式確認後才顯示設定變更。關閉此項會要求取消排程中的更新。",
+    "confirmingSetting": "正在等待原生設定確認…",
+    "confirmingRestart": "正在要求安全重新啟動…",
+    "check": "檢查更新",
+    "refresh": "重新整理狀態",
+    "retry": "重新檢查",
+    "restart": "更新並重新啟動",
+    "osPrompt": "macOS 可能會在系統對話框中要求管理員核准。請在該視窗核准或取消，不要在此輸入憑證。有工作執行時，重新啟動可能會延後。",
+    "notes": "發行說明",
+    "phases": {
+      "disabled": "更新已停用",
+      "idle": "等待下次檢查",
+      "checking": "正在檢查發行版",
+      "downloading": "正在下載更新",
+      "verifying": "正在驗證更新",
+      "ready": "更新準備完成",
+      "deferred": "更新已延後",
+      "error": "更新錯誤",
+      "applying": "正在套用更新",
+      "restarting": "正在重新啟動",
+      "recovery": "需要復原"
+    },
+    "errors": {
+      "unavailable": "無法連線至已驗證的桌面更新服務，目前狀態未知。",
+      "invalidResponse": "桌面更新服務傳回不支援的回應，安裝控制項將保持停用。",
+      "timeout": "已停止等待回應，但原生作業可能仍在執行。重試前請重新整理狀態。"
+    }
+  },
   "close": "關閉設定",
   "title": "設定",
   "account": {

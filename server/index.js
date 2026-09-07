@@ -49,6 +49,7 @@ import gitRoutes from './routes/git.js';
 import authRoutes from './routes/auth.js';
 import settingsRoutes from './routes/settings.js';
 import { createGjcAppFactory } from './app-factory.js';
+import { DesktopUpdateRelay } from './services/desktop-update-relay.js';
 import { isWorkspaceRoot } from './modules/projects/index.js';
 import projectModuleRoutes from './modules/projects/projects.routes.js';
 import notificationRoutes from './modules/notifications/notifications.routes.js';
@@ -131,6 +132,7 @@ function steerGjcChatRun(runId, message) {
 }
 
 const { app, server, wss } = createGjcAppFactory({
+    desktopUpdateRelay: new DesktopUpdateRelay(),
     authority: gjcJobAuthority,
     orchestrator: gjcJobOrchestrator,
     gitService: getProductionGjcJobGitService(

@@ -1,4 +1,58 @@
 {
+  "about": {
+    "updateAvailable": "更新があります: {{version}}"
+  },
+  "desktopUpdate": {
+    "reasons": {
+      "discoveryFailed": "リリースの検索に失敗しました。",
+      "cacheInvalid": "キャッシュされた更新の検証に失敗しました。",
+      "preparationCancelled": "更新の準備がキャンセルされました。",
+      "preferencesNotPersisted": "自動更新の設定を保存できませんでした。"
+    },
+    "title": "デスクトップの更新",
+    "connecting": "デスクトップ更新に接続中…",
+    "unconfirmed": "デスクトップ更新へのアクセスは確認されていません。",
+    "lastConfirmed": "最後に確認したネイティブの状態です。現在の状態は未確認です。",
+    "unknownVersion": "バージョン未確認",
+    "incomplete": "リリースの検索は未完了です。最新バージョンが見つかったことを意味しません。",
+    "preparationOnly": "現在、インストールは利用できません。更新の準備完了はインストール完了ではありません。",
+    "productVersion": "アプリのバージョン",
+    "desktopVersion": "デスクトップビルド",
+    "targetProductVersion": "更新先のアプリバージョン",
+    "targetDesktopVersion": "更新先のデスクトップビルド",
+    "progress": "ダウンロードの進行状況",
+    "knownProgress": "{{downloaded}} / {{total}} バイト",
+    "unknownTotal": "{{downloaded}} バイトをダウンロード済み・合計サイズ不明",
+    "unknownProgress": "ダウンロードの進行情報を待っています。",
+    "automatic": "自動更新",
+    "automaticHelp": "設定はデスクトップアプリの確認後に反映されます。オフにすると、予定された更新のキャンセルを要求します。",
+    "confirmingSetting": "ネイティブによる設定の確認を待機中…",
+    "confirmingRestart": "安全な再起動を要求中…",
+    "check": "更新を確認",
+    "refresh": "状態を更新",
+    "retry": "もう一度確認",
+    "restart": "更新して再起動",
+    "osPrompt": "macOS が専用のシステムダイアログで管理者の承認を求める場合があります。その画面で承認またはキャンセルしてください。ここに認証情報を入力しないでください。作業中は再起動が保留される場合があります。",
+    "notes": "リリースノート",
+    "phases": {
+      "disabled": "更新は無効です",
+      "idle": "次の確認を待機中",
+      "checking": "リリースを確認中",
+      "downloading": "更新をダウンロード中",
+      "verifying": "更新を検証中",
+      "ready": "更新の準備完了",
+      "deferred": "更新は保留中",
+      "error": "更新エラー",
+      "applying": "更新を適用中",
+      "restarting": "再起動中",
+      "recovery": "復旧が必要です"
+    },
+    "errors": {
+      "unavailable": "認証済みのデスクトップ更新に接続できません。現在の状態は不明です。",
+      "invalidResponse": "デスクトップ更新が未対応の応答を返しました。インストール操作は無効のままです。",
+      "timeout": "応答の待機を終了しましたが、ネイティブの処理は続いている可能性があります。再試行の前に状態を更新してください。"
+    }
+  },
   "close": "設定を閉じる",
   "title": "設定。",
   "account": {

@@ -204,6 +204,8 @@ fn recovery_script(message: &str, retry_enabled: bool) -> String {
 
 fn reset_desktop_readiness(app: &AppHandle) {
     #[cfg(target_os = "macos")]
+    crate::updater_bridge::retire(app);
+    #[cfg(target_os = "macos")]
     crate::updater::unhealthy(app);
     app.state::<crate::navigation::LoopbackOrigin>().clear();
     crate::reset_deep_link_readiness(app);
@@ -414,6 +416,11 @@ fn navigate_and_show(
         .map_err(|error| format!("could not show main window: {error}"))
 }
 
+#[cfg(target_os = "macos")]
+fn update_bridge_environment(enabled: bool) -> [(&'static str, &'static str); 1] {
+    [("GJC_DESKTOP_UPDATE_PIPE", if enabled { "1" } else { "0" })]
+}
+
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let window = match app.get_webview_window("main") {
@@ -505,6 +512,11 @@ pub fn start(app: AppHandle) {
                 } else {
                     command.env("HOME", &home).env("PATH", &path)
                 };
+                // Apply after QA's env_clear so isolated children get the flag.
+                #[cfg(target_os = "macos")]
+                let command = command.envs(update_bridge_environment(
+                    crate::updater_bridge::enabled(&app),
+                ));
                 #[cfg(not(target_os = "macos"))]
                 let command = command.env("HOME", &home).env("PATH", &path);
                 let (events, child) = command
@@ -532,6 +544,18 @@ pub fn start(app: AppHandle) {
             }
         };
         let sidecar_pid = child.pid();
+        #[cfg(target_os = "macos")]
+        let mut child = child;
+        #[cfg(target_os = "macos")]
+        match crate::updater_bridge::attach(&app, sidecar_pid) {
+            Ok(Some(frame)) => {
+                if child.write(&frame).is_err() {
+                    crate::updater_bridge::retire(&app);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => eprintln!("desktop updater bridge unavailable"),
+        }
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let mut output = OutputRing::default();
         let mut ready = false;
@@ -688,6 +712,27 @@ pub fn start(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qa_environment_clear_preserves_only_the_explicit_late_update_flag() {
+        for enabled in [true, false] {
+            let output = std::process::Command::new("/usr/bin/env")
+                .env("GJC_DESKTOP_UPDATE_PIPE", "wrong")
+                .env_clear()
+                .envs(update_bridge_environment(enabled))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "GJC_DESKTOP_UPDATE_PIPE={}\n",
+                    if enabled { "1" } else { "0" }
+                )
+            );
+        }
+    }
 
     #[test]
     fn health_check_accepts_only_the_expected_server_identity() {
