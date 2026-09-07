@@ -1,6 +1,6 @@
 # gajae-app v2 — Session Handoff (resume state)
 
-Last updated: 2026-09-06 (post-#39 app and release acceptance). Supersedes the 2026-07-18 handoff.
+Last updated: 2026-09-07 (published beta.10 with the pending Chat UI changes). Supersedes the 2026-07-18 handoff.
 
 ## Current task scope
 
@@ -9,12 +9,20 @@ do not carry cross-model or user-skill execution forward as required remaining
 work. Historical issue #3 is not thereby proven resolved. App-owned tool-result
 delivery, desktop persistence and release artifacts remain in scope.
 
-The beta.9 candidate adds dedicated macOS QA profiles and Linux server archive
-acceptance. See `DESKTOP-QA-PROFILE.md`, `SERVER-LINUX-ACCEPTANCE.md` and
-`scripts/release/LOCAL-RELEASE.md`. Local signing uses the existing identity and
-notary profile without exporting credentials; hosted signing secrets are still
-absent. Verify actual publication in GitHub rather than inferring it from the
-candidate package version. The older session records below are historical.
+**Beta.10 is published, not just a candidate:** GitHub release `383970740`,
+published September 7, 2026 at 19:52 KST. Tag `v2.0.0-beta.10` points to
+`4979b2c49f54f79c51bf4f72cdca59c7b98ed44f`; desktop version is `0.2.4`.
+PR #45's updater preparation and PR #46's UI-inclusive manual release are
+merged. The composer Project/worktree selector and new-goal creation controls
+are removed; the model/reasoning picker is compact. Active goal controls and
+existing worktree-session behavior remain. Earlier UI-excluded candidates were
+never published. See `RELEASE-BETA10-ACCEPTANCE.md` for artifacts and acceptance.
+
+This is a **manual-install, updater-disabled** release. Automatic installation
+and restart, remaining updater G0 authority/cancellation qualification, and
+actual macOS 13 execution are not completed by it. GUI testing used macOS
+26.6.2 and isolated QA profiles; production app data and provider grants were
+not changed. The older session records below are historical.
 
 ## TL;DR
 

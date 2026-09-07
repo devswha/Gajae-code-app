@@ -41,9 +41,12 @@ Existing assets are never removed or replaced to make the set pass.
 
 After signing/notarization/stapling are complete, use the helper with the
 explicit manual flag. A separately versioned verifier-only correction does
-not change the frozen app/Linux source or release-tag target. For beta.10 those
-remain `a6b06a25bdcc8fc7e4980175fc757d93b28becc5`; record the verifier revision
-separately, and read identity/config/manifest pins from that frozen source.
+not change the frozen app/Linux source or release-tag target. The published
+UI-inclusive beta.10 installers and verifier both use
+`4979b2c49f54f79c51bf4f72cdca59c7b98ed44f`. Earlier UI-excluded candidates were
+superseded and never published. Documentation-only follow-ups may advance HEAD;
+read identity/config/manifest pins from the frozen release source, not an
+assumed current checkout. See `docs/RELEASE-BETA10-ACCEPTANCE.md`.
 
 ```js
 import { createHash } from 'node:crypto';
