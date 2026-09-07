@@ -64,13 +64,6 @@
     "stopSpeaking": "Durmak",
     "loading": "Yükleniyor…"
   },
-  "sessionWorktree": {
-    "label": "Çalışma konumu",
-    "project": "Proje",
-    "newWorktree": "Yeni çalışma ağacı",
-    "worktree": "Çalışma ağacı",
-    "preparing": "Çalışma ağacı hazırlanıyor"
-  },
   "input": {
     "placeholder": "'ya sorun, komutlar için / tuşunu veya dosya eklemek için @ tuşunu kullanın… {{provider}}",
     "modelReasoning": {

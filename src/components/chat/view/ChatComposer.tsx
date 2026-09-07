@@ -63,7 +63,6 @@ interface SlashCommand {
 }
 
 interface ChatComposerProps {
-  sessionLocationControl?: ReactNode;
   pendingPermissionRequests: PendingPermissionRequest[];
   handlePermissionDecision: (requestIds: string | string[], decision: PermissionDecision) => void;
   /** A run is in flight for the viewed session: the primary button is Stop, Enter queues. */
@@ -145,7 +144,6 @@ interface ChatComposerProps {
 }
 
 export default function ChatComposer({
-  sessionLocationControl,
   pendingPermissionRequests,
   handlePermissionDecision,
   isLoading,
@@ -442,8 +440,6 @@ export default function ChatComposer({
             can wrap separately when a split pane leaves too little room.
           */}
           <PromptInputTools className="min-w-32 flex-1 basis-0 flex-wrap gap-y-1">
-            {sessionLocationControl}
-
             <PromptInputButton
               tooltip={{ content: t('input.attachImages') }}
               onClick={openImagePicker}

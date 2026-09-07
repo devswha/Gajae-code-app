@@ -39,16 +39,20 @@ test('idle active snapshots present Paused and unavailable controls cannot dispa
   assert.equal(calls, 0);
 });
 
-test('new goal requires an explicit objective and displays bounded-run guidance', async () => {
-  const calls: unknown[] = [];
-  const view = render(<GoalControls {...initial} snapshot={{ ...initial.snapshot!, goal: null, runId: null }} control={async (input) => { calls.push(input); }} />);
-  fireEvent.click(view.getByRole('button', { name: 'New goal' }));
-  const start = view.getByRole('button', { name: 'Start goal' });
-  assert.equal((start as HTMLButtonElement).disabled, true);
-  fireEvent.change(view.getByRole('textbox', { name: 'Goal objective' }), { target: { value: 'Ship scoped controls' } });
-  assert.ok(view.getByText(/200 model steps or 120 minutes/));
-  fireEvent.click(start);
-  await waitFor(() => assert.deepEqual(calls, [{ operation: 'create', objective: 'Ship scoped controls' }]));
+test('goal controls are absent while loading or when no goal exists', () => {
+  const view = render(<GoalControls {...initial} snapshot={undefined} />);
+  assert.equal(view.container.innerHTML, '');
+  view.rerender(<GoalControls {...initial} snapshot={{ ...initial.snapshot!, goal: null, runId: null }} />);
+  assert.equal(view.container.innerHTML, '');
+});
+
+test('terminal goals show status without offering a new goal or controls', () => {
+  const view = render(<GoalControls {...initial} snapshot={{ ...initial.snapshot!, goal: { ...goal, status: 'complete' }, runId: null }} />);
+  assert.equal(view.getByRole('status').textContent, 'Goal · Complete');
+  assert.ok(view.getByText('Finish the integration'));
+  assert.equal(view.queryByRole('button', { name: 'New goal' }), null);
+  assert.equal(view.queryByRole('button', { name: 'Pause' }), null);
+  assert.equal(view.queryByRole('button', { name: 'Cancel goal' }), null);
 });
 
 test('disconnection and pending requests disable controls; server errors remain actionable', () => {

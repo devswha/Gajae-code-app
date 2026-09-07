@@ -340,6 +340,33 @@ pub fn read_qa_certificate(root: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Finalization may change native signatures and therefore manifest hashes.
+/// The signing owner rebuilds the desktop with that final digest BEFORE sealing
+/// the app; runtime verification remains an exact compiled digest comparison.
+pub fn signed_runtime_digest(
+    source: &str,
+    signed: Option<&str>,
+    target_os: &str,
+    release: bool,
+) -> Result<String, String> {
+    let valid = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if !valid(source) {
+        return Err("Invalid source runtime manifest digest.".into());
+    }
+    match signed {
+        None => Ok(source.to_owned()),
+        Some(value) if target_os == "macos" && release && valid(value) => Ok(value.to_owned()),
+        Some(_) => Err(
+            "Signed runtime binding requires a macOS release build and a canonical SHA-256.".into(),
+        ),
+    }
+}
+
 pub fn artifact_prefix(package_name: &str) -> Result<String, String> {
     if package_name.is_empty()
         || package_name.len() > 128

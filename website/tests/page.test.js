@@ -103,7 +103,7 @@ test('keeps page and social metadata aligned with the desktop app positioning', 
 test('states that the macOS beta is notarized and keeps the legacy Gatekeeper path for older builds', () => {
   const html = renderLandingPage();
   assert.match(html, /Public beta/);
-  assert.match(html, /Apple Silicon · macOS 11\+ · Notarized by Apple/);
+  assert.match(html, /Apple Silicon · macOS 13\+ · Notarized by Apple/);
   assert.equal(html.includes('Not notarized'), false);
   assert.equal(html.includes('has not been notarized'), false);
   assert.match(html, /System Settings → Privacy &amp; Security/);

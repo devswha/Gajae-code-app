@@ -1,4 +1,5 @@
 import { constants } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { lstat, mkdir, open } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
@@ -7,12 +8,14 @@ import semver from 'semver';
 import { DESKTOP_APP_ID, PACKAGE_NAME, PRODUCT_NAME, PRODUCT_TOKEN } from '../../shared/productIdentity.js';
 
 import { releaseCommand } from './local-release-command.mjs';
+import { assertOutOfTree } from './out-of-tree.mjs';
 import {
   compareAppInventories,
   cleanupUpdaterExtraction,
   extractUpdaterArchive,
   inventoryApp,
 } from './updater-archive.mjs';
+import { readUpdaterSidecar } from './updater-signature.mjs';
 
 function requireValue(condition, message) {
   if (!condition) throw new Error(message);
@@ -22,6 +25,9 @@ const O_NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const O_NONBLOCK = constants.O_NONBLOCK ?? 0;
 const MAX_PACKAGE_BYTES = 64 * 1024;
 const MAX_VTOOL_OUTPUT_BYTES = 64 * 1024;
+const MAX_BUILD_INFO_BYTES = 4096;
+const MACHO_MAGICS = new Set(['feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
+  'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca']);
 const MACOS_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?$/;
 const REQUIRED_MACHO_PATHS = Object.freeze([
   `Contents/MacOS/${PRODUCT_TOKEN}-desktop`,
@@ -29,6 +35,8 @@ const REQUIRED_MACHO_PATHS = Object.freeze([
   'Contents/Resources/resources/server-payload/dist-native/bun',
   'Contents/Resources/resources/server-payload/dist-native/gajae-core',
 ]);
+const PAYLOAD_MODULES_PREFIX = `${PRODUCT_NAME}.app/Contents/Resources/resources/server-payload/node_modules/`;
+const IOS_BARE_PREBUILD = /^bare-[a-z0-9][a-z0-9._-]*\/prebuilds\/ios-(?:arm64|x64)(-simulator)?\/[^/]+\.bare$/;
 
 function strictMacosVersion(value, label) {
   requireValue(typeof value === 'string' && MACOS_VERSION.test(value)
@@ -39,7 +47,7 @@ function strictMacosVersion(value, label) {
   return { text: value, parsed };
 }
 
-function nativeMachOPaths(app, inventory) {
+async function nativeMachOPaths(app, inventory) {
   requireValue(inventory !== null && typeof inventory === 'object' && !Array.isArray(inventory)
     && inventory.root === `${PRODUCT_NAME}.app` && Array.isArray(inventory.entries),
   `A canonical ${PRODUCT_NAME}.app inventory is required for Mach-O deployment verification.`);
@@ -52,6 +60,23 @@ function nativeMachOPaths(app, inventory) {
   const paths = new Set(required);
   for (const entry of entries) {
     const path = entry.path;
+    // Names alone miss extensionless helpers and framework executables. Read
+    // only four bytes from each inventoried regular file, never a symlink.
+    if (entry.type === 'file' && !paths.has(path)) {
+      requireValue(path.startsWith(`${PRODUCT_NAME}.app/`)
+        && !path.split('/').some(part => part === '..' || part === '.' || part === ''),
+      'Mach-O inventory path must remain inside the app.');
+      const fd = await open(join(app, path.slice(`${PRODUCT_NAME}.app/`.length)),
+        constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+      try {
+        requireValue((await fd.stat()).isFile(), 'Mach-O inventory member must remain a regular file.');
+        const magic = Buffer.alloc(4);
+        const { bytesRead } = await fd.read(magic, 0, 4, 0);
+        if (bytesRead === 4 && MACHO_MAGICS.has(magic.toString('hex'))) paths.add(path);
+      } finally {
+        await fd.close();
+      }
+    }
     if (/\.(?:node|dylib|so)$/iu.test(path)
       || path.endsWith('/@vscode/ripgrep/bin/rg')
       || path.endsWith('/node-pty/build/Release/spawn-helper')) {
@@ -71,46 +96,77 @@ function nativeMachOPaths(app, inventory) {
  * Mach-O load commands; this parser only validates its bounded textual output
  * and never interprets binary bytes itself.
  */
-export function parseVtoolBuildMinimums(output, label = 'Mach-O') {
+function parseVtoolBuildStamps(output, label) {
   requireValue(typeof output === 'string' && Buffer.byteLength(output, 'utf8') > 0
     && Buffer.byteLength(output, 'utf8') <= MAX_VTOOL_OUTPUT_BYTES,
   `${label} vtool output is missing or oversized.`);
   const lines = output.split(/\r?\n/);
-  const commands = [];
+  const stamps = [];
+  const slices = new Set();
+  let filename;
+  let universal;
   let current;
-  for (const line of lines) {
-    if (/^\s*cmd(?:\s|$)/.test(line)) {
-      const command = /^\s*cmd\s+([A-Za-z0-9_]+)\s*$/.exec(line);
-      requireValue(command, `${label} has a malformed load-command line.`);
-      if (current) commands.push(current);
-      current = { name: command[1], platform: undefined, minos: undefined };
-      continue;
-    }
-    if (!current) continue;
-    const platform = /^\s*platform\s+([A-Za-z0-9_]+)\s*$/.exec(line);
-    if (platform) {
-      requireValue(current.platform === undefined, `${label} has duplicate vtool platform evidence.`);
-      current.platform = platform[1];
-      continue;
-    }
-    const minos = /^\s*minos\s+([0-9]+(?:\.[0-9]+){1,2})\s*$/.exec(line);
-    if (minos) {
-      requireValue(current.minos === undefined, `${label} has duplicate vtool minimum evidence.`);
-      current.minos = minos[1];
-    }
-  }
-  if (current) commands.push(current);
-  requireValue(commands.length > 0, `${label} has no LC_BUILD_VERSION evidence.`);
-  requireValue(commands.every(command => command.name === 'LC_BUILD_VERSION'),
-    `${label} contains an unsupported load command; only LC_BUILD_VERSION is accepted.`);
-  const minimums = [];
-  for (const stamp of commands) {
-    requireValue(stamp.platform === 'MACOS' && stamp.minos !== undefined,
+  const finishSlice = () => {
+    requireValue(current?.cmd === 'LC_BUILD_VERSION' && current.platform !== undefined && current.minos !== undefined,
       `${label} has missing or unsupported LC_BUILD_VERSION evidence.`);
-    strictMacosVersion(stamp.minos, `${label} minos`);
-    minimums.push(stamp.minos);
+    requireValue(['MACOS', 'IOS', 'IOSSIMULATOR'].includes(current.platform),
+      `${label} has unsupported LC_BUILD_VERSION platform evidence.`);
+    strictMacosVersion(current.minos, `${label} ${current.platform} minos`);
+    stamps.push(Object.freeze({ platform: current.platform, minos: current.minos }));
+  };
+  for (const line of lines) {
+    if (line.trim() === '') continue;
+    const header = /^(\S.*?)(?: \(architecture ([A-Za-z0-9_]+)\))?:$/.exec(line);
+    if (header) {
+      if (filename !== undefined) finishSlice();
+      const isUniversal = header[2] !== undefined;
+      const slice = header[2] ?? 'thin';
+      requireValue((filename === undefined || filename === header[1])
+        && (universal === undefined || universal === isUniversal) && !slices.has(slice),
+      `${label} has duplicate or inconsistent vtool slice evidence.`);
+      filename = header[1];
+      universal = isUniversal;
+      slices.add(slice);
+      current = undefined;
+      continue;
+    }
+    if (/^Load command (?:0|[1-9]\d*)$/.test(line)) {
+      requireValue(filename !== undefined && current === undefined,
+        `${label} has duplicate or unsupported load-command evidence.`);
+      current = {};
+      continue;
+    }
+    const field = /^\s*(cmd|platform|minos|cmdsize|sdk|ntools)\s+(\S+)\s*$/.exec(line);
+    if (field) {
+      const [, key, value] = field;
+      requireValue(current !== undefined && (key === 'cmd' || current.cmd === 'LC_BUILD_VERSION'),
+        `${label} has misplaced LC_BUILD_VERSION evidence.`);
+      requireValue(current[key] === undefined, `${label} has duplicate vtool ${key} evidence.`);
+      if (key === 'cmd') requireValue(value === 'LC_BUILD_VERSION', `${label} contains an unsupported load command.`);
+      else if (key === 'platform') requireValue(/^[A-Z][A-Z0-9_]*$/.test(value), `${label} has malformed platform evidence.`);
+      else requireValue((key === 'cmdsize' || key === 'ntools' ? /^(0|[1-9]\d*)$/ : /^\d+(?:\.\d+){1,2}$/).test(value),
+        `${label} has malformed vtool ${key} evidence.`);
+      current[key] = value;
+      continue;
+    }
+    // Linker/tool metadata is not deployment evidence, but malformed or
+    // unrecognized lines must not hide an extra platform/minimum stamp.
+    requireValue(current?.cmd === 'LC_BUILD_VERSION'
+      && /^\s*(?:tool\s+[A-Za-z0-9_]+|version\s+\d+(?:\.\d+){1,2})\s*$/.test(line),
+    `${label} has malformed vtool output or LC_BUILD_VERSION evidence.`);
   }
-  return Object.freeze(minimums);
+  finishSlice();
+  requireValue(stamps.every(stamp => stamp.platform === stamps[0].platform),
+    `${label} has mixed LC_BUILD_VERSION platforms.`);
+  return Object.freeze(stamps);
+}
+
+/** Public parser remains strictly macOS; resource classification is internal. */
+export function parseVtoolBuildMinimums(output, label = 'Mach-O') {
+  const stamps = parseVtoolBuildStamps(output, label);
+  requireValue(stamps.every(stamp => stamp.platform === 'MACOS'),
+    `${label} has missing or unsupported LC_BUILD_VERSION evidence.`);
+  return Object.freeze(stamps.map(stamp => stamp.minos));
 }
 
 /**
@@ -124,8 +180,9 @@ export async function verifyMacosDeploymentFloor({
   inventory,
 }, { run = releaseCommand } = {}) {
   const declared = strictMacosVersion(minimumSystemVersion, 'minimumSystemVersion');
-  const paths = nativeMachOPaths(app, inventory);
+  const paths = await nativeMachOPaths(app, inventory);
   const stamps = [];
+  const nonMacResources = [];
   for (const item of paths) {
     const result = await run('xcrun', ['vtool', '-show-build', item.absolute], {
       maxOutputBytes: MAX_VTOOL_OUTPUT_BYTES,
@@ -135,7 +192,18 @@ export async function verifyMacosDeploymentFloor({
     `${item.path} vtool result has an invalid shape.`);
     requireValue(result.stderr === '', `${item.path} vtool wrote diagnostics to stderr.`);
     const output = result.stdout;
-    const minimums = parseVtoolBuildMinimums(output, item.path);
+    const buildStamps = parseVtoolBuildStamps(output, item.path);
+    const platform = buildStamps[0].platform;
+    if (platform !== 'MACOS') {
+      const resource = item.path.startsWith(PAYLOAD_MODULES_PREFIX)
+        ? IOS_BARE_PREBUILD.exec(item.path.slice(PAYLOAD_MODULES_PREFIX.length)) : null;
+      requireValue(resource && platform === (resource[1] ? 'IOSSIMULATOR' : 'IOS'),
+        `${item.path} has unsupported foreign platform ${platform} outside its matching iOS bare prebuild resource path.`);
+      nonMacResources.push(Object.freeze({ path: item.path, platform,
+        minimumSystemVersions: Object.freeze(buildStamps.map(stamp => stamp.minos)) }));
+      continue;
+    }
+    const minimums = buildStamps.map(stamp => stamp.minos);
     for (const minimum of minimums) {
       const parsed = strictMacosVersion(minimum, `${item.path} minos`);
       requireValue(semver.lte(parsed.parsed, declared.parsed),
@@ -150,6 +218,8 @@ export async function verifyMacosDeploymentFloor({
         ? item.minimumSystemVersion : max
     ), '0.0'),
     stamps: Object.freeze(stamps),
+    nonMacResourceCount: nonMacResources.length,
+    nonMacResources: Object.freeze(nonMacResources),
   });
 }
 
@@ -180,6 +250,31 @@ export function assertDeveloperSignature(output, teamId, { hardened = false } = 
 
 export function assertNotarizedAssessment(output) {
   requireValue(/: accepted\s*$/m.test(output) && /^source=Notarized Developer ID\s*$/m.test(output), 'Gatekeeper did not accept Notarized Developer ID.');
+}
+
+/** The signed executable must positively attest its compile-time disabled mode. */
+export function assertManualBuildInfo(text, { version, desktopVersion, runtimeManifestSha256, payloadRuntimeManifestSha256 }) {
+  requireValue(typeof runtimeManifestSha256 === 'string' && /^[a-f0-9]{64}$/.test(runtimeManifestSha256),
+    'The pinned source runtimeManifestSha256 is required for manual verification.');
+  requireValue(typeof payloadRuntimeManifestSha256 === 'string' && /^[a-f0-9]{64}$/.test(payloadRuntimeManifestSha256),
+    'The verified signed payload runtime manifest SHA-256 is required.');
+  requireValue(typeof text === 'string' && Buffer.byteLength(text) <= MAX_BUILD_INFO_BYTES,
+    'Desktop build info is missing or oversized.');
+  let info;
+  try { info = JSON.parse(text); } catch { throw new Error('Desktop build info must be exactly one JSON object.'); }
+  const expected = { schemaVersion: 1, packageName: PACKAGE_NAME, productVersion: version,
+    desktopVersion, debug: false, updateMode: 'disabled', runtimeManifestSha256, payloadRuntimeManifestSha256 };
+  requireValue(info !== null && typeof info === 'object' && !Array.isArray(info)
+    && JSON.stringify(Object.keys(info).sort()) === JSON.stringify(Object.keys(expected).sort()),
+  'Desktop build info must contain exactly the eight schema fields.');
+  // This schema is flat and all accepted values are primitives. Count keys
+  // in the original text as well so JSON.parse cannot hide duplicate fields.
+  const keys = [...text.matchAll(/"(?:\\.|[^"\\])*"\s*:/g)];
+  requireValue(keys.length === Object.keys(expected).length, 'Desktop build info contains duplicate fields.');
+  for (const [key, value] of Object.entries(expected)) {
+    requireValue(info[key] === value, `Desktop build info ${key} does not match the pinned manual-disabled build.`);
+  }
+  return Object.freeze(info);
 }
 
 /**
@@ -240,9 +335,22 @@ export async function verifyMacosRelease({
   desktopVersion,
   updaterArchivePath,
   minimumSystemVersion,
+  manualDisabled = false,
+  runtimeManifestSha256,
 }, { run = releaseCommand } = {}) {
-  requireValue(typeof updaterArchivePath === 'string' && updaterArchivePath.length > 0,
-    'A verified updaterArchivePath is required for macOS release verification.');
+  requireValue(typeof manualDisabled === 'boolean', 'manualDisabled must be an explicit boolean.');
+  if (manualDisabled) {
+    requireValue(updaterArchivePath === undefined, 'Manual-disabled verification forbids an updater archive.');
+    requireValue(typeof runtimeManifestSha256 === 'string' && /^[a-f0-9]{64}$/.test(runtimeManifestSha256),
+      'The pinned source runtimeManifestSha256 is required for manual verification.');
+    const rootStat = await lstat(root);
+    requireValue(rootStat.isDirectory() && !rootStat.isSymbolicLink() && (rootStat.mode & 0o077) === 0
+      && rootStat.uid === process.getuid(), 'Manual verification requires an owner-only private directory.');
+    await assertOutOfTree(root, 'Manual release verification');
+  } else {
+    requireValue(typeof updaterArchivePath === 'string' && updaterArchivePath.length > 0,
+      'A verified updaterArchivePath is required for macOS release verification.');
+  }
   strictMacosVersion(minimumSystemVersion, 'minimumSystemVersion');
   await run('hdiutil', ['verify', dmg]);
   await run('codesign', ['--verify', '--strict', dmg]);
@@ -259,6 +367,7 @@ export async function verifyMacosRelease({
   let verificationError;
   let verificationResult;
   let extracted;
+  let copiedDeployment;
   try {
     await run('hdiutil', ['attach', dmg, '-nobrowse', '-readonly', '-mountpoint', mount]);
     const mountedApp = join(mount, `${PRODUCT_NAME}.app`);
@@ -271,16 +380,39 @@ export async function verifyMacosRelease({
     // names, so this equality binds runtime content without a second parser or
     // a mutable-manifest shortcut.
     const copiedInventory = await inventoryApp(copiedApp);
-    extracted = await extractUpdaterArchive({ archivePath: updaterArchivePath, root });
-    compareAppInventories(copiedInventory, extracted.inventory);
-    for (const app of [mountedApp, copiedApp, extracted.appPath]) {
+    if (manualDisabled) {
+      compareAppInventories(copiedInventory, await inventoryApp(mountedApp));
+    } else {
+      extracted = await extractUpdaterArchive({ archivePath: updaterArchivePath, root });
+      compareAppInventories(copiedInventory, extracted.inventory);
+    }
+    for (const app of [mountedApp, copiedApp, ...(extracted ? [extracted.appPath] : [])]) {
       const appInventory = app === copiedApp ? copiedInventory
-        : app === extracted.appPath ? extracted.inventory : undefined;
-      await verifyMacosApp({
+        : app === extracted?.appPath ? extracted.inventory : undefined;
+      const verifiedApp = await verifyMacosApp({
         app, teamId, version, desktopVersion, minimumSystemVersion, inventory: appInventory,
       }, { run });
+      if (app === copiedApp) copiedDeployment = verifiedApp.deployment;
     }
-    verificationResult = { copiedApp, extractedApp: extracted.appPath, inventory: copiedInventory, archive: extracted.archive };
+    if (manualDisabled) {
+      // No UI, browser IPC, QA mode or lifecycle initialization. This early
+      // diagnostic is run only after *all* copied-app and Apple checks pass.
+      const output = join(root, 'desktop-build-info.json');
+      const result = await run(join(copiedApp, 'Contents/MacOS', `${PRODUCT_TOKEN}-desktop`),
+        ['--desktop-build-info'], { output, timeout: 10_000, maxOutputBytes: MAX_BUILD_INFO_BYTES });
+      requireValue(result?.stderr === '', 'Desktop build info wrote unexpected diagnostics.');
+      const payloadManifest = await readUpdaterSidecar(join(copiedApp,
+        'Contents/Resources/resources/server-payload/server/gjc-runtime-manifest.json'), MAX_PACKAGE_BYTES);
+      const payloadRuntimeManifestSha256 = createHash('sha256').update(payloadManifest, 'utf8').digest('hex');
+      const buildInfo = assertManualBuildInfo(await readUpdaterSidecar(output, MAX_BUILD_INFO_BYTES),
+        { version, desktopVersion, runtimeManifestSha256, payloadRuntimeManifestSha256 });
+      compareAppInventories(copiedInventory, await inventoryApp(copiedApp));
+      verificationResult = { copiedApp, inventory: copiedInventory, deployment: copiedDeployment,
+        buildInfo, payloadRuntimeManifestSha256, updateMode: 'disabled' };
+    } else {
+      verificationResult = { copiedApp, extractedApp: extracted.appPath, inventory: copiedInventory,
+        deployment: copiedDeployment, archive: extracted.archive };
+    }
   } catch (error) {
     verificationError = error;
   }

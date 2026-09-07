@@ -1,6 +1,6 @@
 [package]
 name = "gajae-app-desktop"
-version = "0.2.3"
+version = "0.2.4"
 description = "Gajae Code App desktop shell"
 license = "MIT"
 authors = ["Gajae Code App contributors"]

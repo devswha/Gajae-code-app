@@ -60,7 +60,7 @@ export function renderLandingPage() {
                 ${appleIcon()}
                 Download for macOS
               </a>
-              <p class="platform-note" id="macos-beta-notice">Apple Silicon · macOS 11+ · Notarized by Apple</p>
+              <p class="platform-note" id="macos-beta-notice">Apple Silicon · macOS 13+ · Notarized by Apple</p>
             </div>
             <div class="platform-cta">
               <a class="button button-secondary" href="#linux-download" aria-describedby="linux-desktop-notice">Download for Linux</a>
@@ -112,7 +112,7 @@ export function renderLandingPage() {
             <div class="download-row">
               <div>
                 <h3>macOS</h3>
-                <p>Apple Silicon · macOS 11+</p>
+                <p>Apple Silicon · macOS 13+</p>
                 <a class="quiet-link" href="#macos-install">First-launch instructions</a>
               </div>
               <div class="download-actions">

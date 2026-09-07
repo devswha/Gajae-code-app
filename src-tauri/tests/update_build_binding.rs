@@ -160,6 +160,25 @@ fn disabled_mode_is_explicitly_empty_and_unknown_or_partial_modes_fail() {
 }
 
 #[test]
+fn signed_runtime_binding_is_exact_and_only_admitted_for_macos_release() {
+    let source = "a".repeat(64);
+    let signed = "b".repeat(64);
+    assert_eq!(
+        binding::signed_runtime_digest(&source, None, "linux", false).unwrap(),
+        source
+    );
+    assert_eq!(
+        binding::signed_runtime_digest(&source, Some(&signed), "macos", true).unwrap(),
+        signed
+    );
+    assert!(binding::signed_runtime_digest(&source, Some(&signed), "linux", true).is_err());
+    assert!(binding::signed_runtime_digest(&source, Some(&signed), "macos", false).is_err());
+    for bad in ["".into(), "A".repeat(64), "f".repeat(63), "g".repeat(64)] {
+        assert!(binding::signed_runtime_digest(&source, Some(&bad), "macos", true).is_err());
+    }
+}
+
+#[test]
 fn nonmac_targets_are_disabled_and_reject_explicit_enablement() {
     let temp = TempRoot::new();
     let mut disabled = inputs(&temp.0);
