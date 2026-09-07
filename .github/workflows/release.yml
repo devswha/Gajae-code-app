@@ -2,6 +2,12 @@ name: Release Gajae Code App
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified draft after all final checks
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -156,6 +162,7 @@ jobs:
       APPLE_ID: ${{ secrets.APPLE_ID }}
       APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      GAJAE_UPDATER_PUBLIC_KEY: ${{ vars.GAJAE_UPDATER_PUBLIC_KEY }}
     outputs:
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
       release_tag: ${{ steps.metadata.outputs.release_tag }}
@@ -193,7 +200,36 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Require release signing credentials
-        run: node scripts/release/check-signing-readiness.mjs --mode ci
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          node scripts/release/check-signing-readiness.mjs --mode ci
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}"
+          test -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+          test -n "${GAJAE_UPDATER_PUBLIC_KEY:-}"
+
+      - name: Install and verify Minisign 0.12
+        run: |
+          set -euo pipefail
+          brew install minisign
+          test "$(minisign -v)" = "minisign 0.12"
+
+      - name: Prepare updater public key and reviewed source notes
+        run: |
+          set -euo pipefail
+          PUBLIC_KEY_FILE="$RUNNER_TEMP/gajae-updater.pub"
+          NOTES_FILE="$RUNNER_TEMP/gajae-release-notes.txt"
+          printf '%s' "$GAJAE_UPDATER_PUBLIC_KEY" > "$PUBLIC_KEY_FILE"
+          chmod 600 "$PUBLIC_KEY_FILE"
+          git show -s --format=%B "$GITHUB_SHA" > "$NOTES_FILE"
+          chmod 600 "$NOTES_FILE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          {
+            echo "GAJAE_UPDATER_PUBLIC_KEY_FILE=$PUBLIC_KEY_FILE"
+            echo "GAJAE_RELEASE_NOTES_FILE=$NOTES_FILE"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Rust
         run: |
@@ -283,28 +319,26 @@ jobs:
           (cd "$(dirname "$DMG")" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
           spctl -a -t open --context context:primary-signature -vv "$DMG"
 
-      - name: Stage and verify canonical desktop assets
+      - name: Build canonical macOS updater assets
         env:
           ASSET_NAME: ${{ steps.metadata.outputs.artifact_name }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          SOURCE="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/$ASSET_NAME"
-          test -f "$SOURCE"
-          test -f "$SOURCE.sha256"
-          (
-            cd "$(dirname "$SOURCE")"
-            shasum -a 256 --check "$(basename "$SOURCE.sha256")"
-          )
-          mkdir release-assets
-          cp "$SOURCE" "$SOURCE.sha256" release-assets/
-          assets=(release-assets/*)
-          if [ "${#assets[@]}" -ne 2 ] ||
-             [ ! -f "release-assets/$ASSET_NAME" ] ||
-             [ ! -f "release-assets/$ASSET_NAME.sha256" ]; then
-            echo "Desktop release staging must contain only the canonical DMG and checksum." >&2
-            exit 1
-          fi
-          hdiutil verify "release-assets/$ASSET_NAME"
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Gajae Code App.app"
+          DMG="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/$ASSET_NAME"
+          PUB_DATE="$(date -u -r "$(git show -s --format=%ct "$GITHUB_SHA")" +%Y-%m-%dT%H:%M:%SZ)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          node scripts/release/make-macos-updater.mjs \
+            --app "$APP" \
+            --dmg "$DMG" \
+            --output "$RUNNER_TEMP/gajae-macos-assets" \
+            --commit "$GITHUB_SHA" \
+            --team-id "$APPLE_TEAM_ID" \
+            --updater-public-key-file "$GAJAE_UPDATER_PUBLIC_KEY_FILE" \
+            --notes-file "$GAJAE_RELEASE_NOTES_FILE" \
+            --pub-date "$PUB_DATE"
 
       - name: Smoke the app installed from the DMG
         env:
@@ -315,7 +349,7 @@ jobs:
           set -euo pipefail
           MOUNT_POINT="$RUNNER_TEMP/gajae-app-dmg"
           mkdir "$MOUNT_POINT"
-          hdiutil attach "release-assets/$ASSET_NAME" -nobrowse -readonly -mountpoint "$MOUNT_POINT"
+          hdiutil attach "$RUNNER_TEMP/gajae-macos-assets/$ASSET_NAME" -nobrowse -readonly -mountpoint "$MOUNT_POINT"
           trap 'hdiutil detach "$MOUNT_POINT"' EXIT
           APP="$MOUNT_POINT/Gajae Code App.app"
           test -d "$APP"
@@ -347,7 +381,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gajae-app-desktop-release
-          path: release-assets/*
+          path: ${{ runner.temp }}/gajae-macos-assets/*
           if-no-files-found: error
 
       - name: Remove the signing keychain
@@ -425,9 +459,9 @@ jobs:
       - build
       - desktop-macos
       - ubuntu-24-compatibility
-    runs-on: ubuntu-22.04
+    runs-on: macos-14
     environment: release
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -440,6 +474,41 @@ jobs:
             echo "Refusing to publish a desktop artifact without the signing and notarization lane." >&2
             exit 1
           fi
+
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          architecture: arm64
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install and verify Minisign 0.12
+        run: |
+          set -euo pipefail
+          brew install minisign
+          test "$(minisign -v)" = "minisign 0.12"
+
+      - name: Prepare updater public key
+        env:
+          GAJAE_UPDATER_PUBLIC_KEY: ${{ vars.GAJAE_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -n "${GAJAE_UPDATER_PUBLIC_KEY:-}"
+          PUBLIC_KEY_FILE="$RUNNER_TEMP/gajae-updater.pub"
+          printf '%s' "$GAJAE_UPDATER_PUBLIC_KEY" > "$PUBLIC_KEY_FILE"
+          chmod 600 "$PUBLIC_KEY_FILE"
+          echo "GAJAE_UPDATER_PUBLIC_KEY_FILE=$PUBLIC_KEY_FILE" >> "$GITHUB_ENV"
 
       - name: Download canonical server release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -461,53 +530,58 @@ jobs:
           DESKTOP_RELEASE_TAG: ${{ needs.desktop-macos.outputs.release_tag }}
         run: |
           set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           if [ "$SERVER_RELEASE_TAG" != "$DESKTOP_RELEASE_TAG" ]; then
             echo "Server and desktop release tags do not match." >&2
             exit 1
           fi
           shopt -s nullglob
           assets=(release-assets/*)
-          if [ "${#assets[@]}" -ne 4 ] ||
+          if [ "${#assets[@]}" -ne 8 ] ||
              [ ! -f "release-assets/$SERVER_ASSET_NAME" ] ||
              [ ! -f "release-assets/$SERVER_ASSET_NAME.sha256" ] ||
-             [ ! -f "release-assets/$DESKTOP_ASSET_NAME" ] ||
-             [ ! -f "release-assets/$DESKTOP_ASSET_NAME.sha256" ]; then
+             [ ! -f "release-assets/$DESKTOP_ASSET_NAME" ]; then
             echo "Refusing to publish non-canonical release assets." >&2
             exit 1
           fi
-          (
-            cd release-assets
-            sha256sum --check "$SERVER_ASSET_NAME.sha256"
-            sha256sum --check "$DESKTOP_ASSET_NAME.sha256"
-          )
+          VERSION="${SERVER_RELEASE_TAG#v}"
+          for asset in \
+            "gajae-app-desktop-${VERSION}-macos-arm64.dmg" \
+            "gajae-app-desktop-${VERSION}-macos-arm64.dmg.sha256" \
+            "gajae-app-desktop-${VERSION}-macos-arm64.app.tar.gz" \
+            "gajae-app-desktop-${VERSION}-macos-arm64.app.tar.gz.sig" \
+            "gajae-app-desktop-${VERSION}-macos-arm64.app.tar.gz.sha256" \
+            "desktop-update.json"; do
+            test -f "release-assets/$asset"
+          done
 
-      - name: Create GitHub Release
+      - name: Verify, stage and publish the release draft
         env:
           GH_TOKEN: ${{ github.token }}
-          SERVER_ASSET_NAME: ${{ needs.build.outputs.artifact_name }}
-          DESKTOP_ASSET_NAME: ${{ needs.desktop-macos.outputs.artifact_name }}
           RELEASE_TAG: ${{ needs.build.outputs.release_tag }}
+          RELEASE_PUBLISH: ${{ inputs.publish }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          prerelease_args=()
-          if [[ "$RELEASE_TAG" == *-* ]]; then
-            prerelease_args+=(--prerelease)
+          test -n "${APPLE_TEAM_ID:-}"
+          publish_args=()
+          if [[ "$RELEASE_PUBLISH" == "true" ]]; then
+            publish_args+=(--publish)
           fi
-          gh release create "$RELEASE_TAG" \
-            "release-assets/$SERVER_ASSET_NAME" \
-            "release-assets/$SERVER_ASSET_NAME.sha256" \
-            "release-assets/$DESKTOP_ASSET_NAME" \
-            "release-assets/$DESKTOP_ASSET_NAME.sha256" \
+          node scripts/release/ci-release.mjs \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Gajae Code App $RELEASE_TAG" \
-            "${prerelease_args[@]}" \
-            --generate-notes
+            --tag "$RELEASE_TAG" \
+            --commit "$GITHUB_SHA" \
+            --team-id "$APPLE_TEAM_ID" \
+            --assets-dir release-assets \
+            --updater-public-key-file "$GAJAE_UPDATER_PUBLIC_KEY_FILE" \
+            "${publish_args[@]}"
 
       # A release created with GITHUB_TOKEN does not raise `release: published`,
       # so a separate notification workflow listening for that event never runs.
       # The lane that publishes announces.
       - name: Announce the release
+        if: ${{ inputs.publish == true }}
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           SERVER_ASSET_NAME: ${{ needs.build.outputs.artifact_name }}

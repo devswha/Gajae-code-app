@@ -4,7 +4,7 @@ use std::{
     env,
     io::{Read, Write},
     net::TcpStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -27,6 +27,7 @@ const FAILED_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_STOP_GRACE: Duration = Duration::from_secs(30);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_RESPONSE_LIMIT: usize = 16 * 1024;
+const EXPECTED_PAYLOAD_VERSION: &str = env!("GJC_EXPECTED_PAYLOAD_VERSION");
 
 #[derive(Default)]
 pub(crate) struct RecoveryScreen(std::sync::Mutex<Option<(String, bool)>>);
@@ -49,6 +50,7 @@ impl ReadyFrame {
             && self.host == "127.0.0.1"
             && self.port != 0
             && self.protocol_version == PROTOCOL_VERSION
+            && self.version == EXPECTED_PAYLOAD_VERSION
     }
 }
 
@@ -124,7 +126,7 @@ fn endpoint(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-fn health_check(port: u16, expected_version: &str) -> Result<(), String> {
+fn health_check(port: u16) -> Result<(), String> {
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     let mut stream = TcpStream::connect_timeout(
         &format!("127.0.0.1:{port}")
@@ -154,7 +156,7 @@ fn health_check(port: u16, expected_version: &str) -> Result<(), String> {
     if health.status != "ok"
         || health.product != "gajae-app"
         || health.protocol_version != PROTOCOL_VERSION
-        || health.version != expected_version
+        || health.version != EXPECTED_PAYLOAD_VERSION
     {
         return Err("health endpoint identity did not match the supervised server".to_owned());
     }
@@ -201,6 +203,8 @@ fn recovery_script(message: &str, retry_enabled: bool) -> String {
 }
 
 fn reset_desktop_readiness(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    crate::updater::unhealthy(app);
     app.state::<crate::navigation::LoopbackOrigin>().clear();
     crate::reset_deep_link_readiness(app);
 }
@@ -236,6 +240,28 @@ fn show_error(window: &WebviewWindow, message: &str, retry_enabled: bool) {
 fn is_recovery_origin(url: &tauri::Url) -> bool {
     (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
         || (url.scheme() == "http" && url.host_str() == Some("tauri.localhost"))
+}
+
+pub(crate) fn desktop_data_root(app: &AppHandle) -> Result<PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    if let Some(profile) = app.try_state::<crate::qa_profile::QaProfile>() {
+        return Ok(profile.home().join(".gajae-app"));
+    }
+    app.path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())
+}
+
+fn update_attempt_admission(desktop_data_root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::updater_attempt::check(desktop_data_root)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = desktop_data_root;
+        Ok(())
+    }
 }
 
 /// Called by the main page-load hook after the bundled document finishes.
@@ -398,24 +424,29 @@ pub fn start(app: AppHandle) {
         if lifecycle.is_shutting_down() || lifecycle.has_sidecar() {
             return;
         }
-        let origin_directory = app.path().app_local_data_dir();
-        #[cfg(target_os = "macos")]
-        let origin_directory =
-            if let Some(profile) = app.try_state::<crate::qa_profile::QaProfile>() {
-                Ok(profile.home().join(".gajae-app"))
-            } else {
-                origin_directory
-            };
-        let desktop_origin = match origin_directory
-            .map_err(|error| error.to_string())
-            .and_then(crate::desktop_origin::DesktopOrigin::load)
-        {
-            Ok(origin) => origin,
+        let desktop_data_root = match desktop_data_root(&app) {
+            Ok(root) => root,
             Err(error) => {
-                show_error(&window, &error, true);
+                show_error(&window, &error, !cfg!(target_os = "macos"));
                 return;
             }
         };
+        // Classify an already-invalid update-attempt path before origin
+        // loading can turn it into an ordinary retryable origin error. The
+        // lifecycle admission below repeats this check under its PID/shutdown
+        // lock so neither startup nor Retry can skip admission.
+        if let Err(error) = update_attempt_admission(&desktop_data_root) {
+            show_error(&window, &error, false);
+            return;
+        }
+        let desktop_origin =
+            match crate::desktop_origin::DesktopOrigin::load(desktop_data_root.clone()) {
+                Ok(origin) => origin,
+                Err(error) => {
+                    show_error(&window, &error, true);
+                    return;
+                }
+            };
         let payload = match payload_root(&app) {
             Ok(payload) => payload,
             Err(error) => {
@@ -423,6 +454,12 @@ pub fn start(app: AppHandle) {
                 return;
             }
         };
+        if let Err(error) = crate::expected_payload::ExpectedPayload::compiled()
+            .and_then(|expected| expected.verify_payload(&payload))
+        {
+            show_error(&window, &error, true);
+            return;
+        }
         let api_key = match random_secret() {
             Ok(value) => value,
             Err(error) => {
@@ -440,48 +477,56 @@ pub fn start(app: AppHandle) {
         let home = env::var("HOME").unwrap_or_default();
         let path = env::var("PATH").unwrap_or_default();
         let entrypoint = payload.join("dist-server/server/index.js");
-        let command = lifecycle.start(|| {
-            reset_desktop_readiness(&app);
-            *app.state::<RecoveryScreen>()
-                .0
-                .lock()
-                .expect("recovery screen lock poisoned") = None;
-            let command = app
-                .shell()
-                .sidecar("gajae-app-server")
-                .map_err(|error| format!("could not prepare server sidecar: {error}"))?
-                .arg(entrypoint.to_string_lossy().as_ref());
-            #[cfg(target_os = "macos")]
-            let command = if let Some(profile) = app.try_state::<crate::qa_profile::QaProfile>() {
-                if payload.join(".env").exists() {
-                    return Err(
-                        "QA refuses a server payload containing an environment file.".into(),
-                    );
-                }
-                command
-                    .env_clear()
-                    .envs(profile.environment())
-                    .current_dir(profile.home())
-            } else {
-                command.env("HOME", &home).env("PATH", &path)
-            };
-            #[cfg(not(target_os = "macos"))]
-            let command = command.env("HOME", &home).env("PATH", &path);
-            let (events, child) = command
-                .env("HOST", "127.0.0.1")
-                .env("SERVER_PORT", desktop_origin.requested_port().to_string())
-                .env("NODE_ENV", "production")
-                .env("GJC_DESKTOP", "1")
-                .env("GJC_DESKTOP_API_KEY", api_key)
-                .env("GJC_DESKTOP_BOOTSTRAP_NONCE", &nonce)
-                .spawn()
-                .map_err(|error| format!("could not start server sidecar: {error}"))?;
-            Ok((child.pid(), (events, child)))
-        });
+        let command = lifecycle.start(
+            || update_attempt_admission(&desktop_data_root),
+            || {
+                reset_desktop_readiness(&app);
+                *app.state::<RecoveryScreen>()
+                    .0
+                    .lock()
+                    .expect("recovery screen lock poisoned") = None;
+                let command = app
+                    .shell()
+                    .sidecar("gajae-app-server")
+                    .map_err(|error| format!("could not prepare server sidecar: {error}"))?
+                    .arg(entrypoint.to_string_lossy().as_ref());
+                #[cfg(target_os = "macos")]
+                let command = if let Some(profile) = app.try_state::<crate::qa_profile::QaProfile>()
+                {
+                    if payload.join(".env").exists() {
+                        return Err(
+                            "QA refuses a server payload containing an environment file.".into(),
+                        );
+                    }
+                    command
+                        .env_clear()
+                        .envs(profile.environment())
+                        .current_dir(profile.home())
+                } else {
+                    command.env("HOME", &home).env("PATH", &path)
+                };
+                #[cfg(not(target_os = "macos"))]
+                let command = command.env("HOME", &home).env("PATH", &path);
+                let (events, child) = command
+                    .env("HOST", "127.0.0.1")
+                    .env("SERVER_PORT", desktop_origin.requested_port().to_string())
+                    .env("NODE_ENV", "production")
+                    .env("GJC_DESKTOP", "1")
+                    .env("GJC_DESKTOP_API_KEY", api_key)
+                    .env("GJC_DESKTOP_BOOTSTRAP_NONCE", &nonce)
+                    .spawn()
+                    .map_err(|error| format!("could not start server sidecar: {error}"))?;
+                Ok((child.pid(), (events, child)))
+            },
+        );
         let (mut events, child) = match command {
             Ok(Some(child)) => child,
             Ok(None) => return,
-            Err(error) => {
+            Err(crate::lifecycle::StartError::Admission(error)) => {
+                show_error(&window, &error, false);
+                return;
+            }
+            Err(crate::lifecycle::StartError::Spawn(error)) => {
                 show_error(&window, &error, true);
                 return;
             }
@@ -572,7 +617,7 @@ pub fn start(app: AppHandle) {
                         if !ready_frame.matches_sidecar(sidecar_pid) {
                             continue;
                         }
-                        match health_check(ready_frame.port, &ready_frame.version) {
+                        match health_check(ready_frame.port) {
                             Ok(()) => {
                                 // Quit can arrive during the health request.
                                 if lifecycle.is_shutting_down() {
@@ -591,6 +636,8 @@ pub fn start(app: AppHandle) {
                                     return;
                                 }
                                 ready = true;
+                                #[cfg(target_os = "macos")]
+                                crate::updater::after_healthy(&app);
                                 break;
                             }
                             Err(error) => {
@@ -644,7 +691,7 @@ mod tests {
 
     #[test]
     fn health_check_accepts_only_the_expected_server_identity() {
-        for version in ["expected", "wrong"] {
+        for version in [EXPECTED_PAYLOAD_VERSION, "wrong"] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let responder = std::thread::spawn(move || {
@@ -665,11 +712,82 @@ mod tests {
                 .unwrap();
             });
             assert_eq!(
-                health_check(port, "expected").is_ok(),
-                version == "expected"
+                health_check(port).is_ok(),
+                version == EXPECTED_PAYLOAD_VERSION
             );
             responder.join().unwrap();
         }
+    }
+
+    #[test]
+    fn ready_frame_and_health_agreeing_on_wrong_product_version_are_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let child_version = "9.9.9";
+        let responder = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0u8; 1024];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            let body = format!(
+                r#"{{"status":"ok","product":"gajae-app","protocolVersion":1,"version":"{child_version}"}}"#
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let ready = ReadyFrame {
+            kind: READY_KIND.to_owned(),
+            pid: 1,
+            host: "127.0.0.1".to_owned(),
+            port,
+            protocol_version: PROTOCOL_VERSION,
+            version: child_version.to_owned(),
+        };
+
+        assert!(!ready.matches_sidecar(1));
+        assert!(health_check(port).is_err());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn matching_ready_frame_and_health_pass_compiled_product_version() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0u8; 1024];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            let body = format!(
+                r#"{{"status":"ok","product":"gajae-app","protocolVersion":1,"version":"{EXPECTED_PAYLOAD_VERSION}"}}"#
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let ready = ReadyFrame {
+            kind: READY_KIND.to_owned(),
+            pid: 1,
+            host: "127.0.0.1".to_owned(),
+            port,
+            protocol_version: PROTOCOL_VERSION,
+            version: EXPECTED_PAYLOAD_VERSION.to_owned(),
+        };
+
+        assert!(ready.matches_sidecar(1));
+        assert!(health_check(port).is_ok());
+        responder.join().unwrap();
     }
 
     #[test]
@@ -825,7 +943,7 @@ mod tests {
                 for send_exit in [true, false] {
                     let lifecycle = SidecarLifecycle::default();
                     let (mut child, mut events) = TestChild::spawn(true, send_exit);
-                    lifecycle.start(|| Ok((child.pid, ()))).unwrap();
+                    lifecycle.start(|| Ok(()), || Ok((child.pid, ()))).unwrap();
                     let mut stopping = Box::pin(stop_failed_sidecar(
                         &lifecycle,
                         child.pid,
@@ -839,7 +957,10 @@ mod tests {
                         .is_err());
                     assert!(lifecycle.has_sidecar());
                     assert_eq!(
-                        lifecycle.start::<()>(|| panic!("cleanup still owns the child")),
+                        lifecycle.start::<()>(
+                            || panic!("cleanup still owns the child"),
+                            || panic!("cleanup still owns the child"),
+                        ),
                         Ok(None)
                     );
                     time::timeout(Duration::from_secs(3), stopping)
@@ -849,7 +970,10 @@ mod tests {
                     assert_eq!(child.status().signal(), Some(9));
                     assert!(!crate::lifecycle::process_alive(child.pid));
                     let (mut retry, mut retry_events) = TestChild::spawn(false, true);
-                    assert_eq!(lifecycle.start(|| Ok((retry.pid, ()))).unwrap(), Some(()));
+                    assert_eq!(
+                        lifecycle.start(|| Ok(()), || Ok((retry.pid, ()))).unwrap(),
+                        Some(())
+                    );
                     lifecycle.exited(child.pid);
                     assert!(
                         lifecycle.has_sidecar(),
@@ -875,7 +999,7 @@ mod tests {
             tauri::async_runtime::block_on(async {
                 let lifecycle = SidecarLifecycle::default();
                 let (mut child, mut events) = TestChild::spawn(true, true);
-                lifecycle.start(|| Ok((child.pid, ()))).unwrap();
+                lifecycle.start(|| Ok(()), || Ok((child.pid, ()))).unwrap();
                 assert_eq!(lifecycle.begin_shutdown(), Some(child.pid));
                 assert_eq!(lifecycle.begin_shutdown(), None);
                 assert!(!lifecycle.shutdown_complete());
@@ -892,7 +1016,10 @@ mod tests {
                 assert_eq!(child.status().signal(), Some(9));
                 assert!(lifecycle.shutdown_complete());
                 assert_eq!(
-                    lifecycle.start::<()>(|| panic!("Quit already began")),
+                    lifecycle.start::<()>(
+                        || panic!("Quit already began"),
+                        || panic!("Quit already began"),
+                    ),
                     Ok(None)
                 );
             });
@@ -903,7 +1030,7 @@ mod tests {
             tauri::async_runtime::block_on(async {
                 let lifecycle = SidecarLifecycle::default();
                 let (mut child, mut events) = TestChild::spawn(true, false);
-                lifecycle.start(|| Ok((child.pid, ()))).unwrap();
+                lifecycle.start(|| Ok(()), || Ok((child.pid, ()))).unwrap();
                 let error = time::timeout(
                     Duration::from_secs(2),
                     stop_failed_sidecar(
@@ -922,7 +1049,10 @@ mod tests {
                 assert!(lifecycle.has_sidecar());
                 assert!(crate::lifecycle::process_alive(child.pid));
                 assert_eq!(
-                    lifecycle.start::<()>(|| panic!("exit remains unconfirmed")),
+                    lifecycle.start::<()>(
+                        || panic!("exit remains unconfirmed"),
+                        || panic!("exit remains unconfirmed"),
+                    ),
                     Ok(None)
                 );
                 child.input.write_all(b"exit\n").unwrap();
@@ -940,7 +1070,7 @@ mod tests {
             tauri::async_runtime::block_on(async {
                 let lifecycle = SidecarLifecycle::default();
                 let (mut child, mut events) = TestChild::spawn(true, true);
-                lifecycle.start(|| Ok((child.pid, ()))).unwrap();
+                lifecycle.start(|| Ok(()), || Ok((child.pid, ()))).unwrap();
                 let result = stop_failed_sidecar(
                     &lifecycle,
                     child.pid,
@@ -965,7 +1095,10 @@ mod tests {
 
     #[test]
     fn ready_frame_requires_loopback_contract() {
-        let ready: ReadyFrame = serde_json::from_str(r#"{"kind":"gajae-desktop-ready","pid":1,"host":"127.0.0.1","port":1234,"protocolVersion":1,"version":"0.2.0"}"#).unwrap();
+        let ready: ReadyFrame = serde_json::from_str(&format!(
+            r#"{{"kind":"gajae-desktop-ready","pid":1,"host":"127.0.0.1","port":1234,"protocolVersion":1,"version":"{EXPECTED_PAYLOAD_VERSION}"}}"#
+        ))
+        .unwrap();
         assert!(ready.matches_sidecar(1));
         assert!(!ready.matches_sidecar(2));
         for (field, value) in [
@@ -974,8 +1107,9 @@ mod tests {
             ("host", serde_json::json!("example.com")),
             ("port", serde_json::json!(0)),
             ("protocolVersion", serde_json::json!(2)),
+            ("version", serde_json::json!("9.9.9")),
         ] {
-            let mut frame = serde_json::json!({"kind":READY_KIND,"pid":1,"host":"127.0.0.1","port":1234,"protocolVersion":1,"version":"0.2.0"});
+            let mut frame = serde_json::json!({"kind":READY_KIND,"pid":1,"host":"127.0.0.1","port":1234,"protocolVersion":1,"version":EXPECTED_PAYLOAD_VERSION});
             frame[field] = value;
             assert!(!serde_json::from_value::<ReadyFrame>(frame)
                 .unwrap()

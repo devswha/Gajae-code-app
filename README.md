@@ -39,7 +39,7 @@ Gajae Code App is a self-hosted web and desktop interface for [Gajae Code](https
 
 ## Quick Start
 
-**macOS (Apple Silicon, macOS 11+) — the desktop app.** Download the DMG from [Releases](https://github.com/devswha/gajae-code-app/releases/latest), verify it, drag it to Applications, open it. Since v2.0.0-beta.7 the image is signed with a Developer ID and notarized by Apple; Gatekeeper opens it like any other app.
+**macOS (Apple Silicon, macOS 13+) — the desktop app.** Download the DMG from [Releases](https://github.com/devswha/gajae-code-app/releases/latest), verify it, drag it to Applications, open it. Since v2.0.0-beta.7 the image is signed with a Developer ID and notarized by Apple; Gatekeeper opens it like any other app.
 
 ```bash
 cd ~/Downloads

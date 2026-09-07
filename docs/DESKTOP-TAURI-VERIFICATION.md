@@ -19,9 +19,20 @@ do not establish Linux package or GUI compatibility.
 > stapled and accepted by Gatekeeper (record below). Nothing has been tagged or
 > published from it: the packaged smoke run from the mounted image failed
 > because the payload's `elkjs` exclusion broke worker start-up outside the
-> repository tree. **Fixed the same day** (record below): a first-party stub
+> the repository tree. **Fixed the same day** (record below): a first-party stub
 > now stands in for the removed package, and every packaged smoke runs from a
 > copy outside the checkout. The next signed build starts from that HEAD.
+
+> **Loader-floor correction (2026-09-07): historical signed beta.8/beta.9
+> bundles declare `LSMinimumSystemVersion=11.0`, but the bundled Bun 1.4.0
+> Mach-O carries `LC_BUILD_VERSION minos 13.0` (the other inspected runtime
+> binaries were 11.0). The release verifier now requires a pinned 13.0
+> minimum and independently checks the desktop/server executables, Bun/Rust
+> runtimes, and bounded native modules with `xcrun vtool -show-build`; it does
+> not trust `Info.plist` alone. The historical six-asset builder run therefore
+> demonstrates signing/inventory tooling but is rejected by this stricter
+> guard, and is not new release acceptance or signing evidence. The static
+> loader floor does not establish that execution on macOS 13 succeeds.**
 
 ## Build the artifacts (on the Mac)
 
