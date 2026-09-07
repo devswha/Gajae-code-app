@@ -12,7 +12,7 @@ export const RELEASE = {
   version: '2.0.0-beta.10',
   tag: 'v2.0.0-beta.10',
   channel: 'beta',
-  publishedLabel: '2026-09-06',
+  publishedLabel: '2026-09-07',
 };
 
 function releaseDownloadBase(tag = RELEASE.tag) {

@@ -77,7 +77,7 @@ export function renderLandingPage() {
           <a class="quiet-link all-downloads" href="#download">All download options</a>
           <p class="release-meta" id="macos-beta-notice">
             <span>Public beta</span>
-            Apple Silicon · macOS 11+ · Notarized by Apple
+            Apple Silicon · macOS 13+ · Notarized by Apple
             <a href="#macos-install">First-launch instructions</a>
           </p>
         </section>
@@ -120,7 +120,7 @@ export function renderLandingPage() {
             <div class="download-row">
               <div>
                 <h3>macOS</h3>
-                <p>Apple Silicon · macOS 11+</p>
+                <p>Apple Silicon · macOS 13+</p>
               </div>
               <div class="download-actions">
                 <a class="text-button" href="${DOWNLOADS.macosArm64.href}">Download DMG</a>
