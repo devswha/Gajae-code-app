@@ -8,6 +8,8 @@ import {
   RELEASES_URL,
   buildDownloads,
   checksumName,
+  desktopAppImageName,
+  desktopDebName,
   desktopDmgName,
   downloadUrl,
   serverArchiveName,
@@ -26,6 +28,8 @@ test('pins the release the repository cut and its GitHub download URLs', () => {
   assert.equal(RELEASE.version, appVersion);
   assert.equal(RELEASE.tag, `v${appVersion}`);
   assert.equal(desktopDmgName(), `gajae-app-desktop-${appVersion}-macos-arm64.dmg`);
+  assert.equal(desktopDebName(), `gajae-app-desktop-${appVersion}-linux-x64.deb`);
+  assert.equal(desktopAppImageName(), `gajae-app-desktop-${appVersion}-linux-x64.AppImage`);
   assert.equal(serverArchiveName(), `gajae-app-server-${appVersion}-linux-x64-node22.tar.gz`);
   assert.equal(
     downloadUrl(desktopDmgName()),
@@ -36,6 +40,39 @@ test('pins the release the repository cut and its GitHub download URLs', () => {
     `${RELEASES_URL}/download/v${appVersion}/${checksumName(desktopDmgName())}`,
   );
   assert.match(DOWNLOADS.macosArm64.verifyCommand, /shasum -a 256 -c /);
+});
+
+test('publishes both Linux desktop formats with a matching checksum and verification command', () => {
+  for (const [key, fileName] of [
+    ['linuxDeb', desktopDebName()],
+    ['linuxAppImage', desktopAppImageName()],
+  ]) {
+    const download = DOWNLOADS[key];
+    assert.equal(download.label, fileName);
+    assert.equal(download.href, `${RELEASES_URL}/download/${RELEASE.tag}/${fileName}`);
+    assert.equal(download.checksumHref, `${download.href}.sha256`);
+    assert.equal(download.checksumFile, `${fileName}.sha256`);
+    assert.equal(download.verifyCommand, `sha256sum --check ${fileName}.sha256`);
+  }
+});
+
+test('keeps every artifact and checksum on the supplied release when the version changes', () => {
+  const release = { version: '9.9.9-test', tag: 'v9.9.9-test' };
+  const downloads = buildDownloads(release);
+  assert.equal(downloads.tagUrl, `${RELEASES_URL}/tag/${release.tag}`);
+  for (const [key, suffix] of [
+    ['macosArm64', 'desktop-9.9.9-test-macos-arm64.dmg'],
+    ['linuxDeb', 'desktop-9.9.9-test-linux-x64.deb'],
+    ['linuxAppImage', 'desktop-9.9.9-test-linux-x64.AppImage'],
+    ['linuxServer', 'server-9.9.9-test-linux-x64-node22.tar.gz'],
+  ]) {
+    const download = downloads[key];
+    assert.equal(download.label, `gajae-app-${suffix}`);
+    assert.equal(download.href, `${RELEASES_URL}/download/${release.tag}/${download.label}`);
+    assert.equal(download.checksumHref, `${download.href}.sha256`);
+    assert.equal(download.checksumFile, `${download.label}.sha256`);
+    assert.ok(download.verifyCommand.endsWith(download.checksumFile));
+  }
 });
 
 test('does not invent Windows or Intel desktop artifacts', () => {

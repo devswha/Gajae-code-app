@@ -2,6 +2,7 @@ import {
   APPLE_GATEKEEPER_HELP_URL,
   DOWNLOADS,
   DOCS_INSTALL_URL,
+  DOCS_LINUX_INSTALL_URL,
   DOCS_SELF_HOST_URL,
   GAJAE_CODE_URL,
   ISSUES_URL,
@@ -14,14 +15,6 @@ import {
 
 function appleIcon() {
   return `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"/></svg>`;
-}
-
-function codeIcon() {
-  return `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" aria-hidden="true"><path d="m8 9-3 3 3 3"/><path d="m16 9 3 3-3 3"/><path d="m14 5-4 14"/></svg>`;
-}
-
-function terminalIcon() {
-  return `<svg class="icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>`;
 }
 
 function faqItem(question, answer) {
@@ -56,39 +49,38 @@ export function renderLandingPage() {
 
       <main>
         <section class="hero" id="top">
-          <h1>Gajae Code,<br />with a desktop.</h1>
+          <p class="eyebrow">Public beta · v${RELEASE.version}</p>
+          <h1>The desktop app<br />for Gajae Code.</h1>
           <p class="lede">
-            Open projects, resume sessions, and run Gajae Code from one local workspace.
-            The app uses the setup already on your machine.
+            Open projects, resume sessions, and review changes—all in one local workspace.
           </p>
           <div class="cta-row">
-            <a class="button button-primary" href="${DOWNLOADS.macosArm64.href}" aria-describedby="macos-beta-notice">
-              ${appleIcon()}
-              Download for Mac
-            </a>
-            <a class="button button-secondary" href="${REPOSITORY_URL}">
-              ${codeIcon()}
-              Source
-            </a>
-            <a class="button button-icon" href="${DOWNLOADS.linuxServer.href}" aria-label="Download Linux server archive">
-              ${terminalIcon()}
-            </a>
+            <div class="platform-cta">
+              <a class="button button-primary" href="${DOWNLOADS.macosArm64.href}" aria-describedby="macos-beta-notice">
+                ${appleIcon()}
+                Download for macOS
+              </a>
+              <p class="platform-note" id="macos-beta-notice">Apple Silicon · macOS 13+ · Notarized by Apple</p>
+            </div>
+            <div class="platform-cta">
+              <a class="button button-secondary" href="#linux-download" aria-describedby="linux-desktop-notice">Download for Linux</a>
+              <p class="platform-note" id="linux-desktop-notice">x86_64 · .deb / AppImage</p>
+            </div>
           </div>
-          <a class="quiet-link all-downloads" href="#download">All download options</a>
-          <p class="release-meta" id="macos-beta-notice">
-            <span>Public beta</span>
-            Apple Silicon · macOS 13+ · Notarized by Apple
-            <a href="#macos-install">First-launch instructions</a>
-          </p>
+          <div class="hero-links">
+            <a class="quiet-link" href="${GAJAE_CODE_URL}">About Gajae Code</a>
+            <a class="quiet-link" href="${REPOSITORY_URL}">Source code</a>
+            <a class="quiet-link" href="#self-host">Server setup</a>
+          </div>
         </section>
 
         <section class="product-overview" id="features" aria-label="Gajae Code App session and review">
+          <img src="./screenshots/session-review.jpg" alt="A two-turn Gajae Code App session that writes greet.py and adds a --shout flag, with the Changes tab open on the diff and a review comment waiting to be sent" width="2880" height="1800" fetchpriority="high" />
           <div class="product-overview-copy">
             <p class="eyebrow">Real session · v${RELEASE.version}</p>
             <h2>Watch the work happen, then review it.</h2>
             <p>Each turn's tool calls fold into one block. The Changes tab shows the working tree as a diff, and a comment on a line becomes the next message.</p>
           </div>
-          <img src="./screenshots/session-review.jpg" alt="A two-turn Gajae Code App session that writes greet.py and adds a --shout flag, with the Changes tab open on the diff and a review comment waiting to be sent" width="2880" height="1800" />
         </section>
 
         <section class="details" id="workflow" aria-label="Product details">
@@ -98,7 +90,7 @@ export function renderLandingPage() {
               <h2>Commands wait for you.</h2>
               <p>By default a shell command stops the turn on a card: allow it once, always for this project, or deny it. The turn resumes where it paused.</p>
             </div>
-            <img src="./screenshots/permission-card.jpg" alt="A Gajae Code App turn paused on a permission card for python3 hello.py, with Deny, Always deny, Always allow and Allow buttons" width="2880" height="1800" />
+            <img src="./screenshots/permission-card.jpg" alt="A Gajae Code App turn paused on a permission card for python3 hello.py, with Deny, Always deny, Always allow and Allow buttons" width="2880" height="1800" loading="lazy" />
           </article>
           <article class="detail">
             <div class="detail-copy">
@@ -106,35 +98,65 @@ export function renderLandingPage() {
               <h2>Match the model to the task.</h2>
               <p>Pick the provider, the model and the reasoning depth for the next turn without leaving the session. A model chosen for a session stays with it.</p>
             </div>
-            <img src="./screenshots/model-picker.jpg" alt="The model and reasoning picker open above a session, with ChatGPT selected, GPT-5.6 Terra chosen and the reasoning column beside it" width="2880" height="1800" />
+            <img src="./screenshots/model-picker.jpg" alt="The model and reasoning picker open above a session, with ChatGPT selected, GPT-5.6 Terra chosen and the reasoning column beside it" width="2880" height="1800" loading="lazy" />
           </article>
         </section>
 
         <section class="download-section" id="download">
           <div class="section-copy">
             <p class="eyebrow">v${RELEASE.version}</p>
-            <h2>Download</h2>
-            <p>Versioned files from GitHub Releases. Checksums are published beside every artifact.</p>
+            <h2>Download the desktop app</h2>
+            <p>Versioned files from GitHub Releases. Each download has its own SHA-256 checksum.</p>
           </div>
           <div class="download-list">
             <div class="download-row">
               <div>
                 <h3>macOS</h3>
                 <p>Apple Silicon · macOS 13+</p>
+                <a class="quiet-link" href="#macos-install">First-launch instructions</a>
               </div>
               <div class="download-actions">
                 <a class="text-button" href="${DOWNLOADS.macosArm64.href}">Download DMG</a>
-                <a class="quiet-link" href="${DOWNLOADS.macosArm64.checksumHref}">SHA-256</a>
+                <a class="quiet-link" href="${DOWNLOADS.macosArm64.checksumHref}" aria-label="SHA-256 for macOS DMG">SHA-256</a>
               </div>
             </div>
+            <div class="download-row" id="linux-download" tabindex="-1" role="region" aria-labelledby="linux-download-title">
+              <div>
+                <h3 id="linux-download-title">Linux desktop</h3>
+                <p>x86_64 · Ubuntu 22.04 / 24.04</p>
+                <p>Node.js and Bun included.</p>
+                <a class="quiet-link" href="${DOCS_LINUX_INSTALL_URL}">Linux installation guide</a>
+              </div>
+              <div class="download-formats">
+                <div class="download-actions">
+                  <a class="text-button" href="${DOWNLOADS.linuxDeb.href}">Download .deb</a>
+                  <a class="quiet-link" href="${DOWNLOADS.linuxDeb.checksumHref}" aria-label="SHA-256 for Linux .deb">SHA-256</a>
+                </div>
+                <div class="download-actions">
+                  <a class="text-button" href="${DOWNLOADS.linuxAppImage.href}">Download AppImage</a>
+                  <a class="quiet-link" href="${DOWNLOADS.linuxAppImage.checksumHref}" aria-label="SHA-256 for Linux AppImage">SHA-256</a>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="availability">Intel Mac and Windows builds are not available yet.</p>
+        </section>
+
+        <section class="self-host-section" id="self-host">
+          <div class="section-copy">
+            <h2>Prefer the web interface?</h2>
+            <p>Run Gajae Code App in your browser with the server archive or from source. These are alternatives to the desktop app.</p>
+          </div>
+          <div class="download-list">
             <div class="download-row">
               <div>
                 <h3>Linux server</h3>
-                <p>x86_64 · glibc 2.35+ · Node.js 22</p>
+                <p>x86_64 · glibc 2.35+ · Requires Node.js 22.22.2+ (22.x)</p>
+                <a class="quiet-link" href="${DOCS_SELF_HOST_URL}">Server installation guide</a>
               </div>
               <div class="download-actions">
                 <a class="text-button" href="${DOWNLOADS.linuxServer.href}">Download archive</a>
-                <a class="quiet-link" href="${DOWNLOADS.linuxServer.checksumHref}">SHA-256</a>
+                <a class="quiet-link" href="${DOWNLOADS.linuxServer.checksumHref}" aria-label="SHA-256 for Linux server archive">SHA-256</a>
               </div>
             </div>
             <div class="download-row">
@@ -147,7 +169,6 @@ export function renderLandingPage() {
               </div>
             </div>
           </div>
-          <p class="availability">Intel Mac, Windows, and Linux desktop builds are not available yet.</p>
         </section>
 
         <section class="install-section" id="macos-install">
