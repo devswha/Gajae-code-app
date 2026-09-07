@@ -1,51 +1,24 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
-import { createInstance } from 'i18next';
-import { createElement } from 'react';
-import { I18nextProvider } from 'react-i18next';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 
-import english from '../../../i18n/locales/en/chat.json';
 import { useChatComposerState } from '../hooks/useChatComposerState';
 import { useFileOpenResolver } from '../../../hooks/useFileOpenResolver';
 import { useProjectGitSummary } from '../../workspace/hooks/useProjectGitSummary';
 import { useProjectChanges } from '../../workspace/hooks/useProjectChanges';
 
-import SessionWorktreePicker from './SessionWorktreePicker';
-
-const i18n = createInstance();
-await i18n.init({ lng: 'en', resources: { en: { chat: english } } });
 const originalFetch = globalThis.fetch;
 afterEach(() => { cleanup(); globalThis.fetch = originalFetch; localStorage.clear(); });
 
-test('new-session selector is labelled and can choose an isolated worktree', () => {
-  const changes: boolean[] = [];
-  render(createElement(I18nextProvider, { i18n }, createElement(SessionWorktreePicker, { value: false, onChange: (value) => changes.push(value) })));
-  const select = screen.getByRole('combobox', { name: 'Run location' }) as HTMLSelectElement;
-  assert.equal(select.value, 'project');
-  fireEvent.change(select, { target: { value: 'worktree' } });
-  assert.deepEqual(changes, [true]);
-});
-
-test('a persisted worktree shows its location and cannot be switched in place', () => {
-  render(createElement(I18nextProvider, { i18n }, createElement(SessionWorktreePicker, {
-    value: false, onChange: () => assert.fail('Cannot change an existing session'), sessionId: 'session-one',
-    location: { mode: 'worktree', cwd: '/repo/.gjc-worktrees/job-session-one', projectPath: '/repo', jobId: 'job-session-one' },
-  })));
-  assert.equal(screen.queryByRole('combobox'), null);
-  assert.ok(screen.getByTitle('/repo/.gjc-worktrees/job-session-one'));
-  assert.ok(screen.getByText('Worktree'));
-});
-
-test('composer creates through the worktree route, then sends the allocated app identity', async () => {
+test('composer creates through the ordinary route, then sends the allocated app identity', async () => {
   const requests: Array<{ url: string; body?: Record<string, unknown> }> = [];
   const sent: unknown[] = [];
   globalThis.fetch = (async (input, options) => {
     const url = String(input);
     requests.push({ url, ...(options?.body ? { body: JSON.parse(String(options.body)) } : {}) });
-    const body = url.includes('/files') ? [] : url.includes('/worktree-sessions')
-      ? { success: true, data: { sessionId: 'worktree-app-session', projectPath: '/fixture/project' } }
+    const body = url.includes('/files') ? [] : url.endsWith('/providers/sessions')
+      ? { success: true, data: { sessionId: 'project-app-session', projectPath: '/fixture/project' } }
       : { success: true, data: { commands: [], skills: [], isWorkspace: false, candidates: [] } };
     return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }) as typeof fetch;
@@ -57,14 +30,13 @@ test('composer creates through the worktree route, then sends the allocated app 
     sendMessage: (message) => { sent.push(message); return true; }, scrollToBottom() {}, addMessage() {}, setIsUserScrolledUp() {}, setPendingPermissionRequests() {},
   }));
   act(() => {
-    view.result.current.setUseWorktree(true);
     view.result.current.handleInputChange({ target: { value: 'fixture prompt', selectionStart: 14 } } as never);
   });
   await act(async () => { await view.result.current.handleSubmit({ preventDefault() {} } as never); });
-  const create = requests.find(({ url }) => url.includes('/worktree-sessions'));
+  const create = requests.find(({ url }) => url.endsWith('/providers/sessions'));
   assert.deepEqual(create?.body, { provider: 'gjc', projectPath: '/fixture/project' });
-  assert.equal(requests.some(({ url, body }) => url.endsWith('/providers/sessions') && body), false);
-  assert.ok(sent.some((message) => (message as { type: string; sessionId: string }).type === 'chat.send' && (message as { sessionId: string }).sessionId === 'worktree-app-session'));
+  assert.equal(requests.some(({ url }) => url.includes('/worktree-sessions')), false);
+  assert.ok(sent.some((message) => (message as { type: string; sessionId: string }).type === 'chat.send' && (message as { sessionId: string }).sessionId === 'project-app-session'));
 });
 
 test('file references resolve through the selected session to its worktree', async () => {
@@ -93,13 +65,14 @@ test('an unavailable session directory never opens a relative file at the server
   assert.deepEqual(opened, []);
 });
 
-test('failed worktree creation keeps the draft and does not send or fall back to a project session', async () => {
+test('failed session creation keeps the draft and does not send or fall back to a worktree session', async () => {
   const requests: string[] = [];
   const messages: Array<{ type?: string }> = [];
   globalThis.fetch = (async (input) => {
     const url = String(input);
     requests.push(url);
-    return new Response(JSON.stringify(url.includes('/files') ? [] : url.includes('/worktree-sessions') ? { error: { message: 'A Git repository is required.' } } : {}), { status: url.includes('/worktree-sessions') ? 400 : 200 });
+    const create = url.endsWith('/providers/sessions');
+    return new Response(JSON.stringify(url.includes('/files') ? [] : create ? { error: { message: 'Unable to create a session.' } } : {}), { status: create ? 400 : 200 });
   }) as typeof fetch;
   const view = renderHook(() => useChatComposerState({
     selectedProject: { projectId: 'project-one', fullPath: '/fixture/project', displayName: 'Project' },
@@ -108,13 +81,13 @@ test('failed worktree creation keeps the draft and does not send or fall back to
     sendMessage: () => assert.fail('Must not send'), scrollToBottom() {}, addMessage: (message) => messages.push(message), setIsUserScrolledUp() {}, setPendingPermissionRequests() {},
   }));
   act(() => {
-    view.result.current.setUseWorktree(true);
     view.result.current.handleInputChange({ target: { value: 'keep this draft', selectionStart: 15 } } as never);
   });
   await act(async () => { await view.result.current.handleSubmit({ preventDefault() {} } as never); });
   assert.equal(view.result.current.input, 'keep this draft');
   assert.ok(messages.some((message) => message.type === 'error'));
-  assert.equal(requests.some((url) => url.endsWith('/providers/sessions')), false);
+  assert.ok(requests.some((url) => url.endsWith('/providers/sessions')));
+  assert.equal(requests.some((url) => url.includes('/worktree-sessions')), false);
 });
 
 test('file references retry a pending worktree and preserve explicit absolute paths', async () => {

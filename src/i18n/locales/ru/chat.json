@@ -64,13 +64,7 @@
     "stopSpeaking": "Останавливаться",
     "loading": "Загрузка…"
   },
-  "sessionWorktree": {
-    "label": "Место выполнения",
-    "project": "Проект",
-    "newWorktree": "Новое рабочее дерево",
-    "worktree": "Рабочее дерево",
-    "preparing": "Подготовка рабочего дерева"
-  },
+
   "input": {
     "placeholder": "Спросите {{provider}}, используйте / для команд или @ для добавления файлов…",
     "modelReasoning": {

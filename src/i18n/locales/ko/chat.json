@@ -64,13 +64,6 @@
     "stopSpeaking": "중단",
     "loading": "불러오는 중…"
   },
-  "sessionWorktree": {
-    "label": "실행 위치",
-    "project": "프로젝트",
-    "newWorktree": "새 워크트리",
-    "worktree": "워크트리",
-    "preparing": "워크트리 준비 중"
-  },
   "input": {
     "placeholder": "{{provider}}에게 질문하세요, /로 명령어를 사용하거나 @로 파일을 추가하세요…",
     "modelReasoning": {

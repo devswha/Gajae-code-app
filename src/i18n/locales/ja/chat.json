@@ -64,13 +64,7 @@
     "stopSpeaking": "停止。",
     "loading": "読み込み中…"
   },
-  "sessionWorktree": {
-    "label": "実行場所",
-    "project": "プロジェクト",
-    "newWorktree": "新しいワークツリー",
-    "worktree": "ワークツリー",
-    "preparing": "ワークツリーを準備中"
-  },
+
   "input": {
     "placeholder": "/ でコマンド、@ でファイル指定、または {{provider}} に何でも聞いてください...。",
     "modelReasoning": {

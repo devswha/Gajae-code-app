@@ -64,13 +64,6 @@
     "stopSpeaking": "Stopp",
     "loading": "Laden…"
   },
-  "sessionWorktree": {
-    "label": "Ausführungsort",
-    "project": "Projekt",
-    "newWorktree": "Neuer Worktree",
-    "worktree": "Worktree",
-    "preparing": "Worktree wird vorbereitet"
-  },
   "input": {
     "placeholder": "Fragen Sie {{provider}}, verwenden Sie / für Befehle oder @, um Dateien hinzuzufügen ...",
     "modelReasoning": {

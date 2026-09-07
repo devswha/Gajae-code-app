@@ -64,13 +64,6 @@
     "stopSpeaking": "Stop",
     "loading": "Loading…"
   },
-  "sessionWorktree": {
-    "label": "Run location",
-    "project": "Project",
-    "newWorktree": "New worktree",
-    "worktree": "Worktree",
-    "preparing": "Preparing worktree"
-  },
   "input": {
     "placeholder": "Ask {{provider}}, use / for commands, or @ to add files…",
     "modelReasoning": {

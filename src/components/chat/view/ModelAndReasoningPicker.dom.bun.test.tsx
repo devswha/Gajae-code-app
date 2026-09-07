@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { createElement } from 'react';
+import { createElement, type ComponentProps } from 'react';
 import { cleanup, createEvent, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import '../../../i18n/config';
@@ -13,6 +13,23 @@ import type { ReasoningEffort } from './reasoningEffort';
 afterEach(cleanup);
 
 const searchName = 'Search providers and models';
+type PickerProps = ComponentProps<typeof ModelAndReasoningPicker>;
+
+function renderPicker(overrides: Partial<PickerProps> = {}) {
+  return render(createElement(ModelAndReasoningPicker, {
+    value: 'openai-codex/astra',
+    presetOptions: [],
+    modelOptions: [{
+      value: 'openai-codex/astra',
+      label: 'Astra',
+      effort: { values: [{ value: 'xhigh' }] },
+    }],
+    onSelect() {},
+    reasoningEffort: 'xhigh',
+    onSelectReasoningEffort() {},
+    ...overrides,
+  }));
+}
 
 async function openPicker() {
   const selectedModels: string[] = [];
@@ -46,6 +63,71 @@ function AbortProbe({ canAbort, onAbort }: { canAbort: boolean; onAbort: () => v
   useEscapeToAbort(canAbort, onAbort);
   return null;
 }
+
+test('short model labels size the trigger naturally without growing the model slot', () => {
+  const view = renderPicker();
+  const trigger = screen.getByRole('button', { name: 'Model and reasoning settings' });
+  const root = trigger.parentElement!;
+  const model = screen.getByText('Astra');
+  const reasoning = screen.getByText('Extra high');
+
+  assert.ok(root.classList.contains('w-fit'));
+  assert.ok(root.classList.contains('max-w-full'));
+  assert.ok(root.classList.contains('sm:max-w-56'));
+  assert.ok(root.classList.contains('shrink-0'));
+  assert.ok(trigger.classList.contains('w-fit'));
+  assert.ok(trigger.classList.contains('max-w-full'));
+  assert.ok(model.classList.contains('min-w-0'));
+  assert.ok(model.classList.contains('truncate'));
+  assert.equal(model.classList.contains('flex-1'), false);
+  assert.ok(reasoning.classList.contains('shrink-0'));
+  assert.ok(reasoning.classList.contains('whitespace-nowrap'));
+  assert.match(trigger.textContent ?? '', /Astra.*·.*Extra high/);
+
+  view.unmount();
+});
+
+test('long model labels retain ellipsis while reasoning stays readable', () => {
+  const longLabel = 'Astra with an intentionally long model name for narrow panes';
+  const view = renderPicker({
+    value: 'openai-codex/long-astra',
+    modelOptions: [{
+      value: 'openai-codex/long-astra',
+      label: longLabel,
+      effort: { values: [{ value: 'xhigh' }] },
+    }],
+  });
+  const trigger = screen.getByRole('button', { name: 'Model and reasoning settings' });
+  const model = screen.getByText(longLabel);
+  const reasoning = screen.getByText('Extra high');
+
+  assert.ok(model.classList.contains('min-w-0'));
+  assert.ok(model.classList.contains('truncate'));
+  assert.equal(model.classList.contains('flex-1'), false);
+  assert.ok(reasoning.classList.contains('shrink-0'));
+  assert.ok(reasoning.classList.contains('whitespace-nowrap'));
+  assert.match(trigger.textContent ?? '', /Extra high/);
+
+  view.unmount();
+});
+
+test('loading keeps a visible fixed-width model skeleton in the content-sized trigger', () => {
+  const view = renderPicker({
+    value: 'default',
+    modelOptions: [],
+    loading: true,
+  });
+  const trigger = screen.getByRole('button', { name: 'Model and reasoning settings' });
+  const skeleton = trigger.querySelector('span.bg-muted');
+
+  assert.equal(trigger.getAttribute('aria-busy'), 'true');
+  assert.equal(trigger.hasAttribute('disabled'), true);
+  assert.ok(skeleton);
+  assert.ok(skeleton.classList.contains('w-24'));
+  assert.equal(skeleton.classList.contains('w-full'), false);
+
+  view.unmount();
+});
 
 test('Escape from an empty search dismisses the portal, restores trigger focus, and allows reopening', async () => {
   const { trigger, search, selectedModels, selectedEfforts } = await openPicker();
