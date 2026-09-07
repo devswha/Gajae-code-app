@@ -9,8 +9,9 @@ this local route.
 
 The tool never creates a release, uploads/replaces/deletes an asset, changes a
 tag, signs an artifact, reads a signing private key, or exports credentials.
-It needs the existing authenticated `gh` session and macOS arm64 verification
-tools. A publish request can cause GitHub to create the draft's still-absent
+It needs the existing authenticated `gh` session, official Minisign **0.12**,
+the trusted updater public-key file, and macOS arm64 verification tools.
+A publish request can cause GitHub to create the draft's still-absent
 tag at its pinned target commit. Existing tags must already resolve to that
 same commit, including annotated tags.
 
@@ -24,6 +25,38 @@ regenerate its checksum **after** stapling. Keep `APPLE_SIGNING_IDENTITY`
 exported throughout that build. No credential or PKCS#12 export is needed.
 The existing signed-build instructions remain in
 `docs/DESKTOP-TAURI-VERIFICATION.md`.
+
+The first updater-enabled build requires one manual DMG installation:
+beta.9 has no updater. Its `desktopVersion` must exceed both `0.2.3` and every
+previously published desktop version across beta/stable. Product version is
+display/tag identity; it is not the install-order counter. Missing historical
+tag/commit/package mappings block publication, rather than lowering the floor.
+Real signed/notarized A-to-B acceptance, authorization approve/cancel behavior,
+recovery, lifecycle and data-survival gates remain required before publication.
+
+The macOS bundle minimum is **13.0**. This is a loader requirement, not merely
+an `Info.plist` declaration: the verifier runs `xcrun vtool -show-build` on
+the desktop and server executables, Bun/Rust payload runtimes, and bounded
+native runtime modules discovered in the app inventory. Every `LC_BUILD_VERSION`
+`platform MACOS` `minos` stamp must be present, well-formed, supported, and no
+newer than the pinned `minimumSystemVersion`. A declaration of 11.0 therefore
+cannot pass when Bun (or another bundled Mach-O) requires 13.0. macOS 13
+execution itself remains a separate acceptance gate.
+
+After final app/DMG acceptance, create the updater archive with
+`make-macos-updater.mjs`. It verifies a private quarantined app copy, packs the
+unchanged final app, invokes the official Tauri signer, verifies a private
+snapshot with `minisign -V -H`, and compares the extracted archive with the
+DMG app (all member bytes, modes and symlink targets). It never signs/staples
+the app itself. Do not recompress or modify an archive after signing.
+
+Keep the updater private key and its backup under the approved key-custody
+procedure. Supply `TAURI_SIGNING_PRIVATE_KEY_PATH` or
+`TAURI_SIGNING_PRIVATE_KEY` only through the signer's supported environment;
+encrypted keys also need `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Never put key
+contents/passwords on argv, in release assets or in logs. The verifier accepts
+only the public-key file. No key generation, credential export, or production
+signing is implied by these instructions.
 
 For the final SDK 0.16.4 candidate, `scripts/release/MACOS-ACCEPTANCE.md`
 provides the pinned source snapshot, isolated build paths, bounded local
@@ -50,13 +83,26 @@ VERSION="$(node -p "require('./package.json').version")"
 TAG="v$VERSION"
 TEAM_ID=5987KT43TJ
 DMG=/absolute/path/to/accepted/macos.dmg
+APP="/absolute/path/to/accepted/Gajae Code App.app"
 SERVER=/absolute/path/to/accepted/server.tar.gz
 NOTES=/absolute/path/to/reviewed-release-notes.md
+UPDATER_PUBLIC_KEY=/absolute/path/to/trusted/updater-public.key
+UPDATER_DIR=/absolute/path/to/new/updater-assets
+minisign -v # must report minisign 0.12
+node scripts/release/make-macos-updater.mjs \
+  --app "$APP" --dmg "$DMG" --output "$UPDATER_DIR" \
+  --commit "$RELEASE_COMMIT" --team-id "$TEAM_ID" \
+  --updater-public-key-file "$UPDATER_PUBLIC_KEY" --notes-file "$NOTES" \
+  --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DMG="$UPDATER_DIR/gajae-app-desktop-$VERSION-macos-arm64.dmg"
+UPDATER="$UPDATER_DIR/gajae-app-desktop-$VERSION-macos-arm64.app.tar.gz"
+MANIFEST="$UPDATER_DIR/desktop-update.json"
 test "$(basename "$DMG")" = "gajae-app-desktop-$VERSION-macos-arm64.dmg"
 test "$(basename "$SERVER")" = "gajae-app-server-$VERSION-linux-x64-node22.tar.gz"
 test -f "$DMG.sha256"
 test -f "$SERVER.sha256"
 DMG_SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+UPDATER_SHA="$(shasum -a 256 "$UPDATER" | awk '{print $1}')"
 SERVER_SHA="$(shasum -a 256 "$SERVER" | awk '{print $1}')"
 ```
 
@@ -78,7 +124,8 @@ asset upload with `--clobber` to get past that failure.
 prerelease_args=()
 if [[ "$VERSION" == *-* ]]; then prerelease_args+=(--prerelease); fi
 gh release create "$TAG" \
-  "$DMG" "$DMG.sha256" "$SERVER" "$SERVER.sha256" \
+  "$DMG" "$DMG.sha256" "$UPDATER" "$UPDATER.sig" "$UPDATER.sha256" \
+  "$MANIFEST" "$SERVER" "$SERVER.sha256" \
   --repo "$REPO" --target "$RELEASE_COMMIT" --draft \
   --title "Gajae Code App $TAG" --notes-file "$NOTES" \
   "${prerelease_args[@]}"
@@ -89,8 +136,9 @@ DRAFT_ID="$(gh release view "$TAG" --repo "$REPO" --json databaseId --jq .databa
 
 verify_args=(
   --repo "$REPO" --draft-id "$DRAFT_ID" --tag "$TAG" --commit "$RELEASE_COMMIT"
-  --team-id "$TEAM_ID"
+  --team-id "$TEAM_ID" --updater-public-key-file "$UPDATER_PUBLIC_KEY"
   --asset "$(basename "$DMG")=$DMG_SHA"
+  --asset "$(basename "$UPDATER")=$UPDATER_SHA"
   --asset "$(basename "$SERVER")=$SERVER_SHA"
 )
 node scripts/release/local-release.mjs "${verify_args[@]}"
@@ -102,11 +150,17 @@ performs no GitHub write. Missing arguments exit 2; any validation failure
 exits 1 and leaves the draft and its assets intact. An already-public release
 is refused before downloads or publication.
 
-For additional Linux desktop payloads, include each artifact and sidecar in
+There are six mandatory macOS assets and two mandatory server assets. The
+manifest and updater signature are typed bounded sidecars, not extra
+checksum-bearing payloads. `--mode ci` requires exactly those eight assets.
+
+For additional explicitly pinned payloads, including Linux desktop builds,
+include each artifact and checksum sidecar in
 the initial draft creation and append one `--asset "BASENAME=SHA256"` entry per
 payload to `verify_args`. Unknown or missing assets block publication rather
-than being ignored or removed. The canonical Mac DMG and Linux server archive
-remain mandatory. Optional payloads receive hash/sidecar validation here;
+than being ignored or removed. The canonical Mac DMG, signed updater archive,
+manifest/signature sidecars and Linux server archive remain mandatory.
+Optional payloads receive hash/sidecar validation here;
 their platform/installer acceptance remains with their packaging owner.
 
 ## Explicit publication, after reviewing the verification result
@@ -133,6 +187,7 @@ Each invocation requires:
 - An exact asset set matching the caller's independent hashes and sidecars,
   including uploaded state, IDs, lengths and any supplied GitHub digests.
   Downloads use asset IDs and exclusively created temporary files.
+  Each download is streaming-capped to its inspected byte count.
 - The Linux archive's root package name/version and the copied Mac payload's
   package name/version. `CFBundleIdentifier` and desktop version are checked
   independently against product identity and the pinned source commit.
@@ -140,6 +195,13 @@ Each invocation requires:
   runtime, valid DMG/app staples, Gatekeeper acceptance, and arm64 desktop and
   sidecar binaries. The app is checked both on the read-only mount and after
   copying to a quarantined writable location outside a checkout.
+  The updater-extracted app receives the same checks, including the pinned
+  minimum macOS version and exact DMG/app inventory equivalence.
+- Strict manifest version/channel/repository/target/commit/URL binding,
+  signature-sidecar agreement and real Minisign verification over the same
+  immutable archive snapshot that is extracted.
+- Complete bounded published-history discovery and a strictly advancing
+  desktop version, checked again before publication.
 - Unchanged draft metadata/assets and tag after downloads and verification,
   immediately before the optional publication request.
 
@@ -153,7 +215,11 @@ Errors after requesting publication report `status: "publication-outcome-unknown
 and exit 1; they do not claim that the release stayed unpublished.
 
 Command waits are bounded: 2 minutes for metadata/local verification commands,
-10 minutes per download, at most 16 payloads plus their checksum sidecars. All
+10 minutes per download, and 30 seconds per history request within a five-minute
+history pass. Local releases allow at most 16 explicitly pinned payloads plus
+their checksum sidecars and the two updater metadata sidecars. The updater
+archive/DMG cap is 250 MiB; expanded updater tar data is capped at 1 GiB.
+All
 temporary downloads and copies are removed normally. If image detachment
 cannot be confirmed, the tool retains and reports its temporary directory;
 inspect/detach that mount before deleting it. It never recursively removes a
@@ -165,7 +231,15 @@ of the already-published beta.8 DMG (asset ID `542909888`). Its recorded SHA-256
 matched; the real macOS checker passed signatures, expected team, staples,
 Gatekeeper, mounted/quarantined-copy verification, package/desktop versions
 and arm64 binaries. The temporary image/copy were removed after detachment.
-This historical fixture validates the tooling, not the upcoming candidate.
+The six-asset updater builder was also exercised against this same cached,
+independently pinned image using a disposable updater key. Real Developer ID,
+staple and Gatekeeper checks passed for the mounted, quarantined and
+updater-extracted apps; complete archive/DMG inventories matched. That
+historical package declares 11.0 while its Bun Mach-O is stamped 13.0, so the
+new deployment-floor guard correctly rejects it; the earlier run demonstrates
+signing/inventory tooling only and is not current release acceptance. The
+original image remained unchanged and temporary copies/mounts were cleaned up.
+No new signing, release acceptance, or installed A-to-B behavior is claimed.
 
 No new candidate was built, draft created, release published or signing
 credential exported while implementing this route. The parent must run it

@@ -6,6 +6,12 @@ use std::{
 use tauri::{AppHandle, Manager, Window};
 use tokio::sync::Notify;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartError {
+    Admission(String),
+    Spawn(String),
+}
+
 pub struct SidecarLifecycle {
     pid: std::sync::Mutex<Option<u32>>,
     shutting_down: AtomicBool,
@@ -29,13 +35,17 @@ impl SidecarLifecycle {
     /// A repeated Retry must not replace the server whose exit we still await.
     pub fn start<T>(
         &self,
+        admit: impl FnOnce() -> Result<(), String>,
         spawn: impl FnOnce() -> Result<(u32, T), String>,
-    ) -> Result<Option<T>, String> {
+    ) -> Result<Option<T>, StartError> {
         let mut pid = self.pid.lock().expect("sidecar lifecycle lock poisoned");
         if pid.is_some() || self.is_shutting_down() {
             return Ok(None);
         }
-        let (started_pid, child) = spawn()?;
+        // Admission runs while this PID/shutdown lock is held and directly
+        // before spawn, so Retry and Quit cannot race a pre-server refusal.
+        admit().map_err(StartError::Admission)?;
+        let (started_pid, child) = spawn().map_err(StartError::Spawn)?;
         *pid = Some(started_pid);
         Ok(Some(child))
     }
@@ -256,7 +266,7 @@ mod tests {
     #[test]
     fn shutdown_is_started_once() {
         let lifecycle = SidecarLifecycle::default();
-        lifecycle.start(|| Ok((42, ()))).unwrap();
+        lifecycle.start(|| Ok(()), || Ok((42, ()))).unwrap();
         assert_eq!(lifecycle.begin_shutdown(), Some(42));
         assert_eq!(lifecycle.begin_shutdown(), None);
     }
@@ -268,7 +278,10 @@ mod tests {
         assert_eq!(lifecycle.begin_shutdown(), None);
         assert!(lifecycle.shutdown_complete());
         assert_eq!(
-            lifecycle.start::<()>(|| panic!("closing during startup must prevent a late spawn")),
+            lifecycle.start::<()>(
+                || panic!("closing during startup must prevent admission"),
+                || panic!("closing during startup must prevent a late spawn"),
+            ),
             Ok(None)
         );
     }
@@ -276,7 +289,7 @@ mod tests {
     #[test]
     fn repeated_close_cannot_release_the_shutdown_fence_early() {
         let lifecycle = SidecarLifecycle::default();
-        lifecycle.start(|| Ok((42, ()))).unwrap();
+        lifecycle.start(|| Ok(()), || Ok((42, ()))).unwrap();
         assert!(!lifecycle.shutdown_complete());
         assert_eq!(lifecycle.begin_shutdown(), Some(42));
         assert!(!lifecycle.shutdown_complete());
@@ -291,7 +304,10 @@ mod tests {
             "the final app.exit() must proceed"
         );
         assert_eq!(
-            lifecycle.start::<()>(|| panic!("a completed shutdown must still reject Retry")),
+            lifecycle.start::<()>(
+                || panic!("a completed shutdown must still reject admission"),
+                || panic!("a completed shutdown must still reject Retry"),
+            ),
             Ok(None)
         );
     }
@@ -299,7 +315,7 @@ mod tests {
     #[test]
     fn unexpected_server_exit_does_not_count_as_a_requested_shutdown() {
         let lifecycle = SidecarLifecycle::default();
-        lifecycle.start(|| Ok((42, ()))).unwrap();
+        lifecycle.start(|| Ok(()), || Ok((42, ()))).unwrap();
         lifecycle.exited(42);
         assert!(!lifecycle.shutdown_complete());
         assert_eq!(lifecycle.begin_shutdown(), None);
@@ -309,7 +325,7 @@ mod tests {
     #[test]
     fn exit_before_waiting_completes_shutdown_immediately() {
         let lifecycle = SidecarLifecycle::default();
-        lifecycle.start(|| Ok((42, ()))).unwrap();
+        lifecycle.start(|| Ok(()), || Ok((42, ()))).unwrap();
         assert_eq!(lifecycle.begin_shutdown(), Some(42));
         lifecycle.exited(42);
         tauri::async_runtime::block_on(async {
@@ -324,16 +340,19 @@ mod tests {
     fn retry_does_not_spawn_another_server_until_the_previous_one_exits() {
         let lifecycle = SidecarLifecycle::default();
         assert_eq!(
-            lifecycle.start(|| Ok((42, "first"))).unwrap(),
+            lifecycle.start(|| Ok(()), || Ok((42, "first"))).unwrap(),
             Some("first")
         );
         assert_eq!(
-            lifecycle.start::<()>(|| panic!("the previous server is still tracked")),
+            lifecycle.start::<()>(
+                || panic!("the previous server is still tracked"),
+                || panic!("the previous server is still tracked"),
+            ),
             Ok(None)
         );
         lifecycle.exited(42);
         assert_eq!(
-            lifecycle.start(|| Ok((43, "retry"))).unwrap(),
+            lifecycle.start(|| Ok(()), || Ok((43, "retry"))).unwrap(),
             Some("retry")
         );
         lifecycle.exited(42);
@@ -344,15 +363,72 @@ mod tests {
     fn failed_spawn_can_retry_but_shutdown_cannot_spawn() {
         let lifecycle = SidecarLifecycle::default();
         assert!(lifecycle
-            .start::<()>(|| Err("spawn failed".to_owned()))
+            .start::<()>(|| Ok(()), || Err("spawn failed".to_owned()))
             .is_err());
-        assert_eq!(lifecycle.start(|| Ok((42, ()))).unwrap(), Some(()));
+        assert_eq!(
+            lifecycle.start(|| Ok(()), || Ok((42, ()))).unwrap(),
+            Some(())
+        );
         assert_eq!(lifecycle.begin_shutdown(), Some(42));
         lifecycle.exited(42);
         assert_eq!(
-            lifecycle.start::<()>(|| panic!("Quit already began")),
+            lifecycle.start::<()>(
+                || panic!("Quit already began"),
+                || panic!("Quit already began"),
+            ),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn denied_admission_never_invokes_spawn() {
+        let lifecycle = SidecarLifecycle::default();
+        let spawned = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            lifecycle.start::<()>(
+                || Err("pending update attempt".to_owned()),
+                || {
+                    spawned.store(true, Ordering::SeqCst);
+                    Ok((42, ()))
+                },
+            ),
+            Err(StartError::Admission("pending update attempt".to_owned()))
+        );
+        assert!(!spawned.load(Ordering::SeqCst));
+        assert!(!lifecycle.has_sidecar());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repeated_retry_cannot_bypass_the_same_update_attempt_record() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "gajae-lifecycle-update-attempt-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        std::fs::create_dir(&root).unwrap();
+        assert!(crate::updater_attempt::check(&root).is_ok());
+        std::fs::write(root.join("desktop-update-attempt.json"), b"pending").unwrap();
+        let lifecycle = SidecarLifecycle::default();
+        for _ in 0..2 {
+            let result = lifecycle.start::<()>(
+                || crate::updater_attempt::check(&root),
+                || panic!("a present update attempt must deny every retry"),
+            );
+            match result {
+                Err(StartError::Admission(reason)) => {
+                    assert!(reason.contains("desktop-update-attempt.json"))
+                }
+                result => panic!("expected record admission refusal, got {result:?}"),
+            }
+            assert!(!lifecycle.has_sidecar());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -365,10 +441,13 @@ mod tests {
             let spawn_barrier = Arc::clone(&spawning);
             let starting_lifecycle = &lifecycle;
             let start = threads.spawn(move || {
-                starting_lifecycle.start(|| {
-                    spawn_barrier.wait();
-                    Ok((42, ()))
-                })
+                starting_lifecycle.start(
+                    || Ok(()),
+                    || {
+                        spawn_barrier.wait();
+                        Ok((42, ()))
+                    },
+                )
             });
             spawning.wait();
             assert_eq!(lifecycle.begin_shutdown(), Some(42));
@@ -379,7 +458,7 @@ mod tests {
     #[test]
     fn shutdown_waits_for_the_tracked_server_to_exit() {
         let lifecycle = SidecarLifecycle::default();
-        lifecycle.start(|| Ok((42, ()))).unwrap();
+        lifecycle.start(|| Ok(()), || Ok((42, ()))).unwrap();
         assert_eq!(lifecycle.begin_shutdown(), Some(42));
         tauri::async_runtime::block_on(async {
             let mut waiting = Box::pin(lifecycle.wait_for_exit());

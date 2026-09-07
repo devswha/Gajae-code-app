@@ -206,8 +206,14 @@ test('failed authentication, command timeout, and unexpected notarization respon
 test('workflow requires all signing inputs before expensive macOS work and cannot fall back to ad-hoc', () => {
   const desktop = workflow.slice(workflow.indexOf('  desktop-macos:'), workflow.indexOf('  ubuntu-24-compatibility:'));
   assert.match(desktop, /environment: release/);
+  assert.doesNotMatch(desktop.slice(0, desktop.indexOf('\n    steps:')), /TAURI_SIGNING_PRIVATE_KEY/);
+  for (const name of ['Require release signing credentials', 'Build canonical macOS updater assets']) {
+    for (const secret of ['TAURI_SIGNING_PRIVATE_KEY', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD']) {
+      assert.ok(workflowStep(name).includes(`${secret}: ` + '${{ secrets.' + secret + ' }}'));
+    }
+  }
   assert.deepEqual([...desktop.matchAll(/\$\{\{ secrets\.(APPLE_[A-Z0-9_]+) }}/g)].map(match => match[1]), REQUIRED_SIGNING_SECRETS);
-  assert.match(workflowStep('Require release signing credentials'), /run: node scripts\/release\/check-signing-readiness.mjs --mode ci/);
+  assert.match(workflowStep('Require release signing credentials'), /node scripts\/release\/check-signing-readiness\.mjs --mode ci/);
   const preflight = desktop.indexOf('- name: Require release signing credentials');
   assert.ok(preflight < desktop.indexOf('- name: Set up Rust'));
   assert.ok(preflight < desktop.indexOf('- name: Install dependencies'));
@@ -221,8 +227,12 @@ test('workflow requires all signing inputs before expensive macOS work and canno
 test('the actual publication guard rejects missing/false/malformed signing output and accepts only true', () => {
   const body = stepShell('Require signed desktop before publication');
   assert.match(workflowStep('Require signed desktop before publication'), /DESKTOP_SIGNED: \$\{\{ needs\.desktop-macos\.outputs\.signed }}/);
-  const publish = workflow.slice(workflow.indexOf('  publish:'));
-  assert.ok(publish.indexOf('- name: Require signed desktop before publication') < publish.indexOf('- name: Download canonical server release assets'));
+  const publishStart = workflow.lastIndexOf('\n  publish:');
+  assert.notEqual(publishStart, -1);
+  const publish = workflow.slice(publishStart);
+  const guardIndex = publish.indexOf('- name: Require signed desktop before publication');
+  const serverDownloadIndex = publish.indexOf('- name: Download canonical server release assets');
+  assert.ok(guardIndex >= 0 && serverDownloadIndex >= 0 && guardIndex < serverDownloadIndex);
   for (const signed of ['', 'false', 'TRUE', ' true ', 'true\n', 'true']) {
     const result = spawnSync('bash', ['-c', body], { env: { ...process.env, DESKTOP_SIGNED: signed }, encoding: 'utf8' });
     assert.equal(result.status, signed === 'true' ? 0 : 1, JSON.stringify(signed));

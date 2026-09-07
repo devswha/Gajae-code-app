@@ -16,7 +16,9 @@ exit 1 means blocked; exit 2 means invalid CLI syntax. Each external command
 has a 30-second timeout. Raw command errors, credentials and notarization
 history entries are suppressed. `--mode ci` inspects environment-variable
 presence only; `--mode github` requests only secret names and update times.
-Neither can certify credentials or a built artifact.
+These checker modes cover the Apple-signing prerequisites below. The workflow
+separately checks updater key/password/public-key configuration. Neither check
+certifies credentials, updater key custody, or a built artifact.
 
 The workflow now requires signing inputs before installing/building the
 macOS payload and independently rejects an unsigned desktop at publication.
@@ -27,7 +29,7 @@ an ad-hoc asset and replacing it later.
 
 ## GitHub-hosted signing requirements
 
-The macOS job uses the `release` environment. Its exact required secret names
+The macOS job uses the `release` environment. Its Apple-signing secret names
 are below; repository secrets are also visible to the job, with environment
 secrets taking precedence. The checker does not inspect organization grants.
 This repository is user-owned, so that limitation does not affect its result.
@@ -39,6 +41,17 @@ This repository is user-owned, so that limitation does not affect its result.
 | `APPLE_ID` | Apple developer account email |
 | `APPLE_TEAM_ID` | Team owning the signing identity and notarization account |
 | `APPLE_APP_PASSWORD` | App-specific notarization password, not the Apple account password |
+
+The updater lane additionally requires `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets, plus the
+`GAJAE_UPDATER_PUBLIC_KEY` repository/environment variable containing the
+matching Tauri base64 public key. The workflow requires nonempty values and
+official Minisign 0.12. The public key is not a credential; private keys and
+passwords must never appear on argv, in artifacts or logs. Provisioning,
+backup/recovery and production-versus-QA key/feed binding remain separately
+approved readiness work, not consequences of an Apple certificate check.
+Updater private credentials are scoped to the readiness and final archive
+signing steps, not dependency installation, app builds, or runtime smokes.
 
 `DISCORD_WEBHOOK_URL` is optional for announcements. `GITHUB_TOKEN` is supplied
 by Actions for publication; it is not a signing secret to provision.
@@ -104,6 +117,11 @@ with `--publish`. This path requires no hosted signing secrets and preserves
 the workflow's unsigned-publication guard. Neither route was dispatched or
 published while implementing these checks.
 
+Hosted dispatch is also draft-only by default. Its explicit `publish` input
+authorizes publication only after the shared verifier has rechecked all eight
+assets, signatures, exact commit, complete desktop-version history and mutable
+draft/tag inputs. Announcements run only after successful explicit publication.
+
 ## Bounded validation after integration
 
 1. Run the parent integration's `npm run verify` on supported Node, Rust and
@@ -116,6 +134,8 @@ published while implementing these checks.
    for a bounded submission wait. If it remains in progress, record the
    submission ID and use `notarytool info` on that ID; do not submit duplicates.
    Never re-sign a stapled app; regenerate the DMG checksum after stapling.
+   Then follow `LOCAL-RELEASE.md` to build/sign the unchanged final app archive
+   and verify DMG/updater equivalence. Never use a pre-staple updater archive.
 3. Require DMG and app staples, Gatekeeper acceptance, and deep/strict
    signatures both on the mounted image and on a quarantined copy on a
    writable volume. Run both packaged-server smokes below against that copy,

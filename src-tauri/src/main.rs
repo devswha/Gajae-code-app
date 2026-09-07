@@ -1,33 +1,54 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 use std::fs::OpenOptions;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 use fs2::FileExt;
 use tauri::Manager;
 
 mod desktop_origin;
+mod expected_payload;
 #[cfg(target_os = "linux")]
 mod instance;
 mod lifecycle;
+#[cfg(any(target_os = "macos", test))]
+mod macos_instance;
 mod navigation;
 #[cfg(any(target_os = "macos", test))]
 mod qa_profile;
 mod supervisor;
+#[cfg(target_os = "macos")]
+mod updater;
+#[cfg(target_os = "macos")]
+mod updater_archive;
+#[cfg(target_os = "macos")]
+mod updater_attempt;
+#[cfg(target_os = "macos")]
+mod updater_binding;
+#[cfg(target_os = "macos")]
+mod updater_discovery;
+#[cfg(target_os = "macos")]
+mod updater_manifest;
+#[cfg(target_os = "macos")]
+mod updater_signature;
+#[cfg(target_os = "macos")]
+mod updater_store;
+#[cfg(target_os = "macos")]
+mod updater_transport;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 struct SingleInstanceLock {
     _file: std::fs::File,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn acquire_single_instance_lock() -> Result<SingleInstanceLock, String> {
     let lock_path = std::env::temp_dir().join("gajae-app-desktop.lock");
     acquire_single_instance_lock_at(&lock_path)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 fn acquire_single_instance_lock_at(
     lock_path: &std::path::Path,
 ) -> Result<SingleInstanceLock, String> {
@@ -41,6 +62,18 @@ fn acquire_single_instance_lock_at(
     file.try_lock_exclusive()
         .map_err(|_| "Gajae Code App is already running.".to_owned())?;
     Ok(SingleInstanceLock { _file: file })
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_single_instance_lock() -> Result<macos_instance::InstanceLock, String> {
+    let lock_path = std::env::temp_dir().join("gajae-app-desktop.lock");
+    macos_instance::acquire(&lock_path).map_err(|error| {
+        if error.is_contended() {
+            "Gajae Code App is already running.".to_owned()
+        } else {
+            error.to_string()
+        }
+    })
 }
 fn is_gajae_deep_link(url: &tauri::Url) -> bool {
     url.scheme() == "gajae-app"
@@ -277,26 +310,34 @@ fn main() {
         .setup(move |app| {
             // A held lock means another instance is running. Setup errors
             // abort inside did_finish_launching (panic_cannot_unwind ->
-            // SIGABRT -> crash-reporter dialog), so exit cleanly instead;
+            // SIGABRT -> crash-reporter dialog), so report the bounded
+            // ownership failure and exit with a nonzero status instead;
             // macOS LaunchServices focuses the running instance on reopen.
+            // A failed bounded handoff is still a failed launch: never report
+            // success when this process did not acquire ownership.
             #[cfg(not(target_os = "linux"))]
             let lock_result = {
                 #[cfg(target_os = "macos")]
-                if qa_profile.is_some() {
-                    // QaProfile already owns its lock, before window creation.
-                    Ok(None)
-                } else {
+                {
+                    if qa_profile.is_some() {
+                        // QaProfile already owns its lock, before window
+                        // creation.
+                        Ok(None)
+                    } else {
+                        acquire_single_instance_lock().map(Some)
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
                     acquire_single_instance_lock().map(Some)
                 }
-                #[cfg(not(target_os = "macos"))]
-                acquire_single_instance_lock().map(Some)
             };
             #[cfg(not(target_os = "linux"))]
             let lock = match lock_result {
                 Ok(lock) => lock,
                 Err(message) => {
                     eprintln!("{message}");
-                    std::process::exit(0);
+                    std::process::exit(1);
                 }
             };
             #[cfg(not(target_os = "linux"))]
@@ -310,6 +351,8 @@ fn main() {
             app.manage(navigation::LoopbackOrigin::default());
             app.manage(lifecycle::SidecarLifecycle::default());
             app.manage(supervisor::RecoveryScreen::default());
+            #[cfg(target_os = "macos")]
+            app.manage(updater::Preparation::default());
             #[cfg(target_os = "macos")]
             if let Some(profile) = app.try_state::<qa_profile::QaProfile>() {
                 profile.create_windows(app, &qa_windows)?;
@@ -377,6 +420,8 @@ fn main() {
     app.run(
         |app: &tauri::AppHandle<tauri::Wry>, event: tauri::RunEvent| match event {
             tauri::RunEvent::ExitRequested { api, .. } => {
+                #[cfg(target_os = "macos")]
+                updater::unhealthy(app);
                 // graceful_quit finishes with app.exit(), which requests exit
                 // again on Linux. Let that request through only after the
                 // sidecar is gone; otherwise closing can never release the
@@ -390,6 +435,8 @@ fn main() {
                 }
             }
             tauri::RunEvent::Exit => {
+                #[cfg(target_os = "macos")]
+                updater::unhealthy(app);
                 // macOS Quit Apple events (Cmd-Q, AppleScript quit) bypass a
                 // preventable ExitRequested in this Tauri version; guarantee
                 // the sidecar's graceful shutdown on every exit path.
@@ -511,7 +558,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     #[test]
     fn single_instance_lock_is_released_for_a_fresh_launch() {
         let unique = std::time::SystemTime::now()
