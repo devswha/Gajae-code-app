@@ -28,6 +28,48 @@ and published beta.10 app is unchanged until a new versioned build is released.
 
 ## Implemented surface
 
+### Unreleased panel fixes — 2026-09-07
+
+- The selected conversation watches `/ws/browser?sessionId=…&mode=state`
+  even with the panel closed. Its first active tab or a newly opened active
+  tab reveals Browser automatically. Ordinary navigation/title updates and
+  reconnect snapshots do not reopen a dismissed tab or steal the workspace tab.
+  Other conversations and retired sockets cannot reveal the current panel.
+- This observer reads the sidecar client's existing recovery snapshot and only
+  receives validated state metadata. It neither starts Chromium nor owns a
+  screencast subscription. Disconnecting it cannot stop the visible preview.
+  `shared/browserSessionState.ts` owns the browser/server state contract.
+- Saved panel widths are clamped on attachment and row resize, including
+  sidebar/window changes, with 200 px reserved for chat. Frames fit inside the
+  available surface; image dimensions cannot enlarge it. Initial status races,
+  reconnects and tab changes re-sync Chromium's viewport. Click coordinates use
+  the loaded frame's dimensions, not an unacknowledged resize request.
+- Source verification: `npm run verify`, browser E2E (3) and GJC E2E (8) passed.
+  DOM regressions cover auto-reveal/dismissal, session isolation, observer cleanup,
+  delayed status, reconnect sizing, image coordinates and restored widths.
+- Interactive QA used the real WorkspacePanel/BrowserPanel, React Compiler,
+  app CSS and Chromium sidecar in an isolated local fixture/profile. Checked
+  1024×768, 768×768, 390×844, 320×568 and expanded 1600×1200 layouts;
+  all four page-corner markers remained visible and bottom-right input reached
+  the intended page button. This is not a packaged Tauri/installed-app check.
+
+The comparison below uses the same 1024×768 fixture and a saved 1200 px rail.
+The before fixture replays the width controller from `1339b672`; the viewer and
+test page are shared. The right edge was at x=1400, outside the window. With the
+new controller it is x=1024, retaining the complete frame and toolbar.
+
+Before:
+
+![Saved browser rail extending beyond the window](images/browser-panel/before.png)
+
+After:
+
+![Browser rail and all four page corners fitting the window](images/browser-panel/after.png)
+
+These fixes are unreleased. Published/installed beta.10 remains unchanged.
+
+### Runtime capabilities
+
 - A Bun NDJSON sidecar owns the persistent Chrome-for-Testing profile, tabs,
   structured CDP actions, input, downloads policy, and screencast frames.
 - The Workspace Browser panel and GJC agent bridge share the same session tabs.

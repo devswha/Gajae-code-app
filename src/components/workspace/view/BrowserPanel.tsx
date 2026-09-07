@@ -22,21 +22,8 @@ import {
   type BrowserViewportSize,
 } from '../../../../shared/browserViewport';
 import { openBrowserUrl } from '../../../utils/externalLink';
-
-type BrowserTab = {
-  id: string;
-  title: string;
-  url: string;
-  loading: boolean;
-  canGoBack: boolean;
-  canGoForward: boolean;
-};
-
-type BrowserState = {
-  sessionId: string;
-  activeTabId: string | null;
-  tabs: BrowserTab[];
-};
+import { isBrowserSessionState, type BrowserSessionState as BrowserState } from '../../../../shared/browserSessionState';
+import { browserSocketUrl } from '../browserSocketUrl';
 
 type AutomationStatus = {
   supported: boolean;
@@ -62,11 +49,6 @@ async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
-function socketUrl(sessionId: string): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/ws/browser?sessionId=${encodeURIComponent(sessionId)}`;
-}
-
 export default function BrowserPanel(props: BrowserPanelProps) {
   // Keep HTTP continuations, frames and in-flight controls scoped to the
   // session that created them, including when the viewer returns to an old id.
@@ -78,7 +60,8 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
   const [status, setStatus] = useState<AutomationStatus | null>(null);
   const [state, setState] = useState<BrowserState | null>(null);
   const [address, setAddress] = useState('http://localhost:5173');
-  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const [frame, setFrame] = useState<{ url: string; viewport: BrowserViewportSize; tabId?: string } | null>(null);
+  const frameUrl = frame && (!frame.tabId || !state?.activeTabId || frame.tabId === state.activeTabId) ? frame.url : null;
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('offline');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -99,10 +82,10 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
     frameObjectUrlRef.current = null;
     if (previous) URL.revokeObjectURL(previous);
   }, []);
-  const replaceFrameUrl = useCallback((next: string | null) => {
+  const replaceFrameUrl = useCallback((next: string | null, viewport = DEFAULT_BROWSER_VIEWPORT, tabId?: string) => {
     releaseFrameUrl();
     frameObjectUrlRef.current = next;
-    setFrameUrl(next);
+    setFrame(next ? { url: next, viewport, tabId } : null);
   }, [releaseFrameUrl]);
 
   const activeTab = useMemo(
@@ -152,7 +135,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
       if (disposed) return;
       let websocket: WebSocket;
       try {
-        websocket = new WebSocket(socketUrl(sessionId));
+        websocket = new WebSocket(browserSocketUrl(sessionId));
       } catch {
         setConnection('offline');
         reconnectTimer = setTimeout(connect, 1_000);
@@ -173,8 +156,8 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
         if (disposed || socketRef.current !== websocket) return;
         if (typeof event.data === 'string') {
           const message = JSON.parse(event.data) as { type: string; payload?: Record<string, unknown>; message?: string };
-          if (message.type === 'state' && message.payload) {
-            const nextState = message.payload as unknown as BrowserState;
+          if (message.type === 'state' && isBrowserSessionState(message.payload, sessionId)) {
+            const nextState = message.payload;
             const hasActiveTab = Boolean(
               nextState.activeTabId
               && nextState.tabs.some((tab) => tab.id === nextState.activeTabId),
@@ -221,6 +204,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
         const header = JSON.parse(new TextDecoder().decode(packet.slice(4, 4 + headerLength))) as {
           type?: string;
           sessionId?: string;
+          tabId?: string;
           mimeType?: string;
           metadata?: { deviceWidth?: unknown; deviceHeight?: unknown };
         };
@@ -229,9 +213,8 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
           header.metadata?.deviceWidth,
           header.metadata?.deviceHeight,
         );
-        if (frameViewport) frameViewportRef.current = frameViewport;
         const nextUrl = URL.createObjectURL(new Blob([packet.slice(4 + headerLength)], { type: header.mimeType ?? 'image/jpeg' }));
-        replaceFrameUrl(nextUrl);
+        replaceFrameUrl(nextUrl, frameViewport ?? DEFAULT_BROWSER_VIEWPORT, header.tabId);
       };
     };
     connect();
@@ -297,6 +280,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
   }, [sessionId, t]);
 
   const activeTabId = activeTab?.id ?? null;
+  const previewReady = Boolean(status?.supported && (status.browser.installed || state));
   useEffect(() => {
     const surface = surfaceRef.current;
     if (!surface || !activeTabId) return undefined;
@@ -310,7 +294,6 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
         const previous = sentViewportRef.current;
         if (!viewport || (previous?.width === viewport.width && previous.height === viewport.height)) return;
         sentViewportRef.current = viewport;
-        frameViewportRef.current = viewport;
         sendInput({ kind: 'viewport', ...viewport });
       }, 80);
     };
@@ -321,7 +304,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
       observer.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [activeTabId, sendInput]);
+  }, [activeTabId, connection, previewReady, sendInput]);
 
   const framePoint = useCallback((event: PointerEvent<HTMLImageElement> | WheelEvent<HTMLImageElement>) => {
     const image = frameRef.current;
@@ -436,8 +419,8 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-muted/10">
-      <div className="flex items-center gap-1 border-b border-border/60 p-1.5">
+    <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-muted/10">
+      <div className="flex shrink-0 items-center gap-1 border-b border-border/60 p-1.5">
         <button type="button" disabled={!activeTab?.canGoBack} onClick={() => void command({ action: 'back' })} className="rounded-md p-1.5 text-muted-foreground hover:bg-muted disabled:opacity-30" aria-label={t('workspace.browser.back')}><ArrowLeft className="h-3.5 w-3.5" /></button>
         <button type="button" disabled={!activeTab?.canGoForward} onClick={() => void command({ action: 'forward' })} className="rounded-md p-1.5 text-muted-foreground hover:bg-muted disabled:opacity-30" aria-label={t('workspace.browser.forward')}><ArrowRight className="h-3.5 w-3.5" /></button>
         <button type="button" disabled={!state} onClick={() => void command({ action: 'reload' })} className="rounded-md p-1.5 text-muted-foreground hover:bg-muted disabled:opacity-30" aria-label={t('workspace.browser.reload')}><RefreshCw className={`h-3.5 w-3.5 ${activeTab?.loading ? 'animate-spin' : ''}`} /></button>
@@ -450,7 +433,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
       </div>
 
       {state && state.tabs.length > 0 && (
-        <div className="flex items-center gap-1 overflow-x-auto border-b border-border/60 px-1.5 py-1">
+        <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-border/60 px-1.5 py-1">
           {state.tabs.map((tab) => (
             <div key={tab.id} className={`flex max-w-48 min-w-0 items-center rounded ${tab.id === state.activeTabId ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted/50'}`}>
               <button type="button" onClick={() => void command({ action: 'selectTab', tabId: tab.id })} className="min-w-0 flex-1 truncate px-2 py-1 text-left text-[11px]">
@@ -472,7 +455,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onKeyUp={handleKeyUp}
-        className="relative flex min-h-0 flex-1 items-start justify-start overflow-auto bg-black/90 outline-hidden focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset"
+        className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-background outline-hidden focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset"
       >
         {frameUrl ? (
           <img
@@ -480,6 +463,11 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
             src={frameUrl}
             alt={t('workspace.browser.preview')}
             draggable={false}
+            onLoad={() => {
+              // Input follows the loaded image, not a requested resize whose
+              // corresponding frame has not arrived yet.
+              if (frame) frameViewportRef.current = frame.viewport;
+            }}
             onPointerMove={(event) => {
               if (pointerFrameRef.current !== null) return;
               const { clientX, clientY } = event;
@@ -526,21 +514,21 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
               sendInput({ kind: 'wheel', ...point, deltaX: event.deltaX, deltaY: event.deltaY });
             }}
             onContextMenu={(event) => event.preventDefault()}
-            className="h-full w-full object-contain select-none"
+            className="absolute inset-0 block h-full w-full object-contain select-none"
           />
         ) : (
-          <div className="m-auto p-6 text-center text-xs text-white/60">
+          <div className="m-auto p-6 text-center text-xs text-muted-foreground">
             <RotateCcw className="mx-auto mb-2 h-5 w-5" />
             <p>{t('workspace.browser.empty')}</p>
             <div className="mt-3 flex flex-wrap justify-center gap-1.5">
-              {localUrls.map((url) => <button key={url} type="button" onClick={() => { setAddress(url); void open(url, false); }} className="rounded border border-white/15 px-2 py-1 hover:bg-white/10">{url.replace('http://', '')}</button>)}
+              {localUrls.map((url) => <button key={url} type="button" onClick={() => { setAddress(url); void open(url, false); }} className="rounded border border-border px-2 py-1 hover:bg-muted">{url.replace('http://', '')}</button>)}
             </div>
           </div>
         )}
       </div>
-      {error && <div className="border-t border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive">{error}</div>}
+      {error && <div className="max-h-24 shrink-0 overflow-auto border-t border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-xs break-words text-destructive">{error}</div>}
       {status?.cua && (
-        <div className="flex items-center justify-between border-t border-border/60 px-2.5 py-1 text-[10px] text-muted-foreground">
+        <div className="flex shrink-0 items-center justify-between border-t border-border/60 px-2.5 py-1 text-[10px] text-muted-foreground">
           <span>{t('workspace.browser.cua')}</span>
           <span>{status.cua.installed ? `${status.cua.version ?? 'Installed'} · ${status.cua.daemon}` : t('workspace.browser.cuaMissing')}</span>
         </div>

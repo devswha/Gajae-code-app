@@ -40,6 +40,11 @@ test('a container too narrow to honor the ratio still yields the minimum width',
   assert.equal(clampWorkspacePanelWidth(500, 200), MIN_WORKSPACE_PANEL_WIDTH);
 });
 
+test('a narrow desktop row preserves the chat minimum instead of clipping the right edge', () => {
+  assert.equal(clampWorkspacePanelWidth(900, 768), 568);
+  assert.equal(clampWorkspacePanelWidth(900, 488), 288);
+});
+
 test('a non-finite width falls back to the default rather than styling NaN', () => {
   assert.equal(clampWorkspacePanelWidth(Number.NaN), DEFAULT_WORKSPACE_PANEL_WIDTH);
 });

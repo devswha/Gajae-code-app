@@ -2,13 +2,15 @@ import type { IncomingMessage } from 'node:http';
 
 import type WebSocket from 'ws';
 
+import { isBrowserSessionState } from '../../../shared/browserSessionState.js';
+
 import { safeSessionId } from './browser-protocol.js';
 import { automationService } from './automation.service.js';
 
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 type BrowserStreamingService = Pick<typeof automationService, 'subscribeBrowser'> & {
-  browser: Pick<typeof automationService.browser, 'subscribeFrames' | 'unsubscribeFrames'>;
+  browser: Pick<typeof automationService.browser, 'cachedState' | 'subscribeFrames' | 'unsubscribeFrames'>;
 };
 
 function binaryFrame(header: Record<string, unknown>, data: string): Buffer {
@@ -32,6 +34,7 @@ export function handleBrowserConnection(
     return;
   }
 
+  const stateOnly = url.searchParams.get('mode') === 'state';
   let streamSubscribed = false;
   let closed = false;
   const subscribeFrames = () => {
@@ -42,18 +45,24 @@ export function handleBrowserConnection(
         // A static page may not emit another state event after this websocket
         // attaches. Send the subscription snapshot so a remounted panel gets
         // its tab strip even when nothing in the page changes.
-        if (ws.readyState === ws.OPEN && state && typeof state === 'object') {
+        if (!closed && ws.readyState === ws.OPEN && state && typeof state === 'object') {
           ws.send(JSON.stringify({ type: 'state', sessionId, payload: state }));
         }
       })
       .catch((error) => {
         streamSubscribed = false;
-        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', message: error instanceof Error ? error.message : 'Browser stream failed.' }));
+        if (!closed && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', message: error instanceof Error ? error.message : 'Browser stream failed.' }));
       });
   };
 
   const unsubscribe = service.subscribeBrowser((event) => {
-    if (event.sessionId !== sessionId || ws.readyState !== ws.OPEN) return;
+    if (closed || event.sessionId !== sessionId || ws.readyState !== ws.OPEN) return;
+    if (stateOnly) {
+      if (event.method === 'state' && isBrowserSessionState(event.payload, sessionId)) {
+        ws.send(JSON.stringify({ type: 'state', sessionId, payload: event.payload }));
+      }
+      return;
+    }
     if (event.method === 'frame') {
       if (ws.bufferedAmount > MAX_BUFFERED_BYTES || typeof event.payload.data !== 'string') return;
       const { data, ...metadata } = event.payload;
@@ -75,14 +84,23 @@ export function handleBrowserConnection(
     ws.send(JSON.stringify({ type: event.method, sessionId, payload: event.payload }));
   });
 
-  subscribeFrames();
-
   const close = () => {
+    if (closed) return;
     closed = true;
     streamSubscribed = false;
     unsubscribe();
-    void service.browser.unsubscribeFrames(sessionId).catch(() => {});
+    if (!stateOnly) void service.browser.unsubscribeFrames(sessionId).catch(() => {});
   };
   ws.once('close', close);
   ws.once('error', close);
+
+  if (stateOnly) {
+    // Watching for agent-open events must not create a browser session or alter
+    // the screencast subscription owned by an actual preview socket.
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'state', sessionId, payload: service.browser.cachedState(sessionId) }));
+    }
+  } else {
+    subscribeFrames();
+  }
 }

@@ -42,6 +42,13 @@ not changed. The older session records below are historical.
   first-download consent and OS restrictions remain. See
   `BROWSER-CUA-VERIFICATION.md` for the scope and regression evidence. These
   fixes likewise require a new desktop build; beta.10 has not been overwritten.
+- A separate unreleased browser-panel follow-up auto-reveals newly active
+  browser tabs in the selected conversation using a metadata-only observer.
+  Saved widths now follow window/sidebar resizing; viewport synchronization
+  survives initial status races and reconnects, and input follows the loaded
+  frame. Shared browser state types/validation replace duplicated contracts.
+  See `BROWSER-CUA-VERIFICATION.md` for regression and visual evidence. No new
+  installer was produced and the installed beta.10 app remains unchanged.
 
 - **The v2 baseline is complete.** Server/backend/web MVP (Slices 0–4 + 6), the Tauri
   desktop shell (Slice 5 C1–C6), **and the C7 interactive GUI smoke** are all

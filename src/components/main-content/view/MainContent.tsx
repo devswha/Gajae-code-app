@@ -8,6 +8,8 @@ import { useFileOpenResolver } from '../../../hooks/useFileOpenResolver';
 import { useProjectPermissions } from '../../../hooks/useProjectPermissions';
 import { useSessionStore } from '../../../stores/useSessionStore';
 import { useWorkspacePanel } from '../../workspace/hooks/useWorkspacePanel';
+import { useBrowserAutoReveal } from '../../workspace/hooks/useBrowserAutoReveal';
+import { MIN_WORKSPACE_CHAT_WIDTH } from '../../workspace/workspacePanelState';
 import { api } from '../../../utils/api';
 import { useSessionLocation } from '../../chat/hooks/useSessionLocation';
 
@@ -53,6 +55,10 @@ function MainContent({
   const navigationSequence = useRef(0);
   const { permissions: projectPermissions } = useProjectPermissions(selectedProject?.projectId);
   const sessionLocation = useSessionLocation(selectedSession?.id);
+  const automationSessionId = selectedProject
+    ? selectedSession?.id ?? `project-${selectedProject.projectId}`
+    : undefined;
+  useBrowserAutoReveal(isLoading ? undefined : automationSessionId, panel.openPanel);
 
   const revealFile = useCallback((path: string) => {
     void api.system.openFile(path).catch((error) => {
@@ -115,7 +121,7 @@ function MainContent({
 
       <SessionStatusProvider>
       <div ref={containerRef} className="flex min-h-0 flex-1 overflow-hidden">
-        <div className={`flex min-h-0 min-w-50 flex-1 flex-col overflow-hidden ${expanded ? 'hidden' : ''}`}>
+        <div style={{ minWidth: MIN_WORKSPACE_CHAT_WIDTH }} className={`flex min-h-0 flex-1 flex-col overflow-hidden ${expanded ? 'hidden' : ''}`}>
           <div className={`h-full ${activeTab === 'chat' ? 'block' : 'hidden'}`}>
             <ErrorBoundary showDetails>
               <Suspense fallback={null}>
@@ -158,7 +164,7 @@ function MainContent({
               sessionId={selectedSession?.id}
               onComposerInsert={handleComposerInsert}
               permissionMode={projectPermissions?.mode ?? null}
-              automationSessionId={selectedSession?.id ?? `project-${selectedProject.projectId}`}
+              automationSessionId={automationSessionId!}
               browserNavigation={pendingBrowserNavigation}
               onBrowserNavigationHandled={() => setPendingBrowserNavigation(null)}
               resizeHandleRef={resizeHandleRef}

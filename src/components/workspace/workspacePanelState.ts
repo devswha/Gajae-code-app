@@ -27,6 +27,7 @@ export const WORKSPACE_PANEL_STORAGE_KEY = 'workspace-panel';
 const LEGACY_FILES_PANEL_OPEN_KEY = 'files-panel-open';
 
 export const MIN_WORKSPACE_PANEL_WIDTH = 280;
+export const MIN_WORKSPACE_CHAT_WIDTH = 200;
 export const DEFAULT_WORKSPACE_PANEL_WIDTH = 384;
 export const WORKSPACE_PANEL_KEYBOARD_RESIZE_STEP = 24;
 
@@ -49,7 +50,10 @@ export function clampWorkspacePanelWidth(width: number, containerWidth?: number)
   }
 
   const ceiling = typeof containerWidth === 'number' && containerWidth > 0
-    ? Math.max(MIN_WORKSPACE_PANEL_WIDTH, Math.floor(containerWidth * MAX_CONTAINER_RATIO))
+    ? Math.max(MIN_WORKSPACE_PANEL_WIDTH, Math.min(
+      Math.floor(containerWidth * MAX_CONTAINER_RATIO),
+      containerWidth - MIN_WORKSPACE_CHAT_WIDTH,
+    ))
     : ABSOLUTE_MAX_WORKSPACE_PANEL_WIDTH;
 
   return Math.round(Math.min(Math.max(width, MIN_WORKSPACE_PANEL_WIDTH), ceiling));
