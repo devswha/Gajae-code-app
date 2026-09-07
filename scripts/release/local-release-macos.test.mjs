@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -7,6 +8,7 @@ import { test } from 'node:test';
 import {
   assertDeveloperSignature,
   assertNotarizedAssessment,
+  assertManualBuildInfo,
   parseVtoolBuildMinimums,
   verifyMacosApp,
   verifyMacosDeploymentFloor,
@@ -32,14 +34,16 @@ async function fixture(t) {
     teamId,
   };
   const state = { input, calls: [], packageVersion: input.version, desktopVersion: input.desktopVersion };
-  state.run = async (program, args) => {
-    state.calls.push({ program, args });
+  state.run = async (program, args, options) => {
+    state.calls.push({ program, args, ...(options?.output ? { options } : {}) });
     if (state.fail?.(program, args)) throw new Error('Simulated acceptance failure');
     if (program === 'hdiutil' && args[0] === 'attach') {
       const app = join(root, 'mount/Gajae Code App.app');
       const payload = join(app, 'Contents/Resources/resources/server-payload');
       await mkdir(payload, { recursive: true });
       await writeFile(join(payload, 'package.json'), JSON.stringify({ name: 'gajae-app', version: state.packageVersion }));
+      await mkdir(join(payload, 'server'), { recursive: true });
+      await writeFile(join(payload, 'server/gjc-runtime-manifest.json'), '{"signed":"fixture"}\n');
       await mkdir(join(app, 'Contents/MacOS'), { recursive: true });
       await mkdir(join(payload, 'dist-native'), { recursive: true });
       await writeFile(join(payload, 'dist-native/libfixture.dylib'), 'Mach-O dylib fixture');
@@ -59,10 +63,25 @@ async function fixture(t) {
     }
     if (program === 'ditto') {
       await cp(args[0], args[1], { recursive: true });
+      if (state.alterCopy) await state.alterCopy(args[1]);
       if (!state.archiveReady && !state.skipArchive) {
         await createUpdaterArchive({ appPath: args[1], archivePath: input.updaterArchivePath });
         state.archiveReady = true;
       }
+    }
+    if (args[0] === '--desktop-build-info') {
+      assert.ok(program.includes('/copy/'));
+      assert.equal(options.timeout, 10_000);
+      assert.equal(options.maxOutputBytes, 4096);
+      await writeFile(options.output, state.buildInfoText ?? JSON.stringify({
+        schemaVersion: 1, packageName: 'gajae-app', productVersion: input.version,
+        desktopVersion: input.desktopVersion, debug: false, updateMode: 'disabled',
+        runtimeManifestSha256: input.runtimeManifestSha256,
+        payloadRuntimeManifestSha256: createHash('sha256').update('{"signed":"fixture"}\n').digest('hex'),
+        ...state.buildInfoOverrides,
+      }), { flag: 'wx', mode: 0o600 });
+      if (state.afterDiagnostic) await state.afterDiagnostic();
+      return { stdout: '', stderr: state.buildInfoStderr ?? '' };
     }
     if (program === 'codesign' && args[0] === '--display') return { stdout: '', stderr: state.signature ?? signature };
     if (program === 'spctl') return { stdout: '', stderr: `${args.at(-1)}: accepted\nsource=Notarized Developer ID\n` };
@@ -263,6 +282,145 @@ test('copy-only signature rejection, absent staples and architecture errors all 
 
 test('failed detachment preserves the temporary directory instead of risking deletion through a mount', async t => {
   const state = await fixture(t);
+  state.fail = (program, args) => program === 'hdiutil' && args[0] === 'detach';
+  await assert.rejects(state.execute(), error => error.preserveDirectory === true && error.message.includes(state.input.root));
+});
+
+async function manualFixture(t) {
+  const state = await fixture(t);
+  delete state.input.updaterArchivePath;
+  state.input.manualDisabled = true;
+  state.input.runtimeManifestSha256 = 'c'.repeat(64);
+  state.skipArchive = true;
+  return state;
+}
+
+test('explicit manual mode validates DMG and both apps before the bounded copied-binary diagnostic', async t => {
+  const state = await manualFixture(t);
+  const result = await state.execute();
+  assert.equal(result.updateMode, 'disabled');
+  assert.equal(result.buildInfo.updateMode, 'disabled');
+  assert.equal(result.buildInfo.runtimeManifestSha256, state.input.runtimeManifestSha256);
+  assert.equal(result.extractedApp, undefined);
+  assert.ok((await readFile(join(result.copiedApp, 'Contents/MacOS/gajae-app-desktop'))).length > 0);
+  const diagnosticIndex = state.calls.findIndex(call => call.args.includes('--desktop-build-info'));
+  assert.ok(diagnosticIndex > 0);
+  for (const target of [state.input.dmg, join(state.input.root, 'mount/Gajae Code App.app'), result.copiedApp]) {
+    for (const program of ['codesign', 'spctl', 'xcrun']) {
+      assert.ok(state.calls.slice(0, diagnosticIndex).some(call => call.program === program && call.args.at(-1) === target));
+    }
+  }
+  assert.equal(state.calls.filter(call => call.program === 'lipo').length, 4);
+  assert.ok(state.calls.slice(0, diagnosticIndex).some(call => call.args[0] === 'vtool' && call.args.at(-1).includes('/copy/')));
+  assert.equal(state.calls.filter(call => call.args[0] === '--desktop-build-info').length, 1);
+  assert.equal(state.calls.at(-1).args[0], 'detach');
+  assert.ok(!state.calls.some(call => call.args.some(arg => /--sign|--qa|--browser|\.app\.tar\.gz/.test(arg))));
+});
+
+test('manual flag is explicit, mutually exclusive with updater archives, and requires private root and source hash', async t => {
+  for (const modify of [
+    input => { delete input.manualDisabled; },
+    input => { input.manualDisabled = 'true'; },
+    input => { input.manualDisabled = false; },
+    input => { input.updaterArchivePath = 'archive.tar.gz'; },
+    input => { input.updaterArchivePath = null; },
+    input => { delete input.runtimeManifestSha256; },
+    input => { input.runtimeManifestSha256 = 'bad'; },
+  ]) {
+    const state = await manualFixture(t);
+    modify(state.input);
+    await assert.rejects(state.execute());
+    assert.equal(state.calls.length, 0);
+  }
+  const state = await manualFixture(t);
+  await chmod(state.input.root, 0o755);
+  await assert.rejects(state.execute(), /owner-only/);
+  assert.equal(state.calls.length, 0);
+});
+
+test('build info requires exact typed schema, disabled mode and every pinned compile-time identity', () => {
+  const expected = { version: '2.0.0-beta.10', desktopVersion: '0.2.4', runtimeManifestSha256: 'c'.repeat(64), payloadRuntimeManifestSha256: 'e'.repeat(64) };
+  const good = { schemaVersion: 1, packageName: 'gajae-app', productVersion: expected.version,
+    desktopVersion: expected.desktopVersion, debug: false, updateMode: 'disabled', runtimeManifestSha256: expected.runtimeManifestSha256,
+    payloadRuntimeManifestSha256: expected.payloadRuntimeManifestSha256 };
+  assert.deepEqual(assertManualBuildInfo(JSON.stringify(good), expected), good);
+  for (const [key, value] of [
+    ['schemaVersion', '1'], ['schemaVersion', 2], ['packageName', 'other'], ['productVersion', '2.0.0-beta.9'],
+    ['desktopVersion', '0.2.3'], ['debug', true], ['debug', 'false'], ['updateMode', 'enabled'],
+    ['updateMode', 'qa'], ['runtimeManifestSha256', 'd'.repeat(64)], ['extra', true],
+    ['payloadRuntimeManifestSha256', 'd'.repeat(64)],
+  ]) assert.throws(() => assertManualBuildInfo(JSON.stringify({ ...good, [key]: value }), expected));
+  for (const key of Object.keys(good)) {
+    const missing = { ...good };
+    delete missing[key];
+    assert.throws(() => assertManualBuildInfo(JSON.stringify(missing), expected));
+  }
+  for (const text of ['null', '[]', '{}', 'not JSON', `${JSON.stringify(good)}\n{}`, ' '.repeat(4097),
+    JSON.stringify(good).replace('"debug":false', '"debug":true,"debug":false')]) {
+    assert.throws(() => assertManualBuildInfo(text, expected));
+  }
+});
+
+test('manual signing, staple, Gatekeeper, architecture and loader failures never launch the diagnostic', async t => {
+  for (const fail of [
+    (program, args) => program === 'codesign' && args.at(-1).endsWith('.dmg'),
+    (program, args) => program === 'codesign' && args.at(-1).includes('/copy/'),
+    (program, args) => program === 'xcrun' && args[0] === 'stapler',
+    program => program === 'spctl',
+    program => program === 'lipo',
+    (program, args) => program === 'xcrun' && args[0] === 'vtool',
+  ]) {
+    const state = await manualFixture(t);
+    state.fail = fail;
+    await assert.rejects(state.execute(), /acceptance failure/);
+    assert.ok(!state.calls.some(call => call.args[0] === '--desktop-build-info'));
+    if (state.calls.some(call => call.args[0] === 'attach')) assert.equal(state.calls.at(-1).args[0], 'detach');
+  }
+});
+
+test('manual mode fails closed on diagnostic absence, malformed output, updater enabled and diagnostics', async t => {
+  for (const change of [
+    state => { state.buildInfoOverrides = { updateMode: 'enabled' }; },
+    state => { state.buildInfoOverrides = { debug: true }; },
+    state => { state.buildInfoText = '{}'; },
+    state => { state.buildInfoText = ' '.repeat(4097); },
+    state => { state.buildInfoStderr = 'unexpected diagnostics'; },
+    state => { state.fail = (_, args) => args[0] === '--desktop-build-info'; },
+  ]) {
+    const state = await manualFixture(t);
+    change(state);
+    await assert.rejects(state.execute());
+    assert.equal(state.calls.at(-1).args[0], 'detach');
+  }
+});
+
+test('manual copied app must match the mounted app and remain unchanged after diagnostic', async t => {
+  for (const after of [false, true]) {
+    const state = await manualFixture(t);
+    const mutate = copiedApp => writeFile(join(copiedApp, 'Contents/MacOS/gajae-app-server'), 'different signed bytes');
+    if (after) state.afterDiagnostic = () => mutate(join(state.input.root, 'copy/Gajae Code App.app'));
+    else state.alterCopy = mutate;
+    await assert.rejects(state.execute(), /bytes differ/);
+    assert.equal(state.calls.at(-1).args[0], 'detach');
+    assert.equal(state.calls.some(call => call.args[0] === '--desktop-build-info'), after);
+  }
+});
+
+test('deployment floor finds extensionless and fat Mach-O helpers by bytes, regardless of executable mode', async t => {
+  for (const magic of ['cffaedfe', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca']) {
+    const state = await fixture(t);
+    const app = join(state.input.root, 'mount/Gajae Code App.app');
+    await state.run('hdiutil', ['attach']);
+    const helper = join(app, 'Contents/Resources/unlisted-helper');
+    await writeFile(helper, Buffer.from(`${magic}00000000`, 'hex'), { mode: 0o600 });
+    state.vtoolMinimumByPath = new Map([[helper, '14.0']]);
+    await assert.rejects(verifyMacosDeploymentFloor({ app, minimumSystemVersion: '13.0', inventory: await inventoryApp(app) },
+      { run: state.run }), /unlisted-helper.*requires macOS 14\.0/);
+  }
+});
+
+test('manual failed detachment retains the private copy and reports its directory', async t => {
+  const state = await manualFixture(t);
   state.fail = (program, args) => program === 'hdiutil' && args[0] === 'detach';
   await assert.rejects(state.execute(), error => error.preserveDirectory === true && error.message.includes(state.input.root));
 });

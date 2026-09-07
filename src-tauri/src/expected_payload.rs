@@ -1,8 +1,11 @@
 //! Read-only payload identity checks, independent of the supervised process.
 //!
 //! `build.rs` must bind package name/product version and the SHA-256 of the source
-//! `server/gjc-runtime-manifest.json` into the executable. Never derive these
-//! expectations from the installed payload, a ready frame, health, or runtime
+//! `server/gjc-runtime-manifest.json` into the executable. For a signed macOS
+//! release, finalization rebuilds the desktop with the finalized payload digest
+//! before sealing the app; the original source digest stays separate for release
+//! diagnostics. Never derive these expectations at runtime from the installed
+//! payload, a ready frame, health, or runtime
 //! environment variables. Missing build inputs fail closed, even with updates
 //! disabled. This module does not enable updates or access update state.
 //!
@@ -423,6 +426,24 @@ mod tests {
         changed["platforms"]["darwin-arm64"]["files"][0]["sha256"] = json!("f".repeat(64));
         assert!(expected
             .verify_manifests(&source, &bytes(&changed))
+            .is_err());
+    }
+
+    #[test]
+    fn signed_manifest_requires_its_final_compiled_digest_without_a_runtime_fallback() {
+        let original = bytes(&manifest());
+        let mut signed = manifest();
+        signed["platforms"]["darwin-arm64"]["files"][0]["sha256"] = json!("f".repeat(64));
+        let signed = bytes(&signed);
+        // Code signing legitimately changes native bytes. The pre-sign binding
+        // must reject those bytes; the finalization rebuild supplies the exact
+        // post-sign digest rather than trusting a mutable receipt at startup.
+        assert!(expected(&original)
+            .verify_manifests(&signed, &signed)
+            .is_err());
+        assert!(expected(&signed).verify_manifests(&signed, &signed).is_ok());
+        assert!(expected(&signed)
+            .verify_manifests(&original, &original)
             .is_err());
     }
 

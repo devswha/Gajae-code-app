@@ -858,6 +858,8 @@ mod tests {
             &identity(),
         )
         .unwrap();
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        manifest.version = Version::new(current.major, current.minor, current.patch + 1);
         assert!(eligible_cached(&manifest, "26.0").unwrap());
         assert!(!eligible_cached(&manifest, "12.0").unwrap());
         manifest.version = Version::new(0, 2, 3);
@@ -868,6 +870,14 @@ mod tests {
     fn fabricated_cached_signature_never_becomes_ready() {
         let temp = Temp::new();
         let store = Store::open(&temp.0).unwrap();
+        let mut fixture: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../shared/fixtures/desktop-update-manifest.json"
+        ))
+        .unwrap();
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        fixture["version"] = Version::new(current.major, current.minor, current.patch + 1)
+            .to_string()
+            .into();
         let record = PreparedRecord {
             schema: 1,
             release_id: 1,
@@ -875,10 +885,7 @@ mod tests {
             archive_asset_id: 3,
             archive_size: 4,
             archive_sha256: digest(b"test"),
-            manifest: String::from_utf8(
-                include_bytes!("../../shared/fixtures/desktop-update-manifest.json").to_vec(),
-            )
-            .unwrap(),
+            manifest: serde_json::to_string(&fixture).unwrap(),
             inventory: serde_json::json!({"fabricated":true}),
         };
         store

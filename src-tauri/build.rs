@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../package.json");
     println!("cargo:rerun-if-changed=../server/gjc-runtime-manifest.json");
     println!("cargo:rerun-if-changed=update_build_binding.rs");
+    println!("cargo:rerun-if-env-changed=GJC_SIGNED_RUNTIME_MANIFEST_SHA256");
     for name in update_build_binding::INPUT_ENV_NAMES {
         println!("cargo:rerun-if-env-changed={name}");
     }
@@ -113,10 +114,17 @@ fn main() {
         !runtime_manifest.is_empty() && runtime_manifest.len() <= 64 * 1024,
         "source runtime manifest is empty or oversized"
     );
-    println!(
-        "cargo:rustc-env=GJC_EXPECTED_RUNTIME_MANIFEST_SHA256={:x}",
-        Sha256::digest(&runtime_manifest)
-    );
+    let source_digest = format!("{:x}", Sha256::digest(&runtime_manifest));
+    let signed_digest = env::var("GJC_SIGNED_RUNTIME_MANIFEST_SHA256").ok();
+    let expected_digest = update_build_binding::signed_runtime_digest(
+        &source_digest,
+        signed_digest.as_deref(),
+        &inputs.target_os,
+        env::var("PROFILE").is_ok_and(|profile| profile == "release"),
+    )
+    .expect("invalid final signed runtime binding");
+    println!("cargo:rustc-env=GJC_SOURCE_RUNTIME_MANIFEST_SHA256={source_digest}");
+    println!("cargo:rustc-env=GJC_EXPECTED_RUNTIME_MANIFEST_SHA256={expected_digest}");
 
     tauri_build::build()
 }

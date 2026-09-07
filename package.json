@@ -1,8 +1,8 @@
 {
   "name": "gajae-app",
   "private": true,
-  "version": "2.0.0-beta.9",
-  "desktopVersion": "0.2.3",
+  "version": "2.0.0-beta.10",
+  "desktopVersion": "0.2.4",
   "productName": "Gajae Code App",
   "description": "A self-hosted web and desktop interface for GJC",
   "type": "module",

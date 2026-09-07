@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use fs2::FileExt;
 use tauri::Manager;
 
+mod build_info;
 mod desktop_origin;
 mod expected_payload;
 #[cfg(target_os = "linux")]
@@ -250,6 +251,17 @@ fn retry_desktop_server(app: tauri::AppHandle) {
 }
 
 fn main() {
+    match build_info::handle_cli(std::env::args_os().skip(1)) {
+        Ok(Some(info)) => {
+            println!("{info}");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
     use tauri_plugin_deep_link::DeepLinkExt;
 
     #[cfg(target_os = "macos")]
