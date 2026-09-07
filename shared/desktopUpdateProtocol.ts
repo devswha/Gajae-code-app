@@ -34,7 +34,7 @@ export function isDesktopUpdateCommand(value: unknown): value is DesktopUpdateCo
 
 export function isDesktopUpdateSnapshot(value: unknown): value is DesktopUpdateSnapshot {
   const keys = ['protocolVersion', 'phase', 'automatic', 'productVersion', 'desktopVersion', 'targetProductVersion', 'targetDesktopVersion', 'discoveryIncomplete', 'reason', 'installationAvailable', 'downloadedBytes', 'totalBytes', 'notes'];
-  if (!record(value) || Object.keys(value).length !== keys.length || !keys.every((key) => Object.hasOwn(value, key))
+  if (!record(value) || Object.keys(value).length !== keys.length || !keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
     || value.protocolVersion !== DESKTOP_UPDATE_PROTOCOL
     || !DESKTOP_UPDATE_PHASES.some((phase) => phase === value.phase)
     || typeof value.automatic !== 'boolean' || typeof value.discoveryIncomplete !== 'boolean'
