@@ -114,7 +114,13 @@
     "tasks": {
       "empty": "暂无计划",
       "emptyHint": "当代理在此会话中维护待办列表时，会显示在这里。",
-      "progress": "已完成 {{done}} / {{total}}"
+      "progress": "已完成 {{done}} / {{total}}",
+      "status": {
+        "pending": "待处理",
+        "in_progress": "进行中",
+        "completed": "已完成",
+        "abandoned": "已放弃"
+      }
     },
     "browser": {
       "address": "网址",

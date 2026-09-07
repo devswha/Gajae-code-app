@@ -114,7 +114,13 @@
     "tasks": {
       "empty": "尚無計畫",
       "emptyHint": "當代理人在此工作階段維護待辦清單時，會顯示在這裡。",
-      "progress": "已完成 {{done}} / {{total}}"
+      "progress": "已完成 {{done}} / {{total}}",
+      "status": {
+        "pending": "待處理",
+        "in_progress": "進行中",
+        "completed": "已完成",
+        "abandoned": "已放棄"
+      }
     },
     "browser": {
       "address": "網址",

@@ -8,7 +8,7 @@
  * panel component only has to render what these functions return.
  */
 
-export const WORKSPACE_TABS = ['status', 'changes', 'tasks', 'browser'] as const;
+export const WORKSPACE_TABS = ['status', 'changes', 'browser'] as const;
 
 export type WorkspaceTab = (typeof WORKSPACE_TABS)[number];
 
@@ -117,7 +117,8 @@ export function readWorkspacePanelState(storage: WorkspaceStorage | null): Works
   const width = typeof record.width === 'number' ? record.width : DEFAULT_WORKSPACE_PANEL_WIDTH;
 
   return {
-    open: record.open === true,
+    // Tasks moved into the chat; do not open an unrelated rail on upgrade.
+    open: record.tab !== 'tasks' && record.open === true,
     tab: normalizeWorkspaceTab(record.tab) ?? DEFAULT_WORKSPACE_PANEL_STATE.tab,
     width: clampWorkspacePanelWidth(width),
   };

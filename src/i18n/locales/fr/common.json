@@ -116,7 +116,13 @@
     "tasks": {
       "empty": "Rien de prévu pour l’instant",
       "emptyHint": "Quand l’agent tient une liste de tâches dans cette session, elle s’affiche ici.",
-      "progress": "{{done}} sur {{total}} terminées"
+      "progress": "{{done}} sur {{total}} terminées",
+      "status": {
+        "pending": "En attente",
+        "in_progress": "En cours",
+        "completed": "Terminée",
+        "abandoned": "Abandonnée"
+      }
     },
     "browser": {
       "address": "Adresse Internet",

@@ -113,7 +113,7 @@ export function sessionTodos(messages: readonly NormalizedMessage[]): SessionTod
   return sawOps ? phases : [];
 }
 
-/** Latest todo state for a session, re-read when its messages change. */
+/** Latest todo state for the visible chat, re-read when its messages change. */
 export function useSessionTodos(sessionStore: SessionStore, sessionId: string | undefined, enabled: boolean): SessionTodoPhase[] {
   const { getMessages, subscribeSession } = sessionStore;
   const subscribe = useCallback(

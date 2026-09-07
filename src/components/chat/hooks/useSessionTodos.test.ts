@@ -82,6 +82,6 @@ test('the latest structured result wins over folding the ops', () => {
   assert.deepEqual(phases, [{ name: 'Plan', tasks: [{ content: 'only', status: 'pending', notes: [] }] }]);
 });
 
-test('a session without todo_write has no plan', () => {
+test('a chat session without todo_write has no plan', () => {
   assert.deepEqual(sessionTodos([{ kind: 'text', role: 'user', content: 'hi' } as unknown as NormalizedMessage]), []);
 });

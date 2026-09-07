@@ -26,6 +26,14 @@ not changed. The older session records below are historical.
 
 ## TL;DR
 
+- **Unreleased follow-up: tasks above the conversation.** `ChatTasksPanel` now
+  shows the session's live todo list above the transcript with collapse,
+  progress and bounded scrolling. The right-hand Tasks tab is retired; its
+  persisted open state closes on upgrade. The todo projection hook now lives
+  under `src/components/chat/hooks/`. This source change is **not included in
+  the published/installed beta.10** and requires a new build/release to reach
+  that desktop installation.
+
 - **The v2 baseline is complete.** Server/backend/web MVP (Slices 0–4 + 6), the Tauri
   desktop shell (Slice 5 C1–C6), **and the C7 interactive GUI smoke** are all
   done and verified. Electron is removed (C9/wave1); the C8 rollback drill is
