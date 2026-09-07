@@ -194,6 +194,11 @@ test('real Chromium sidecar shares structured actions, tabs, and screencast stat
       return;
     }
     response.setHeader('content-type', 'text/html; charset=utf-8');
+    if (request.url === '/csp') {
+      response.setHeader('content-security-policy', "default-src 'self'; script-src 'self'; object-src 'none'");
+      response.end('<!doctype html><title>CSP fixture</title><p>restricted evaluation</p>');
+      return;
+    }
     if (request.url === '/popup') {
       response.end('<!doctype html><title>Popup fixture</title><p>popup</p>');
       return;
@@ -238,6 +243,23 @@ test('real Chromium sidecar shares structured actions, tabs, and screencast stat
     command: { action: 'run', code: '({ width: window.innerWidth, height: window.innerHeight })' },
   }) as { value: { width: number; height: number } };
   assert.deepEqual(resized.value, { width: 517, height: 742 });
+  const awaited = await sidecar.request('browser.command', 'browser-e2e', {
+    command: { action: 'run', code: 'await Promise.resolve({ title: document.title, ready: true })' },
+  }) as { value: { title: string; ready: boolean } };
+  assert.deepEqual(awaited.value, { title: 'Gajae browser fixture', ready: true });
+  const runScript = (code: string) => sidecar.request('browser.command', 'browser-e2e', {
+    command: { action: 'run', code },
+  });
+  assert.deepEqual(await runScript('Promise.resolve(42)'), { value: 42 });
+  assert.deepEqual(await runScript('const value = await Promise.resolve(21); value * 2'), { value: 42 });
+  assert.deepEqual(await runScript('const value = await Promise.resolve(7); value * 2'), { value: 14 });
+  await assert.rejects(runScript('await Promise.reject(new Error("async fixture failure"))'), /async fixture failure/);
+  await assert.rejects(runScript('globalThis.failedRunCount = (globalThis.failedRunCount || 0) + 1; throw new SyntaxError("runtime fixture failure")'), /runtime fixture failure/);
+  assert.deepEqual(await runScript('globalThis.failedRunCount'), { value: 1 }, 'runtime errors must never replay code');
+  await assert.rejects(runScript(`globalThis.oversizedRan = true; /*${'x'.repeat(64 * 1024)}*/`), /script is too large/i);
+  assert.deepEqual(await runScript('typeof globalThis.oversizedRan'), { value: 'undefined' });
+  const large = await runScript('"x".repeat(300000)') as { value: string };
+  assert.equal(large.value.length, 256 * 1024 + 1);
   const resizedFrame = await sidecar.waitForEvent('frame', 5_000, resizedFrameStart);
   assert.equal(resizedFrame.kind === 'event' && resizedFrame.payload.metadata && typeof resizedFrame.payload.metadata === 'object'
     ? (resizedFrame.payload.metadata as { deviceWidth?: number }).deviceWidth
@@ -341,6 +363,17 @@ test('real Chromium sidecar shares structured actions, tabs, and screencast stat
     command: { action: 'extract', selector: '#result', format: 'text' },
   }), { value: 'background preserved' }, 'closing one session preserves the other session');
   await assert.rejects(sidecar.request('session.state', 'browser-e2e'), /Open the browser session first/u);
+  await sidecar.request('session.open', 'csp-e2e', { url: `${url}/csp`, allowDownload: false });
+  assert.deepEqual(await sidecar.request('browser.command', 'csp-e2e', {
+    command: { action: 'run', code: 'await Promise.resolve(document.title)' },
+  }), { value: 'CSP fixture' });
+  await assert.rejects(sidecar.request('browser.command', 'csp-e2e', {
+    command: { action: 'run', code: 'eval("1 + 1")' },
+  }), /unsafe-eval|Content Security Policy|Refused/i);
+  await assert.rejects(sidecar.request('browser.command', 'csp-e2e', {
+    command: { action: 'run', code: 'await new Promise(() => {})', timeoutMs: 50 },
+  }), /timed out/);
+  assert.deepEqual(await sidecar.request('session.close', 'csp-e2e'), { closed: true });
   assert.deepEqual(await sidecar.request('session.close', 'browser-e2e'), { closed: false });
   const reopened = await sidecar.request('session.open', 'browser-e2e', { url, allowDownload: false }) as { activeTabId: string; tabs: unknown[] };
   assert.equal(reopened.tabs.length, 1);

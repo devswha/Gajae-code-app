@@ -27,6 +27,7 @@ import puppeteer, {
   type Target,
 } from 'puppeteer-core';
 import { PUPPETEER_REVISIONS } from 'puppeteer-core/internal/revisions.js';
+import { createEvaluationError, valueFromPrimitiveRemoteObject } from 'puppeteer-core/internal/cdp/utils.js';
 
 import {
   DEFAULT_BROWSER_VIEWPORT,
@@ -98,6 +99,41 @@ const CACHE_ROOT = process.env.GAJAE_BROWSER_CACHE_DIR ?? join(homedir(), '.gaja
 const PROFILE_ROOT = process.env.GAJAE_BROWSER_PROFILE_DIR ?? join(homedir(), '.gajae-app', 'browser', 'profile');
 const MAX_RUN_CODE_BYTES = 64 * 1024;
 const MAX_RESULT_TEXT = 256 * 1024;
+
+/** Console-style page evaluation: preserve completion values and support top-level await. */
+export async function evaluateBrowserScript(cdp: Pick<CDPSession, 'send'>, code: string): Promise<unknown> {
+  const objectGroup = `gajae-browser-run-${randomUUID()}`;
+  try {
+    let response = await cdp.send('Runtime.evaluate', {
+      expression: code,
+      replMode: true,
+      awaitPromise: true,
+      returnByValue: false,
+      objectGroup,
+      userGesture: true,
+      allowUnsafeEvalBlockedByCSP: false,
+    });
+    // Do not retry failed code in another wrapper: it may already have changed the page.
+    if (response.exceptionDetails) throw createEvaluationError(response.exceptionDetails);
+    if (response.result.objectId) {
+      // REPL completion can itself be a Promise. Await the existing value,
+      // rather than serializing it to {} or executing the source a second time.
+      response = response.result.subtype === 'promise'
+        ? await cdp.send('Runtime.awaitPromise', { promiseObjectId: response.result.objectId, returnByValue: true })
+        : await cdp.send('Runtime.callFunctionOn', {
+          objectId: response.result.objectId,
+          functionDeclaration: 'function() { return this; }',
+          returnByValue: true,
+          awaitPromise: true,
+          objectGroup,
+        });
+    }
+    if (response.exceptionDetails) throw createEvaluationError(response.exceptionDetails);
+    return valueFromPrimitiveRemoteObject(response.result);
+  } finally {
+    await cdp.send('Runtime.releaseObjectGroup', { objectGroup }).catch(() => {});
+  }
+}
 
 type AppBrowserLaunchOptions = Omit<LaunchOptions, 'executablePath' | 'channel'> & { userDataDir: string };
 type BrowserLaunchDependencies = {
@@ -350,7 +386,7 @@ class BrowserRuntime {
         const timeoutMs = Math.min(Math.max(command.timeoutMs ?? 30_000, 1), 300_000);
         let timeout: ReturnType<typeof setTimeout> | undefined;
         const value = await Promise.race([
-          page.evaluate((source) => (0, eval)(source), command.code),
+          this.cdp(tab).then((cdp) => evaluateBrowserScript(cdp, command.code)),
           new Promise((_, reject) => {
             timeout = setTimeout(() => reject(new Error('run_timeout: Browser script timed out.')), timeoutMs);
           }),

@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import net from 'node:net';
 import { isAbsolute, join, relative } from 'node:path';
 import { test } from 'node:test';
 
 import { ACP_BUILTIN_SLASH_COMMANDS } from '@gajae-code/coding-agent/slash-commands/acp-builtins';
-import { createAgentSession, discoverAuthStorage } from '@gajae-code/coding-agent/sdk/session';
+import { createAgentSession, discoverAuthStorage, type AutomationTools } from '@gajae-code/coding-agent/sdk/session';
 import { ModelRegistry } from '@gajae-code/coding-agent/config/model-registry';
 import { Settings } from '@gajae-code/coding-agent/config/settings';
 import { SessionManager } from '@gajae-code/coding-agent/session/session-manager';
@@ -2020,6 +2021,65 @@ test('app automation is injected through the SDK built-in automationTools contra
     session.complete();
     await run;
   } finally { await f.close(); }
+});
+test('the production adapter passes bypass to automation without answering real questions', { timeout: 15_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'gjc-automation-mode-'));
+  const socketPath = join(directory, 'bridge.sock');
+  const token = 'a'.repeat(64);
+  const requests: Array<Record<string, unknown>> = [];
+  const server = net.createServer((socket) => {
+    let buffer = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      const incoming = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>;
+      requests.push(incoming);
+      const result = incoming.operation === 'authorize'
+        ? incoming.surface === 'browser'
+          ? { granted: false, origin: 'https://example.com' }
+          : { granted: false, application: 'com.apple.TextEdit', label: 'TextEdit' }
+        : { success: true };
+      socket.end(`${JSON.stringify({ id: incoming.id, ok: incoming.token === token, result })}\n`);
+    });
+  });
+  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
+  const f = await fixture('contract-model', undefined, undefined, undefined, undefined, undefined, {
+    automationBridge: { socketPath, token },
+  });
+  const runId = 'automation-bypass-mode';
+  const run = f.host.handle(request('session.start', runId, {
+    message: 'hello', options: { ...f.options, permissions: { mode: 'bypass', allowAlways: [] } },
+  }, 'automation-app-session'));
+  let session: FakeAgentSession | undefined;
+  try {
+    session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    const tools = f.factoryOptions[0]!.automationTools as AutomationTools;
+    await tools.browser!.execute('browser-bypass', { action: 'open', url: 'https://example.com' }, AbortSignal.timeout(5_000));
+    await tools.computer!.execute('computer-bypass', { action: 'click', arguments: { pid: 42, x: 1, y: 1 } }, AbortSignal.timeout(5_000));
+    assert.equal(methods(f.frames).filter(method => method === 'ask.presented').length, 0);
+    assert.deepEqual(requests.map(item => item.operation), ['authorize', 'open', 'authorize', undefined]);
+    assert.ok(requests.every(item => item.sessionId === 'automation-app-session'));
+    assert.ok(requests.every(item => !(item.payload as Record<string, unknown> | undefined)?.scope));
+
+    const question = session.uiContext!.select('Choose a plan', ['A', 'B']);
+    void question.catch(() => {});
+    await Promise.resolve();
+    const message = (f.frames.at(-1)!.payload as Record<string, unknown>).message as Record<string, unknown>;
+    assert.equal(message.kind, 'permission_request');
+    assert.equal(message.toolName, 'ask');
+    await f.host.handle(request('ask.reply', 'answer-plan', { runId, requestId: message.requestId, decision: { allow: true, message: 'B' } }, 'automation-app-session'));
+    assert.equal((response(f.frames, 'answer-plan').payload as Record<string, unknown>).ok, true);
+    assert.equal(await question, 'B');
+  } finally {
+    session?.complete();
+    await run;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await f.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 test('abort closes the app automation session before reporting success', async () => {
   const cleanup = deferred<void>();

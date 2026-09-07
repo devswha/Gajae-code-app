@@ -1,6 +1,30 @@
 # Browser and CUA verification
 
-Last verified: 2026-08-21 on Apple Silicon macOS.
+Packaged-app baseline: 2026-08-21 on Apple Silicon macOS. Unreleased source
+checks are recorded separately below.
+
+## Unreleased runtime fixes — 2026-09-07
+
+- `browser.run` now evaluates page JavaScript with top-level `await` support.
+  The final expression is returned; ordinary Promise results are awaited too.
+  Code is evaluated only once, including when it throws a runtime SyntaxError.
+  Page-context execution does not expose Node.js or Puppeteer variables.
+- The existing 64 KiB code, 256 KiB result and time limits remain. Temporary
+  remote objects are released, closing a session still interrupts pending
+  scripts, and the evaluator explicitly does not bypass page CSP.
+- The adapter passes the run's validated project permission mode into the
+  browser/computer wrappers. `bypass` skips their additional origin/application
+  access questions after target validation, without creating session or
+  persistent grants. Later Ask runs therefore do not inherit bypass access.
+- Ask/auto-edits prompts, Chromium's first-download consent, actual `ask`
+  questions, operating-system permissions and driver restrictions remain.
+  Cancelled tool calls fail before opening a bridge connection.
+- Regression coverage includes the production adapter policy handoff, later
+  Ask runs, model-supplied policy spoofing, real Chromium top-level await,
+  Promise results, one-shot errors, CSP enforcement, size limits and interruption.
+
+These are source/runtime checks, not new packaged-app acceptance. The installed
+and published beta.10 app is unchanged until a new versioned build is released.
 
 ## Implemented surface
 

@@ -219,6 +219,14 @@ method or frame changes; the policy travels inside existing payloads:
   persists it to the project's allow-list before forwarding the reply.
 - `ask` questions keep their `sdk-ask:` prefix and answer semantics.
 
+The app-owned browser and computer tool wrappers receive the same validated
+run permission mode as the SDK gate. In `bypass`, target/origin resolution still
+runs, but the extra access question is omitted without adding grants to either
+allow-list. Ask and auto-edits retain their existing access prompts. This does
+not auto-answer `ask` questions, approve Chromium installation, or override OS
+permissions or CUA driver restrictions. The mode is captured for the run; no
+implicit grant survives into a later Ask run.
+
 ## Process and terminal lifecycle
 
 - On POSIX (Linux and macOS), the application starts the Rust core as a detached
