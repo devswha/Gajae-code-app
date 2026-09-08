@@ -1,5 +1,10 @@
 # gajae-app v2 — Session Handoff (resume state)
 
+Latest signed qualification: [DESKTOP-UPDATER-SIGNED-QA.md](DESKTOP-UPDATER-SIGNED-QA.md).
+Same-source f69ec4f release-mode A/B are notarized and Gatekeeper-accepted. The
+actual signed update transition is paused for manual Mac unlock; its running
+isolated A, feed and local model are retained. Public deployment is not complete.
+
 Last updated: 2026-09-08 (private manual-update A10 → B3 and attachment preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
 
 ## Follow-up checkpoint — SDK32 and durable notification handoff

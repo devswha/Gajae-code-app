@@ -1,5 +1,15 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 최신 서명 QA 상태
+
+`f69ec4f`의 동일 소스 release-mode A/B가 Developer ID 서명·공증·Gatekeeper
+검증을 통과했다. B의 packaged smoke/data-survival도 통과했다. 실제 로컬 모델
+대화와 실행 중 재시작 보류를 확인했고, 초안/대기열/SVG/전사 파일의 before
+해시를 기록했다. **실제 서명 A→B 교체는 아직 미검증**이며 Mac 잠금으로 다음
+화면 조작을 기다린다. 프로덕션 배포는 하지 않았다.
+현재 앱/피드/모델 상태와 정확한 재개 절차는
+[DESKTOP-UPDATER-SIGNED-QA.md](DESKTOP-UPDATER-SIGNED-QA.md)에 있다.
+
 ## 후속: 배포 binding과 자동 다음 실행 적용 연결
 
 명시적 release-arm64 production binding과 exact QA binding이 같은 설치·재시작
