@@ -1743,6 +1743,17 @@ async function startServer() {
             // starts, no reversible preparation may certify an idle runtime.
             markInternalActivityUncertain('runtime_shutdown_started');
 
+            // Persist interruption before any slower observer cleanup. Otherwise
+            // a not-yet-started worker can cancel admission back to ready while
+            // watcher shutdown awaits, erasing the interrupted-resume contract.
+            let gjcShutdownFenced = false;
+            try {
+                await gjcJobOrchestrator.interruptForShutdown();
+                gjcShutdownFenced = true;
+            } catch (err) {
+                console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);
+            }
+
             // Join the actual watcher startup/synchronization/exit lifetime.
             // The old eager close ran before the asynchronous listen callback,
             // and never closed the watcher that callback subsequently started.
@@ -1752,14 +1763,6 @@ async function startServer() {
                 console.error('[Watcher] Shutdown is unconfirmed; refusing normal process exit:', err?.message || err);
                 process.exitCode = 1;
                 return;
-            }
-
-            let gjcShutdownFenced = false;
-            try {
-                await gjcJobOrchestrator.interruptForShutdown();
-                gjcShutdownFenced = true;
-            } catch (err) {
-                console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);
             }
 
             await drainWebSocketClients(wss.clients);
