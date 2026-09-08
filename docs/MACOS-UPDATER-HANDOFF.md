@@ -1,5 +1,20 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 후속: 배포 binding과 자동 다음 실행 적용 연결
+
+명시적 release-arm64 production binding과 exact QA binding이 같은 설치·재시작
+경로를 사용하도록 연결했다. 기본 빌드의 disabled 상태, 실제 draft/runtime
+admission, 소유 프로세스 종료, 캐시/서명/전체 앱 검증은 그대로다. 다음 실행의
+적용 여부는 durable automatic 설정 또는 대상 hash가 일치하는 manual intent로
+결정한다. QA 전용 추가 CLI 스위치는 더 이상 자동 설정의 실행 조건이 아니다.
+Off + manual intent 없음은 설치하지 않는다. 이미 충족된 installation gate를
+About에 pending으로 남기던 표시도 수정했다.
+
+이는 production 앱을 활성화하거나 배포했다는 뜻이 아니다. 동일 소스의
+Developer ID 서명·공증 QA A/B를 만든 뒤 실제 자동 경로를 검증한다. 현재
+서명 identity 및 기존 `gajae-notary` 인증은 read-only 확인을 통과했다.
+새 공증과 배포 조건의 완료 여부는 별도 실제 결과로 확인한다.
+
 ## 2026-09-08 후속: SDK 실제 종료 추적·알림 링크 보존·실패 정리
 
 이전 `4fb43c2`의 Node 22/24, Linux 서버 아카이브와 desktop 빌드 및 Ubuntu

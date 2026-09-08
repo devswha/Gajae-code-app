@@ -1,6 +1,6 @@
 //! Native launch admission and verified successor health. Installation is
-//! currently actuated only by the explicit compile-bound QA qualification path;
-//! public activation still needs the approved G0/G3/release evidence.
+//! requires explicit compiled mode/profile admission. Default builds are inert;
+//! production release publication still requires the qualification gates.
 use std::{
     path::Path,
     sync::{
@@ -320,15 +320,17 @@ fn normal_start(app: &AppHandle) {
     crate::supervisor::start(app.clone());
 }
 
-pub(crate) fn start(app: AppHandle, qa_install: bool) {
+pub(crate) fn start(app: AppHandle, _qa_install: bool) {
+    // Preserve the older explicit QA CLI flag for qualification tooling. A
+    // matching QA build now exercises the same durable consent path as release.
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = start_inner(&app, qa_install).await {
+        if let Err(error) = start_inner(&app).await {
             recover(&app, &error);
         }
     });
 }
 
-async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
+async fn start_inner(app: &AppHandle) -> Result<(), String> {
     trace("launch-start");
     let root = crate::supervisor::desktop_data_root(app)?;
     let binding = Binding::compiled();
@@ -346,15 +348,6 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
                     .into(),
             );
         }
-        normal_start(app);
-        return Ok(());
-    }
-    let manual_pending = root
-        .join("desktop-update-cache/manual-intent.json")
-        .exists();
-    if absent && ((!qa_install && !manual_pending) || binding.mode != Mode::Qa) {
-        // Current public builds continue preparation only until the required
-        // installation qualification exists; do not penalize normal startup.
         normal_start(app);
         return Ok(());
     }
@@ -435,7 +428,7 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
         .store
         .manual_requested(&archive.record().archive_sha256)
         .unwrap_or(false);
-    if (!runtime.store.preferences()?.automatic && !manual)
+    if !installation_requested(runtime.store.preferences()?.automatic, manual)
         || !crate::updater::eligible_cached(archive.manifest(), &runtime.os)
             .map_err(|error| error.code().to_owned())?
     {
@@ -444,12 +437,8 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
     }
     // A manual intent only selects the cached target. Actual process absence,
     // native bundle identity and signature gates are independently re-proved.
-    if (!qa_install && !manual) || runtime.binding.mode != Mode::Qa {
-        normal_start(app);
-        return Ok(());
-    }
     let deadline = tokio::time::Instant::now() + PREFLIGHT_TIMEOUT;
-    qa_port_is_unoccupied(&root)?;
+    stored_port_is_unoccupied(&root)?;
     let owners = crate::updater_owners::prove_no_packaged_owners(location.app())?;
     if app
         .plugin(
@@ -496,6 +485,10 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
     run_install(app, prepared, journal, location).await
 }
 
+fn installation_requested(automatic: bool, matching_manual_intent: bool) -> bool {
+    automatic || matching_manual_intent
+}
+
 async fn run_install(
     app: &AppHandle,
     prepared: PreparedInstall,
@@ -535,7 +528,7 @@ async fn run_install(
     }
 }
 
-fn qa_port_is_unoccupied(root: &Path) -> Result<(), String> {
+fn stored_port_is_unoccupied(root: &Path) -> Result<(), String> {
     let port = crate::desktop_origin::DesktopOrigin::load(root.to_owned())?.requested_port();
     if port == 0 {
         return Ok(());
@@ -545,7 +538,7 @@ fn qa_port_is_unoccupied(root: &Path) -> Result<(), String> {
         Duration::from_millis(250),
     ) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
-        _ => Err("The QA origin is occupied or its previous owner is uncertain.".into()),
+        _ => Err("The desktop origin is occupied or its previous owner is uncertain.".into()),
     }
 }
 
@@ -600,6 +593,13 @@ pub(crate) fn finish_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installation_follows_durable_consent_not_a_qa_only_cli_switch() {
+        assert!(!installation_requested(false, false));
+        assert!(installation_requested(true, false));
+        assert!(installation_requested(false, true));
+        assert!(installation_requested(true, true));
+    }
     #[test]
     fn gate_starts_closed_and_only_one_install_can_claim_it() {
         let gate = LaunchGate::default();

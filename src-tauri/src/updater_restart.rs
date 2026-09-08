@@ -159,15 +159,16 @@ pub(crate) enum Reply {
 }
 
 fn qualified(app: &AppHandle) -> bool {
-    // General production activation still requires the approved qualification.
-    // This integrated manual path can be exercised in an exact-bound QA app.
+    // Build/profile admission is shared with startup. Disabled builds remain
+    // inert; production is enabled only by an explicit release-arm64 binding.
+    // Native location/ownership and runtime/draft gates are still mandatory.
     let binding = Binding::compiled();
-    binding.mode == Mode::Qa
-        && app
-            .try_state::<crate::qa_profile::QaProfile>()
-            .is_some_and(|profile| {
-                binding.admits_profile(Some(profile.root()), !cfg!(debug_assertions))
-            })
+    let profile = app.try_state::<crate::qa_profile::QaProfile>();
+    cfg!(target_arch = "aarch64")
+        && binding.admits_profile(
+            profile.as_ref().map(|profile| profile.root()),
+            !cfg!(debug_assertions),
+        )
 }
 fn snapshot(app: &AppHandle) -> Result<Snapshot, &'static str> {
     app.state::<crate::updater::Preparation>().snapshot(|| true)
@@ -215,6 +216,7 @@ impl Restarts {
     ) -> Snapshot {
         state.installation_available =
             qualified(app) && backend.is_some_and(|backend| backend.available()) && !self.active();
+        clear_satisfied_installation_gate(&mut state);
         if let Some(attempt) = self.attempt() {
             match attempt.phase() {
                 Phase::Navigating | Phase::CommitSent | Phase::Stopping => {
@@ -386,6 +388,12 @@ impl Restarts {
             return Err("updater_busy");
         }
         tauri::async_runtime::block_on(prepare_restart(app, attempt))
+    }
+}
+
+fn clear_satisfied_installation_gate(state: &mut Snapshot) {
+    if state.installation_available && state.reason == Some("installation_safety_gate_pending") {
+        state.reason = None;
     }
 }
 
@@ -718,6 +726,22 @@ pub(crate) fn view_lost(app: &AppHandle) {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn enabled_installation_does_not_display_a_satisfied_gate_as_pending() {
+        let mut state = Snapshot {
+            reason: Some("installation_safety_gate_pending"),
+            ..Snapshot::default()
+        };
+        clear_satisfied_installation_gate(&mut state);
+        assert!(state.reason.is_some());
+        state.installation_available = true;
+        clear_satisfied_installation_gate(&mut state);
+        assert_eq!(state.reason, None);
+        state.reason = Some("updater_runtime_busy");
+        clear_satisfied_installation_gate(&mut state);
+        assert_eq!(state.reason, Some("updater_runtime_busy"));
+    }
 
     fn attempt(phase: Phase) -> (Arc<Attempt>, UnixStream) {
         let (native, peer) = UnixStream::pair().unwrap();
