@@ -1,5 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 
+import { asyncHandler } from '@/shared/utils.js';
+
 import { safeSessionId, type BrowserCommand, type BrowserInput } from './browser-protocol.js';
 import { isCuaSafeTool } from './cua-client.js';
 import { automationService, type AutomationService } from './automation.service.js';
@@ -28,7 +30,7 @@ function sessionId(request: Request, response: Response): string | null {
 }
 
 function registerBrowserRoutes(router: Router, prefix: string, service: AutomationService): void {
-  router.post(`${prefix}/:sessionId/open`, async (request, response) => {
+  router.post(`${prefix}/:sessionId/open`, asyncHandler(async (request, response) => {
     const id = sessionId(request, response);
     if (!id) return;
     try {
@@ -40,9 +42,9 @@ function registerBrowserRoutes(router: Router, prefix: string, service: Automati
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
-  router.post(`${prefix}/:sessionId/command`, async (request, response) => {
+  router.post(`${prefix}/:sessionId/command`, asyncHandler(async (request, response) => {
     const id = sessionId(request, response);
     if (!id) return;
     try {
@@ -50,9 +52,9 @@ function registerBrowserRoutes(router: Router, prefix: string, service: Automati
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
-  router.post(`${prefix}/:sessionId/input`, async (request, response) => {
+  router.post(`${prefix}/:sessionId/input`, asyncHandler(async (request, response) => {
     const id = sessionId(request, response);
     if (!id) return;
     try {
@@ -60,9 +62,9 @@ function registerBrowserRoutes(router: Router, prefix: string, service: Automati
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
-  router.delete(`${prefix}/:sessionId`, async (request, response) => {
+  router.delete(`${prefix}/:sessionId`, asyncHandler(async (request, response) => {
     const id = sessionId(request, response);
     if (!id) return;
     try {
@@ -70,7 +72,7 @@ function registerBrowserRoutes(router: Router, prefix: string, service: Automati
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 }
 
 export function createBrowserAutomationRouter(service: AutomationService = automationService): Router {
@@ -81,15 +83,15 @@ export function createBrowserAutomationRouter(service: AutomationService = autom
 
 export function createAutomationRouter(service: AutomationService = automationService): Router {
   const router = Router();
-  router.get('/status', async (_request, response) => {
+  router.get('/status', asyncHandler(async (_request, response) => {
     try {
       response.json(await service.status());
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
-  router.get('/local-sites', async (request, response) => {
+  router.get('/local-sites', asyncHandler(async (request, response) => {
     try {
       const localPort = request.socket.localPort;
       response.json({
@@ -98,13 +100,13 @@ export function createAutomationRouter(service: AutomationService = automationSe
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
   // Kept for compatibility with the first PoC client. The documented/public
   // desktop surface is mounted separately at /api/browser/:sessionId.
   registerBrowserRoutes(router, '/browser', service);
 
-  router.post('/computer/:sessionId/call', async (request, response) => {
+  router.post('/computer/:sessionId/call', asyncHandler(async (request, response) => {
     const id = sessionId(request, response);
     if (!id) return;
     if (!isCuaSafeTool(request.body?.tool)) {
@@ -116,16 +118,16 @@ export function createAutomationRouter(service: AutomationService = automationSe
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
-  router.get('/grants', (request, response) => {
+  router.get('/grants', asyncHandler((request, response) => {
     const id = typeof request.query.sessionId === 'string' && safeSessionId(request.query.sessionId)
       ? request.query.sessionId
       : undefined;
     response.json(service.grants.list(id));
-  });
+  }));
 
-  router.post('/grants', (request, response) => {
+  router.post('/grants', asyncHandler((request, response) => {
     const { kind, value, scope, sessionId: requestedSessionId } = request.body ?? {};
     if ((kind !== 'origin' && kind !== 'application') || (scope !== 'session' && scope !== 'always')
         || typeof value !== 'string' || !value || value.length > 512
@@ -139,9 +141,9 @@ export function createAutomationRouter(service: AutomationService = automationSe
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
-  router.delete('/grants', (request, response) => {
+  router.delete('/grants', asyncHandler((request, response) => {
     try {
       const filter = parseAutomationGrantFilter(request.body ?? {});
       service.grants.revoke(filter);
@@ -149,7 +151,7 @@ export function createAutomationRouter(service: AutomationService = automationSe
     } catch (error) {
       errorResponse(response, error);
     }
-  });
+  }));
 
   return router;
 }

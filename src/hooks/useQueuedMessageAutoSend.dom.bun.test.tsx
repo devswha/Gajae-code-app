@@ -143,3 +143,17 @@ test('a completed background steer accepted late never becomes a second send', (
   assert.deepEqual(readQueuedMessages('a'), []);
   assert.deepEqual(sent.map((message) => message.type), ['chat.steer']);
 });
+
+test('a consumed cached queue cannot resurrect on activation or the next keystroke', async () => {
+  const { view, sent, socket } = mountSteeringSequence();
+  act(() => view.result.current.resolveSteerResult('follow up A', false, 'a'));
+  assert.equal(sent.length, 2);
+  assert.deepEqual(readQueuedMessages('a'), []);
+  view.rerender({ activeSessionId: 'a', processingSessions: new Map(), ws: socket });
+  act(() => view.result.current.handleInputChange({ target: { value: 'fresh draft', selectionStart: 11 } } as never));
+  assert.deepEqual(view.result.current.queuedDrafts, []);
+  assert.deepEqual(readQueuedMessages('a'), []);
+  act(() => view.result.current.handleClearInput());
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 800)); });
+  assert.equal(sent.length, 2, 'no duplicate after clearing the new input either');
+});

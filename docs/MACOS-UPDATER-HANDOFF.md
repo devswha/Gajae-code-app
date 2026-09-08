@@ -1,5 +1,21 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 2026-09-08 재개: 실제 admission 연결과 초안 보존
+
+`server/index.js`에 하나의 restart authority를 만들고 HTTP handler, 채팅 메시지,
+PTY 메시지와 인증 전 경로에 연결했다. 응답/연결 종료와 실제 작업 종료를 구분하고,
+준비 중 완료된 작업도 이전 prepare token을 무효화한다. chat/worker/shell의 실제
+reader를 합치되 나머지 필수 owner는 누락 상태로 남겨 재시작을 차단한다.
+
+OAuth 취소 후 정리, UI 완료 이후 제목 저장, 교체 중인 PTY를 실제 수명까지
+추적한다. SDK 내부 백그라운드와 detached descendant 종료는 미확인이므로
+유휴 상태라고 주장하지 않는다. 실제 composer에는 IndexedDB 기반의 초안·File·
+대기 메시지 보존과 오래된 창의 덮어쓰기 방지를 연결했다.
+
+구현/증거/남은 작업: `DESKTOP-UPDATE-ADMISSION-IMPLEMENTATION.md`.
+**자동 설치·안전 재시작·공개 배포는 여전히 미완료다.** G0를 완화하거나 제품
+installer를 켜지 않았으며 package/desktop 버전은 beta.10/0.2.4 그대로다.
+
 ## 사용자 환경 확인 후 실제 QA 앱 검증
 
 사용자는 이전 인증창에서 무엇을 눌렀는지 기억하지 못하며 macOS 13 테스트

@@ -7,10 +7,14 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { after, test } from 'node:test';
 
+import type { DesktopOwnerActivity } from '../shared/desktopUpdateProtocol.js';
+
 import {
   DEFAULT_INITIALIZE_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
   GjcWorkerSupervisor,
+  createGjcWorkerDesktopRestartReader,
+  getGjcWorkerSupervisor,
   killWorkerTree,
   resolveGjcResumeSessionRoot,
 } from './gjc-worker-client.js';
@@ -1319,4 +1323,661 @@ test('a start refused for an unresolvable model tells the client why', async () 
     ['complete', 1],
   ]);
   assert.deepEqual(failures, [GJC_MODEL_UNRESOLVED_MESSAGE]);
+});
+
+function assertDesktopIdle(activity: DesktopOwnerActivity): void {
+  assert.equal(activity.owner, 'gjc-worker');
+  assert.equal(activity.complete, true);
+  assert.deepEqual(activity.unknown, []);
+  for (const count of ['starting', 'queued', 'running', 'settling', 'approvals', 'retained'] as const) {
+    assert.equal(activity[count], 0, count);
+  }
+}
+
+test('desktop reader is inert, detached from returned snapshots, and bound to the production singleton by default', () => {
+  let spawns = 0;
+  let reaps = 0;
+  const child = new FakeChild();
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child),
+    spawn: () => { spawns += 1; return child; },
+    killTree: () => { reaps += 1; },
+  });
+  const reader = createGjcWorkerDesktopRestartReader(supervisor);
+  const generation = reader.getGeneration();
+  const first = reader.read();
+  assertDesktopIdle(first);
+  assert.equal(first.generation, generation);
+  (first.unknown as string[]).push('caller_mutation');
+  first.queued = 100;
+  assertDesktopIdle(reader.read());
+  assert.equal(reader.getGeneration(), generation);
+  assert.notEqual(new GjcWorkerSupervisor().getGeneration(), generation);
+  assert.deepEqual(createGjcWorkerDesktopRestartReader().read(), getGjcWorkerSupervisor().snapshotActivity());
+  assert.equal(spawns, 0);
+  assert.equal(reaps, 0);
+  assert.equal(child.killed, false);
+});
+
+test('desktop startup is owned inside spawn and request settlement retains its awaiting continuation', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child);
+  let insideSpawn!: DesktopOwnerActivity;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child),
+    spawn: () => { insideSpawn = supervisor.snapshotActivity(); return child; },
+  });
+  const reader = createGjcWorkerDesktopRestartReader(supervisor);
+  const cold = reader.getGeneration();
+  const catalog = supervisor.modelCatalog();
+  assert.ok(insideSpawn.starting > 0);
+  assert.ok(insideSpawn.settling > 0);
+  assert.notEqual(insideSpawn.generation, cold);
+  const initializing = reader.read();
+  assert.equal(initializing.complete, false);
+  assert.deepEqual(initializing.unknown, ['worker_runtime_unaccounted']);
+  peer.respond(await peer.waitFor('worker.initialize'));
+  const request = await peer.waitFor('models.catalog');
+  const pending = reader.read();
+  assert.equal(pending.queued, 1);
+  assert.equal(pending.starting, 0);
+  assert.notEqual(pending.generation, initializing.generation);
+  peer.respond(request);
+  const acknowledged = reader.read();
+  assert.equal(acknowledged.queued, 0);
+  assert.ok(acknowledged.settling > 0, 'response acknowledgement cannot drop its continuation');
+  assert.notEqual(acknowledged.generation, pending.generation);
+  await catalog;
+  const retained = reader.read();
+  assert.equal(retained.settling, 0);
+  assert.equal(retained.retained, 1);
+  assert.equal(retained.complete, false, 'an empty parent request map is not SDK idle proof');
+  assert.equal(child.killed, false, 'reading never drains a retained worker');
+});
+
+test('desktop generation records failed startup even when both endpoint snapshots are idle', async () => {
+  let observed!: DesktopOwnerActivity;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(new FakeChild()),
+    spawn: () => { observed = supervisor.snapshotActivity(); throw new Error('spawn failed'); },
+  });
+  const before = supervisor.snapshotActivity();
+  assertDesktopIdle(before);
+  await assert.rejects(supervisor.modelCatalog(), /spawn failed/);
+  assert.ok(observed.starting > 0);
+  assert.ok(observed.settling > 0);
+  const after = supervisor.snapshotActivity();
+  assertDesktopIdle(after);
+  assert.notEqual(before.generation, after.generation, 'idle -> failed startup -> idle must invalidate a prepared proof');
+});
+
+test('desktop reader tracks registered, issued and terminal run mutations without exposing payloads', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child);
+  const supervisor = new GjcWorkerSupervisor(runtime(child));
+  const reader = createGjcWorkerDesktopRestartReader(supervisor);
+  const cold = reader.getGeneration();
+  const run = spawn(supervisor, 'private-prompt-never-in-snapshot', {}, { send() {} });
+  const registered = reader.read();
+  assert.ok(registered.starting >= 2, 'registered run plus worker startup');
+  assert.notEqual(registered.generation, cold);
+  peer.respond(await peer.waitFor('worker.initialize'));
+  const start = await peer.waitFor('session.start');
+  const issued = reader.read();
+  assert.equal(issued.starting, 0);
+  assert.equal(issued.running, 1);
+  assert.equal(issued.queued, 1);
+  assert.notEqual(issued.generation, registered.generation);
+  peer.event('app-session-1', start.id, 'turn.completed', { message: { kind: 'complete' } });
+  const terminalEvent = reader.read();
+  assert.equal(terminalEvent.running, 1, 'UI terminal does not retire the request/run owner');
+  assert.notEqual(terminalEvent.generation, issued.generation);
+  peer.respond(start);
+  assert.equal(reader.read().queued, 0);
+  assert.equal(reader.read().running, 1, 'run finalization is still queued after acknowledgement');
+  await run;
+  await new Promise((resolve) => setImmediate(resolve));
+  const finished = reader.read();
+  assert.equal(finished.running, 0);
+  assert.equal(finished.settling, 0);
+  assert.deepEqual(finished.unknown, ['worker_runtime_unaccounted']);
+  assert.notEqual(finished.generation, terminalEvent.generation);
+  assert.equal(JSON.stringify(finished).includes('private-prompt'), false);
+  assert.equal(JSON.stringify(finished).includes(start.id), false);
+});
+
+test('desktop approvals include hidden in-flight replies, restoration and cancellation', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  const supervisor = new GjcWorkerSupervisor(runtime(child));
+  const run = spawn(supervisor, 'hello', {}, { send() {} });
+  const start = await peer.waitFor('session.start');
+  const initial = supervisor.snapshotActivity();
+  peer.event('app-session-1', start.id, 'ask.presented', {
+    message: { kind: 'permission_request', requestId: 'private-approval', content: 'secret-input' },
+  });
+  const presented = supervisor.snapshotActivity();
+  assert.equal(presented.approvals, 1);
+  assert.notEqual(presented.generation, initial.generation);
+  assert.equal(supervisor.resolveApproval('private-approval', { allow: true }), true);
+  const replying = supervisor.snapshotActivity();
+  assert.deepEqual(supervisor.pendingApprovals('app-session-1'), []);
+  assert.equal(replying.approvals, 1);
+  assert.ok(replying.settling > presented.settling);
+  assert.notEqual(replying.generation, presented.generation);
+  assert.equal(JSON.stringify(replying).includes('private-approval'), false);
+  const reply = await peer.waitFor('ask.reply');
+  peer.respond(reply, { ok: true, result: { accepted: false } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const restored = supervisor.snapshotActivity();
+  assert.equal(restored.approvals, 1);
+  assert.equal(supervisor.pendingApprovals('app-session-1').length, 1);
+  assert.equal(restored.settling, presented.settling);
+  assert.notEqual(restored.generation, replying.generation);
+  supervisor.resolveApproval('private-approval', { allow: false });
+  peer.respond(await peer.waitFor('ask.reply', 2), { ok: true, result: { accepted: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const accepted = supervisor.snapshotActivity();
+  assert.equal(accepted.approvals, 1, 'accepted reply alone does not erase the mirrored approval');
+  peer.event('app-session-1', start.id, 'ask.presented', {
+    message: { kind: 'permission_cancelled', requestId: 'private-approval' },
+  });
+  assert.equal(supervisor.snapshotActivity().approvals, 0);
+  assert.notEqual(supervisor.getGeneration(), accepted.generation);
+  peer.respond(start); await run;
+});
+
+test('desktop timeout uncertainty survives 257-request eviction, late replies and failAll until tree proof', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  let releaseReap!: () => void;
+  const verifiedTree = new Promise<void>((resolve) => { releaseReap = resolve; });
+  let insideReap!: DesktopOwnerActivity;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), requestTimeoutMs: 5,
+    killTree: () => { insideReap = supervisor.snapshotActivity(); return verifiedTree; },
+  });
+  const warm = supervisor.modelCatalog();
+  peer.respond(await peer.waitFor('models.catalog')); await warm;
+  const waiters = Array.from({ length: 257 }, () => supervisor.modelCatalog());
+  const failures = Promise.all(waiters.map((waiter) => assert.rejects(waiter, /request timed out/)));
+  await peer.waitFor('models.catalog', 258);
+  const before = supervisor.snapshotActivity();
+  assert.equal(before.queued, 257);
+  t.mock.timers.tick(5); await failures;
+  const timedOut = supervisor.snapshotActivity();
+  assert.equal(timedOut.queued, 0);
+  assert.equal(timedOut.settling, 0);
+  assert.ok(timedOut.unknown.includes('worker_request_timeout_unconfirmed'));
+  assert.notEqual(timedOut.generation, before.generation);
+  const expired = (supervisor as unknown as { expiredRequests: ReadonlyMap<string, unknown> }).expiredRequests;
+  assert.equal(expired.size, 256, 'exercise actual bounded-cache eviction, not just one timeout');
+  const requests = peer.requests.filter((request) => request.method === 'models.catalog').slice(1);
+  for (const request of requests.slice(1)) peer.respond(request);
+  assert.equal(expired.size, 0);
+  const late = supervisor.snapshotActivity();
+  assert.ok(late.unknown.includes('worker_request_timeout_unconfirmed'));
+  assert.notEqual(late.generation, timedOut.generation);
+  assert.equal(child.killed, false);
+
+  child.emit('exit', 1);
+  assert.ok(insideReap.unknown.includes('worker_reap_pending'));
+  assert.equal(insideReap.retained, 1, 'the child field is cleared before killTree but ownership must survive');
+  const pendingReap = supervisor.snapshotActivity();
+  assert.ok(pendingReap.unknown.includes('worker_request_timeout_unconfirmed'));
+  assert.equal(expired.size, 0, 'failAll/cache clearing is not reap proof');
+  assert.notEqual(pendingReap.generation, late.generation);
+  releaseReap();
+  await new Promise((resolve) => setImmediate(resolve));
+  assertDesktopIdle(supervisor.snapshotActivity());
+  assert.notEqual(supervisor.getGeneration(), pendingReap.generation);
+});
+
+test('desktop failed reap retains runtime and timeout uncertainty without active parent requests', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), requestTimeoutMs: 5,
+    killTree: () => Promise.reject(new Error('tree remains alive')),
+  });
+  const request = assert.rejects(supervisor.oauthStatus(), /request timed out/);
+  await peer.waitFor('oauth.status');
+  t.mock.timers.tick(5); await request;
+  child.emit('exit', 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  const failed = supervisor.snapshotActivity();
+  assert.equal(failed.queued, 0);
+  assert.equal(failed.running, 0);
+  assert.equal(failed.settling, 0);
+  assert.equal(failed.retained, 1);
+  assert.equal(failed.complete, false);
+  assert.deepEqual(failed.unknown, [
+    'worker_runtime_unaccounted', 'worker_request_timeout_unconfirmed', 'worker_reap_unconfirmed',
+  ]);
+  assert.equal(supervisor.getGeneration(), failed.generation);
+  assert.deepEqual(supervisor.snapshotActivity(), failed);
+});
+
+test('desktop reader retains option enrichment after registered-run abort and verified worker reap', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  let rejectEnrichment!: (error: Error) => void;
+  const enrichment = new Promise<never>((_resolve, reject) => { rejectEnrichment = reject; });
+  let enriching = false;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), enrichOptions: () => { enriching = true; return enrichment; },
+  });
+  const run = spawn(supervisor, 'hello', {}, { send() {} });
+  await peer.waitFor('worker.initialize');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(enriching, true);
+  assert.equal(await supervisor.abort(run.abortHandle), 'not_started');
+  await run;
+  child.emit('exit', 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  const waiting = supervisor.snapshotActivity();
+  assert.equal(waiting.running, 0);
+  assert.equal(waiting.starting, 0);
+  assert.equal(waiting.retained, 0);
+  assert.equal(waiting.complete, true);
+  assert.ok(waiting.settling > 0, 'the removed run still has an accepted enrichment continuation');
+  rejectEnrichment(new Error('late enrichment failed'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assertDesktopIdle(supervisor.snapshotActivity());
+  assert.notEqual(supervisor.getGeneration(), waiting.generation);
+  assert.equal(peer.requests.some((request) => request.method === 'session.start'), false);
+});
+
+function deferredEnrichment<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => { resolve = yes; });
+  return { promise, resolve };
+}
+
+const flushEnrichment = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+for (const method of ['session.start', 'session.resume'] as const) {
+  test(`successful option enrichment cannot dispatch a cancelled ${method}`, async () => {
+    const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+    const entered = deferredEnrichment<void>();
+    const enriched = deferredEnrichment<Record<string, unknown>>();
+    const messages: unknown[] = [];
+    let stopped = 0;
+    const supervisor = new GjcWorkerSupervisor({
+      ...runtime(child),
+      enrichOptions: () => { entered.resolve(); return enriched.promise; },
+      notifyRunStopped: () => { stopped += 1; },
+    });
+    const run = supervisor.spawnRun({
+      runId: 'cancel-during-enrichment', appSessionId: 'app-session-1', message: 'never send this',
+      options: method === 'session.resume' ? { sessionId: 'existing-provider-session' } : {},
+      writer: { send: (message) => messages.push(message) },
+    });
+    try {
+      await entered.promise;
+      const alias = method === 'session.resume' ? 'existing-provider-session' : run.abortHandle;
+      assert.equal(await supervisor.abort(alias), 'not_started');
+      await run.completion;
+      await assert.rejects(run.started, /GJC worker failed/);
+      assert.equal(await run.outcome, 'not_started');
+      assert.equal(run.phase?.(), 'run_terminal');
+      const cancelled = supervisor.snapshotActivity();
+      assert.ok(cancelled.settling > 0, 'cancellation still owns the unfinished enrichment');
+      enriched.resolve({ cwd: '/test/project', modelId: 'resolved-model' });
+      await flushEnrichment();
+      assert.equal(peer.requests.some((request) => request.method === method), false);
+      assert.equal(run.phase?.(), 'run_terminal');
+      assert.equal(supervisor.isActive(alias), false);
+      assert.equal(supervisor.snapshotActivity().settling, 0);
+      assert.notEqual(supervisor.getGeneration(), cancelled.generation);
+      assert.equal(child.killed, false, 'cancelling an unissued run must not kill the shared worker');
+      assert.deepEqual(messages, [], 'no synthetic completion or late stream after the accepted abort');
+      assert.equal(stopped, 1);
+    } finally {
+      enriched.resolve({});
+      await flushEnrichment();
+      for (const request of peer.requests.filter((entry) => entry.method === method)) peer.respond(request);
+      await flushEnrichment();
+    }
+  });
+}
+
+test('successful option enrichment from a cancelled run cannot seize its reused run ID', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  const oldEntered = deferredEnrichment<void>(); const nextEntered = deferredEnrichment<void>();
+  const oldOptions = deferredEnrichment<Record<string, unknown>>();
+  const nextOptions = deferredEnrichment<Record<string, unknown>>();
+  let enrichments = 0;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child),
+    enrichOptions: () => {
+      if (++enrichments === 1) { oldEntered.resolve(); return oldOptions.promise; }
+      nextEntered.resolve(); return nextOptions.promise;
+    },
+  });
+  const input = { runId: 'reused-run-id', appSessionId: 'app-session-1', writer: { send() {} } };
+  const oldRun = supervisor.spawnRun({ ...input, message: 'cancelled message' });
+  try {
+    await oldEntered.promise;
+    assert.equal(await supervisor.abort(oldRun.abortHandle), 'not_started');
+    await oldRun.completion;
+    const replacement = supervisor.spawnRun({ ...input, message: 'replacement message' });
+    await nextEntered.promise;
+    oldOptions.resolve({ modelId: 'stale-model' });
+    await flushEnrichment();
+    assert.equal(peer.requests.some((request) => request.method === 'session.start'), false);
+    assert.equal(oldRun.phase?.(), 'run_terminal');
+    assert.equal(replacement.phase?.(), 'registered');
+    assert.equal(supervisor.isActive(replacement.abortHandle), true);
+    nextOptions.resolve({ modelId: 'current-model' });
+    const start = await peer.waitFor('session.start');
+    assert.equal(start.payload.message, 'replacement message');
+    assert.equal((start.payload.options as Record<string, unknown>).modelId, 'current-model');
+    await replacement.started;
+    peer.respond(start);
+    await replacement.completion;
+    assert.equal(await replacement.outcome, 'completed');
+    assert.equal(await oldRun.outcome, 'not_started');
+    assert.equal(peer.requests.filter((request) => request.method === 'session.start').length, 1);
+  } finally {
+    oldOptions.resolve({}); nextOptions.resolve({});
+    await flushEnrichment();
+    for (const request of peer.requests.filter((entry) => entry.method === 'session.start')) peer.respond(request);
+    await flushEnrichment();
+  }
+});
+
+test('successful option enrichment during shutdown uses the existing not-started abort outcome', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  const entered = deferredEnrichment<void>();
+  const enriched = deferredEnrichment<Record<string, unknown>>();
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), enrichOptions: () => { entered.resolve(); return enriched.promise; },
+  });
+  const run = supervisor.spawnRun({
+    runId: 'shutdown-enrichment', appSessionId: 'app-session-1', message: 'never dispatch', writer: { send() {} },
+  });
+  let shutdown: Promise<void> | undefined;
+  try {
+    await entered.promise;
+    shutdown = supervisor.shutdown();
+    await peer.waitFor('worker.shutdown');
+    enriched.resolve({ modelId: 'late-model' });
+    await flushEnrichment();
+    assert.equal(peer.requests.some((request) => request.method === 'session.start'), false);
+    await run.completion;
+    assert.equal(await run.outcome, 'not_started');
+    assert.equal(run.phase?.(), 'run_terminal');
+    assert.equal(child.killed, false, 'the existing shutdown response/reap sequence is unchanged');
+  } finally {
+    enriched.resolve({});
+    await flushEnrichment();
+    for (const request of peer.requests.filter((entry) => entry.method === 'session.start' || entry.method === 'worker.shutdown')) peer.respond(request);
+    if (shutdown) await shutdown;
+    await flushEnrichment();
+  }
+});
+
+test('successful option enrichment from a reaped worker cannot dispatch into its replacement', async () => {
+  const first = new FakeChild(); const second = new FakeChild();
+  const peer = new FakePeer(first); const nextPeer = new FakePeer(second);
+  replyToHandshake(peer); replyToHandshake(nextPeer);
+  const entered = deferredEnrichment<void>();
+  const enriched = deferredEnrichment<Record<string, unknown>>();
+  let spawns = 0;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(first), spawn: () => ++spawns === 1 ? first : second,
+    killTree: () => {},
+    enrichOptions: () => { entered.resolve(); return enriched.promise; },
+  });
+  const run = supervisor.spawnRun({
+    runId: 'old-worker-enrichment', appSessionId: 'app-session-1', message: 'old worker only', writer: { send() {} },
+  });
+  try {
+    await entered.promise;
+    const failure = assert.rejects(run.completion, /GJC worker failed/);
+    first.emit('exit', 1);
+    await failure;
+    assert.equal(await run.outcome, 'reaped');
+    const catalog = supervisor.modelCatalog();
+    nextPeer.respond(await nextPeer.waitFor('models.catalog'));
+    await catalog;
+    assert.equal(spawns, 2);
+    enriched.resolve({ modelId: 'old-generation-model' });
+    await flushEnrichment();
+    assert.equal(nextPeer.requests.some((request) => request.method === 'session.start'), false);
+    assert.equal(peer.requests.some((request) => request.method === 'session.start'), false);
+    assert.equal(run.phase?.(), 'run_terminal');
+    assert.equal(supervisor.active().length, 0);
+    assert.equal(supervisor.snapshotActivity().settling, 0);
+    assert.equal(second.killed, false);
+  } finally {
+    enriched.resolve({});
+    await flushEnrichment();
+    for (const request of nextPeer.requests.filter((entry) => entry.method === 'session.start')) nextPeer.respond(request);
+    await flushEnrichment();
+  }
+});
+
+test('desktop reader owns terminal callback settlement after run removal and tree reap', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  let finishNotification!: () => void;
+  const notification = new Promise<void>((resolve) => { finishNotification = resolve; });
+  let duringNotification!: DesktopOwnerActivity;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), notifyRunStopped: () => {
+      duringNotification = supervisor.snapshotActivity();
+      return notification;
+    },
+  });
+  const run = spawn(supervisor, 'hello', {}, { send() {} });
+  peer.respond(await peer.waitFor('session.start')); await run;
+  assert.equal(duringNotification.running, 0);
+  assert.ok(duringNotification.settling > 0);
+  child.emit('exit', 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  const waiting = supervisor.snapshotActivity();
+  assert.equal(waiting.retained, 0);
+  assert.equal(waiting.complete, true);
+  assert.ok(waiting.settling > 0);
+  finishNotification();
+  await new Promise((resolve) => setImmediate(resolve));
+  assertDesktopIdle(supervisor.snapshotActivity());
+  assert.notEqual(supervisor.getGeneration(), waiting.generation);
+});
+
+test('desktop reap-to-finalization handoff has no zero-count gap inside a writer callback', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  const observed: DesktopOwnerActivity[] = [];
+  const supervisor = new GjcWorkerSupervisor(runtime(child));
+  const run = spawn(supervisor, 'hello', {}, { send() { observed.push(supervisor.snapshotActivity()); } });
+  await peer.waitFor('session.start');
+  const failure = assert.rejects(run, /GJC worker failed/);
+  child.emit('exit', 1);
+  await failure;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(observed.length > 0);
+  for (const during of observed) {
+    assert.equal(during.running, 0);
+    assert.equal(during.retained, 0);
+    assert.ok(during.settling > 0, 'finish owns synchronous callbacks after releasing the run map entry');
+  }
+  assertDesktopIdle(supervisor.snapshotActivity());
+});
+
+test('desktop replacement waiters remain owned across reap and stale old-child frames cannot mutate the reader', async () => {
+  const first = new FakeChild(); const second = new FakeChild();
+  const peer = new FakePeer(first); const nextPeer = new FakePeer(second);
+  replyToHandshake(peer); replyToHandshake(nextPeer);
+  let releaseReap!: () => void;
+  const verifiedTree = new Promise<void>((resolve) => { releaseReap = resolve; });
+  let spawns = 0;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(first), spawn: () => ++spawns === 1 ? first : second,
+    killTree: () => verifiedTree,
+  });
+  const warm = supervisor.modelCatalog();
+  peer.respond(await peer.waitFor('models.catalog')); await warm;
+  const oldGeneration = supervisor.getGeneration();
+  first.emit('exit', 1);
+  const run = spawn(supervisor, 'replacement', {}, { send() {} });
+  const catalog = supervisor.modelCatalog();
+  const waiting = supervisor.snapshotActivity();
+  assert.equal(spawns, 1);
+  assert.ok(waiting.starting > 0);
+  assert.ok(waiting.settling > 0);
+  assert.ok(waiting.unknown.includes('worker_reap_pending'));
+  assert.notEqual(waiting.generation, oldGeneration);
+  releaseReap();
+  const start = await nextPeer.waitFor('session.start');
+  const models = await nextPeer.waitFor('models.catalog');
+  const replaced = supervisor.snapshotActivity();
+  assert.equal(spawns, 2);
+  assert.equal(replaced.retained, 1);
+  assert.equal(replaced.running, 1);
+  assert.deepEqual(replaced.unknown, ['worker_runtime_unaccounted']);
+  assert.notEqual(replaced.generation, waiting.generation);
+  first.stdout.write('not-json\n');
+  first.emit('close', 1);
+  assert.equal(supervisor.getGeneration(), replaced.generation);
+  nextPeer.respond(start); nextPeer.respond(models);
+  await Promise.all([run, catalog]);
+});
+
+test('desktop process-tree proof includes a separately reported run process, not just worker leader exit', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  let proveProcessExit!: () => void;
+  const processExit = new Promise<void>((resolve) => { proveProcessExit = resolve; });
+  const killed: number[] = [];
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), killTree: () => {},
+    killProcessTree: (pid) => { killed.push(pid); return processExit; },
+  });
+  const run = spawn(supervisor, 'hello', {}, { send() {} });
+  const start = await peer.waitFor('session.start');
+  const beforePid = supervisor.getGeneration();
+  peer.status('app-session-1', start.id, 4242);
+  assert.notEqual(supervisor.getGeneration(), beforePid);
+  const failure = assert.rejects(run, /GJC worker failed/);
+  child.emit('exit', 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(killed, [4242]);
+  const pending = supervisor.snapshotActivity();
+  assert.equal(pending.retained, 1);
+  assert.equal(pending.running, 1);
+  assert.ok(pending.unknown.includes('worker_reap_pending'));
+  proveProcessExit(); await failure;
+  await new Promise((resolve) => setImmediate(resolve));
+  assertDesktopIdle(supervisor.snapshotActivity());
+});
+
+test('desktop missing process reaper or discarded PID never becomes an OS tree-termination proof', async () => {
+  for (const mode of ['missing-reaper', 'pid-cleared', 'pid-replaced', 'run-finished'] as const) {
+    const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+    const supervisor = new GjcWorkerSupervisor({
+      ...runtime(child),
+      ...(mode !== 'missing-reaper' ? { killProcessTree: () => {} } : {}),
+    });
+    const run = spawn(supervisor, 'hello', {}, { send() {} });
+    const start = await peer.waitFor('session.start');
+    peer.status('app-session-1', start.id, 4242);
+    if (mode === 'pid-cleared') peer.status('app-session-1', start.id, null);
+    if (mode === 'pid-replaced') peer.status('app-session-1', start.id, 4243);
+    if (mode === 'run-finished') { peer.respond(start); await run; }
+    const settled = mode === 'run-finished' ? run : assert.rejects(run, /GJC worker failed/);
+    child.emit('exit', 1); await settled;
+    await new Promise((resolve) => setImmediate(resolve));
+    const unknown = supervisor.snapshotActivity();
+    assert.equal(unknown.retained, 1, mode);
+    assert.equal(unknown.complete, false, mode);
+    assert.deepEqual(unknown.unknown, ['worker_runtime_unaccounted', 'worker_process_tree_unaccounted'], mode);
+  }
+});
+
+test('desktop pending approval and abort completions outlive terminal run and approval map removal', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child); replyToHandshake(peer);
+  const supervisor = new GjcWorkerSupervisor(runtime(child));
+  const run = spawn(supervisor, 'hello', {}, { send() {} });
+  const start = await peer.waitFor('session.start');
+  peer.event('app-session-1', start.id, 'ask.presented', {
+    message: { kind: 'permission_request', requestId: 'outliving-reply' },
+  });
+  supervisor.resolveApproval('outliving-reply', { allow: true });
+  const beforeAbort = supervisor.getGeneration();
+  const abort = supervisor.abort(run.abortHandle);
+  assert.notEqual(supervisor.getGeneration(), beforeAbort);
+  const abortRequest = await peer.waitFor('turn.abort');
+  const approvalRequest = await peer.waitFor('ask.reply');
+  peer.respond(start); await run;
+  const terminal = supervisor.snapshotActivity();
+  assert.equal(terminal.running, 0);
+  assert.equal(terminal.approvals, 0);
+  assert.equal(terminal.queued, 2);
+  assert.ok(terminal.settling >= 2, 'both owned completion handlers are still live');
+  peer.respond(abortRequest, { ok: true, result: { aborted: true } });
+  peer.respond(approvalRequest, { ok: true, result: { accepted: false } });
+  const replies = supervisor.snapshotActivity();
+  assert.equal(replies.queued, 0);
+  assert.ok(replies.settling >= 2, 'acknowledging both requests does not run their continuations inline');
+  assert.notEqual(replies.generation, terminal.generation);
+  assert.equal(await abort, 'unconfirmed', 'do not change existing late-abort behavior');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.snapshotActivity().settling, 0);
+  assert.notEqual(supervisor.getGeneration(), replies.generation);
+});
+
+test('desktop old reap cannot erase a reentrant replacement generation or its pending reap', async () => {
+  const first = new FakeChild(); const second = new FakeChild();
+  const peer = new FakePeer(first); const nextPeer = new FakePeer(second);
+  replyToHandshake(peer); replyToHandshake(nextPeer);
+  let proveFirstExit!: () => void; let proveSecondExit!: () => void;
+  const firstExit = new Promise<void>((resolve) => { proveFirstExit = resolve; });
+  const secondExit = new Promise<void>((resolve) => { proveSecondExit = resolve; });
+  let replacement!: Promise<unknown>;
+  let insideReplacement!: DesktopOwnerActivity;
+  let spawns = 0;
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(first), spawn: () => ++spawns === 1 ? first : second,
+    killTree: (child) => {
+      if (child === first) {
+        // Existing lifecycle hooks can reenter before terminating is assigned.
+        // Observation must remain safe without changing that runtime behavior.
+        replacement = supervisor.modelCatalog();
+        insideReplacement = supervisor.snapshotActivity();
+        return firstExit;
+      }
+      return secondExit;
+    },
+  });
+  const warm = supervisor.modelCatalog();
+  peer.respond(await peer.waitFor('models.catalog')); await warm;
+  first.emit('exit', 1);
+  assert.equal(insideReplacement.retained, 2);
+  nextPeer.respond(await nextPeer.waitFor('models.catalog')); await replacement;
+  second.emit('exit', 1);
+  const bothRetiring = supervisor.snapshotActivity();
+  assert.equal(bothRetiring.retained, 2);
+  proveFirstExit();
+  await new Promise((resolve) => setImmediate(resolve));
+  const secondRetiring = supervisor.snapshotActivity();
+  assert.equal(secondRetiring.retained, 1);
+  assert.equal(secondRetiring.complete, false);
+  assert.ok(secondRetiring.unknown.includes('worker_reap_pending'));
+  assert.notEqual(secondRetiring.generation, bothRetiring.generation);
+  proveSecondExit();
+  await new Promise((resolve) => setImmediate(resolve));
+  assertDesktopIdle(supervisor.snapshotActivity());
+});
+
+test('desktop frozen Windows tree remains unaccounted even if an injected reaper fulfills', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child, true); replyToHandshake(peer);
+  const supervisor = new GjcWorkerSupervisor({
+    ...runtime(child), platform: 'win32', killTree: () => {},
+    environment: { SystemRoot: 'C:\\Windows' },
+  });
+  const catalog = supervisor.modelCatalog();
+  child.stdout.write(`${GJC_WINDOWS_JOB_GUARD_READY}\n`);
+  peer.respond(await peer.waitFor('models.catalog')); await catalog;
+  child.emit('exit', 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  const snapshot = supervisor.snapshotActivity();
+  assert.equal(snapshot.retained, 1);
+  assert.equal(snapshot.complete, false);
+  assert.deepEqual(snapshot.unknown, ['worker_runtime_unaccounted']);
 });

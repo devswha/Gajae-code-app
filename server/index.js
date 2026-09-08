@@ -10,7 +10,7 @@ import express from 'express';
 import mime from 'mime-types';
 import Database from 'better-sqlite3';
 
-import { AppError, WORKSPACES_ROOT, getOpenCodeDatabasePath, validateWorkspacePath } from '@/shared/utils.js';
+import { AppError, WORKSPACES_ROOT, asyncHandler, getOpenCodeDatabasePath, validateWorkspacePath } from '@/shared/utils.js';
 import {
     openProjectFileForWrite,
     resolveProjectEntryForMutation,
@@ -22,6 +22,7 @@ import { closeSessionsWatcher, configureSessionWorktrees, initializeSessionsWatc
 import { getConnectableHost } from '../shared/networkHosts.js';
 
 import { GjcJobProjectionService } from './modules/websocket/services/gjc-job-projection.service.js';
+import { chatRunRegistry } from './modules/websocket/index.js';
 import { drainWebSocketClients } from './modules/websocket/services/websocket-drain.service.js';
 import { createGjcTerminalNotificationAdapter } from './modules/notifications/services/gjc-terminal-notification-adapter.service.js';
 import { findAppRoot, getModuleDir } from './utils/runtime-paths.js';
@@ -31,6 +32,7 @@ import {
     steerGjcRun,
     getPendingGjcApprovalsForSession,
     getGjcWorkerSupervisor,
+    createGjcWorkerDesktopRestartReader,
     resolveGjcToolApproval,
     shutdownGjcWorker,
     spawnGjcRun,
@@ -50,6 +52,8 @@ import authRoutes from './routes/auth.js';
 import settingsRoutes from './routes/settings.js';
 import { createGjcAppFactory } from './app-factory.js';
 import { DesktopUpdateRelay } from './services/desktop-update-relay.js';
+import { createDesktopRestartRuntime } from './services/desktop-restart-runtime.js';
+import { getShellActivityGeneration, snapshotShellActivity } from './modules/websocket/services/shell-websocket.service.js';
 import { isWorkspaceRoot } from './modules/projects/index.js';
 import projectModuleRoutes from './modules/projects/projects.routes.js';
 import notificationRoutes from './modules/notifications/notifications.routes.js';
@@ -110,6 +114,13 @@ const gjcJobProjection = new GjcJobProjectionService({
 const gjcTerminalNotificationAdapter = createGjcTerminalNotificationAdapter({
     authority: gjcJobAuthority,
 });
+// This is not exposed as a browser prepare/commit endpoint. Unimplemented
+// ownership readers remain explicit blockers; native install stays disabled.
+const desktopRestartAdmission = createDesktopRestartRuntime({
+    chat: { getGeneration: chatRunRegistry.getGeneration, read: chatRunRegistry.snapshotActivity },
+    'gjc-worker': createGjcWorkerDesktopRestartReader(),
+    shell: { getGeneration: getShellActivityGeneration, read: snapshotShellActivity },
+});
 function gjcSpawn(message, options, writer) {
     return spawnGjcRun(message, {
         ...options,
@@ -132,6 +143,7 @@ function steerGjcChatRun(runId, message) {
 }
 
 const { app, server, wss } = createGjcAppFactory({
+    desktopRestartAdmission,
     desktopUpdateRelay: new DesktopUpdateRelay(),
     authority: gjcJobAuthority,
     orchestrator: gjcJobOrchestrator,
@@ -259,7 +271,7 @@ const expandWorkspacePath = (inputPath) => {
 };
 
 // Browse filesystem endpoint for project suggestions - uses existing getFileTree
-app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
+app.get('/api/browse-filesystem', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { path: dirPath } = req.query;
 
@@ -337,9 +349,9 @@ app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
         console.error('Error browsing filesystem:', error);
         res.status(500).json({ error: 'Failed to browse filesystem' });
     }
-});
+}));
 
-app.post('/api/create-folder', authenticateToken, async (req, res) => {
+app.post('/api/create-folder', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { path: folderPath } = req.body;
         if (!folderPath) {
@@ -377,10 +389,10 @@ app.post('/api/create-folder', authenticateToken, async (req, res) => {
         console.error('Error creating folder:', error);
         res.status(500).json({ error: 'Failed to create folder' });
     }
-});
+}));
 
 // Read file content endpoint
-app.get('/api/projects/:projectId/file', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/file', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { filePath } = req.query;
@@ -426,10 +438,10 @@ app.get('/api/projects/:projectId/file', authenticateToken, async (req, res) => 
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // Serve raw file bytes for previews and downloads.
-app.get('/api/projects/:projectId/files/content', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/files/content', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { path: filePath } = req.query;
@@ -489,10 +501,10 @@ app.get('/api/projects/:projectId/files/content', authenticateToken, async (req,
             res.status(error.statusCode || 500).json({ error: error.message });
         }
     }
-});
+}));
 
 // Save file content endpoint
-app.put('/api/projects/:projectId/file', authenticateToken, async (req, res) => {
+app.put('/api/projects/:projectId/file', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { filePath, content } = req.body;
@@ -566,9 +578,9 @@ app.put('/api/projects/:projectId/file', authenticateToken, async (req, res) => 
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
-app.get('/api/projects/:projectId/files', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/files', authenticateToken, asyncHandler(async (req, res) => {
     try {
 
         // Using fsPromises from import
@@ -599,7 +611,7 @@ app.get('/api/projects/:projectId/files', authenticateToken, async (req, res) =>
         console.error('[ERROR] File tree error:', error.message);
         res.status(error.statusCode || 500).json({ error: error.message });
     }
-});
+}));
 
 // ============================================================================
 // FILE OPERATIONS API ENDPOINTS
@@ -649,7 +661,7 @@ function validateFilename(name) {
 }
 
 // POST /api/projects/:projectId/files/create - Create new file or directory
-app.post('/api/projects/:projectId/files/create', authenticateToken, async (req, res) => {
+app.post('/api/projects/:projectId/files/create', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { path: parentPath, type, name } = req.body;
@@ -724,10 +736,10 @@ app.post('/api/projects/:projectId/files/create', authenticateToken, async (req,
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // PUT /api/projects/:projectId/files/rename - Rename file or directory
-app.put('/api/projects/:projectId/files/rename', authenticateToken, async (req, res) => {
+app.put('/api/projects/:projectId/files/rename', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { oldPath, newName } = req.body;
@@ -805,10 +817,10 @@ app.put('/api/projects/:projectId/files/rename', authenticateToken, async (req, 
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // DELETE /api/projects/:projectId/files - Delete file or directory
-app.delete('/api/projects/:projectId/files', authenticateToken, async (req, res) => {
+app.delete('/api/projects/:projectId/files', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { path: targetPath } = req.body;
@@ -871,7 +883,7 @@ app.delete('/api/projects/:projectId/files', authenticateToken, async (req, res)
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // POST /api/projects/:projectId/files/upload - Upload files
 // Dynamic import of multer for file uploads
@@ -1059,14 +1071,14 @@ const uploadFilesHandler = async (req, res) => {
     });
 };
 
-app.post('/api/projects/:projectId/files/upload', authenticateToken, uploadFilesHandler);
+app.post('/api/projects/:projectId/files/upload', authenticateToken, asyncHandler(uploadFilesHandler));
 
 // Chat image uploads moved to POST /api/assets/images (server/modules/assets),
 // which stores them in the global ~/.gajae-app/assets folder.
 
 // Get token usage for a specific session. `projectId` is the DB primary key;
 // the Claude branch below resolves it to an absolute path via the DB.
-app.get('/api/projects/:projectId/sessions/:sessionId/token-usage', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/sessions/:sessionId/token-usage', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId, sessionId } = req.params;
         const homeDir = os.homedir();
@@ -1338,7 +1350,7 @@ app.get('/api/projects/:projectId/sessions/:sessionId/token-usage', authenticate
         console.error('Error reading session token usage:', error);
         res.status(500).json({ error: 'Failed to read session token usage' });
     }
-});
+}));
 
 // Serve React app for all other routes (excluding static files)
 app.get('*', (req, res) => {

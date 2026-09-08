@@ -7,6 +7,7 @@ import readline from 'node:readline';
 
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
 import type {
   AnyRecord,
   ApiSuccessShape,
@@ -42,12 +43,25 @@ export function createApiSuccessResponse<TData>(data: TData): ApiSuccessShape<TD
   return { success: true, data };
 }
 
-export function asyncHandler(handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>): RequestHandler {
+export function asyncHandler(handler: (req: Request, res: Response, next: NextFunction) => unknown | Promise<unknown>): RequestHandler {
   return (req, res, next) => {
-    // Promise.resolve tolerates handlers that return a plain value; a rejection
-    // is routed into Express error handling instead of an unhandled rejection.
-    const outcome = Promise.resolve(handler(req, res, next));
-    void outcome.catch(next);
+    let release: (() => void) | undefined;
+    try {
+      const admission = req.app?.locals.desktopRestartAdmission as DesktopWorkAdmission | undefined;
+      // Use the registered route, not a caller-controlled URL/query/body. Even
+      // GET handlers can start native processes and must acquire before awaiting.
+      release = admission?.enter('http:handler');
+      const outcome = Promise.resolve(handler(req, res, next));
+      // Response finish/close is not completion of the actual handler. In
+      // particular, client disconnect must not let prepare overtake a write.
+      void outcome.then(() => release?.(), (error) => { release?.(); next(error); });
+    } catch (error) {
+      release?.();
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'DESKTOP_RESTART_FENCED') {
+        res.setHeader('Retry-After', '1');
+        res.status(503).json({ error: 'Desktop restart is being prepared. Retry this request.', code: 'DESKTOP_RESTART_FENCED' });
+      } else next(error);
+    }
   };
 }
 

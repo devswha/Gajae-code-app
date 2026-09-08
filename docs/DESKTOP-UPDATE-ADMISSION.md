@@ -1,5 +1,11 @@
 # Desktop update admission: safe manual restart
 
+2026-09-08 implementation delta: common HTTP/WS admission and three real owner
+readers are partially connected. See
+[implementation and remaining gates](DESKTOP-UPDATE-ADMISSION-IMPLEMENTATION.md).
+The map below retains its original source-inspection baseline; it is not G3
+acceptance and unimplemented readers still block restart.
+
 Status: implementation map, not an implemented contract or a G3 pass.
 Source inspection: `7b138efc607b1c0bb8de3b06e72fa5ddc34cae02`, 2026-09-07.
 Scope: one reversible backend admission fence and existing execution owners.

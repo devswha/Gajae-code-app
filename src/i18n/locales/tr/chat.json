@@ -94,6 +94,8 @@
     },
     "scrollToBottom": "En yeniye atla",
     "queue": {
+      "reviewBeforeSending": "Göndermeden önce düzenleyip kontrol edin",
+      "recoveryNotice": "Yinelenen gönderimleri önlemek için kurtarılan iletiler bekletiliyor. İletiyi düzenleyin, metni ve ekleri kontrol edip gönderin. Mevcut taslağınız korunur.",
       "sendNext": "Başka bir mesajı sıraya koy",
       "label": "Sıraya alındı",
       "willSend": "Geçerli çalıştırma bittiğinde gönderilir",
@@ -106,6 +108,14 @@
       "images_one": "{{count}} resim eklendi",
       "images_other": "{{count}} resim eklendi",
       "steerNow": "Aktif dönüşü yönlendirin"
+    },
+    "draftPersistence": {
+      "failed": "Taslak kaydedilemedi. Bu pencereyi açık tutun.",
+      "retry": "Taslağı kaydetmeyi yeniden dene",
+      "failedInline": "Taslak ve ekler kaydedilemedi ({{reason}}). Girdiğiniz içerik korunuyor. Kaydetmeyi yeniden deneyin. Kayıt başarılı olana kadar pencereyi kapatmayın veya uygulamayı yeniden başlatmayın.",
+      "recoveredRetry": "Taslak kaydedildi. Metni ve ekleri kontrol edip Gönder düğmesine tekrar basın.",
+      "recoveryStillFailed": "Taslak kurtarılamadı. Mevcut girdi ve kayıtlı veriler korunuyor.",
+      "recoveryNotReady": "Taslak kurtarma işlemi sürüyor. Girdiğiniz içerik korunuyor. İşlem bitince yeniden deneyin."
     },
     "skills": {
       "label": "Beceri seç",

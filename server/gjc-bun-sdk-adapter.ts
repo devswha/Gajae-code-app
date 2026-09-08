@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 
 import { createAgentSession, discoverAuthStorage } from '@gajae-code/coding-agent/sdk/session';
@@ -16,7 +17,7 @@ import { getSupportedEfforts } from '@gajae-code/ai/model-thinking';
 import { parseGjcGoalCommand, type GjcGoalCommand, type GjcGoalSnapshot } from '../shared/gjc-goal.js';
 
 import { appendImagesInputTag } from './shared/image-attachments.js';
-import { GjcBunOAuthController, type GjcBunOAuthControllerOptions } from './gjc-bun-oauth-controller.js';
+import { GjcBunOAuthController, type GjcBunOAuthControllerOptions, type GjcOAuthActivitySnapshot } from './gjc-bun-oauth-controller.js';
 import { GJC_APP_BUILTIN_COMMAND_NAMES } from './gjc-command-surface.generated.js';
 import type { GjcWorkerOAuthRuntime, GjcWorkerRuntime, GjcWorkerWriter } from './gjc-worker.js';
 import { GjcBunAskController } from './gjc-bun-ask-controller.js';
@@ -84,6 +85,8 @@ export type GjcSessionTitleGenerator = (firstMessage: string, registry: ModelReg
 export type GjcBunSdkAdapterOptions = {
   createSessionFactory?: GjcAgentSessionFactory;
   generateSessionTitle?: GjcSessionTitleGenerator;
+  /** Shorter UI grace for embedders/tests; never extends the ten-second cap. */
+  sessionTitleGraceMs?: number;
   settings?: Settings;
   loadSettings?: () => Promise<Settings>;
   executeBuiltinCommand?: typeof executeAcpBuiltinSlashCommand;
@@ -91,6 +94,20 @@ export type GjcBunSdkAdapterOptions = {
   automationBridge?: GjcAutomationBridgeTransport;
   closeAutomationSession?: (appSessionId: string) => Promise<void>;
 };
+
+export type GjcSdkActivitySnapshot = Readonly<{
+  generation: string;
+  revision: number;
+  starting: number;
+  running: number;
+  settling: number;
+  background: number;
+  operations: number;
+  oauth: GjcOAuthActivitySnapshot;
+  /** Coverage only, NOT idle: all counts, including nested OAuth, must be zero. */
+  complete: boolean;
+  unknown: readonly ('sdk_background_ownership_unproven' | 'sdk_cleanup_unconfirmed')[];
+}>;
 
 type ActiveRun = {
   goals?: GjcGoalSession;
@@ -111,6 +128,7 @@ type ActiveRun = {
   askController: GjcBunAskController;
   state: SdkRunState;
   abortState: 'idle' | 'aborting' | 'aborted';
+  settling: boolean;
   appSessionId?: string;
   delegation?: GjcDelegationExecutor;
 };
@@ -118,7 +136,7 @@ type ActiveRun = {
 const FAILURE = 'GJC SDK configuration is invalid.';
 const MODEL_ID_EFFORT = /-(off|minimal|low|medium|high|xhigh|max)(?:-fast)?$/;
 /**
- * How long a finished turn waits for its title before giving up on it. The
+ * How long a finished turn waits for its title before releasing the UI. The
  * title is a 30-token completion started with the turn, so it is normally
  * long done; a hung title request must not hold the turn's terminal frame.
  */
@@ -384,7 +402,60 @@ async function resumeManager(providerSessionId: string, sessionRoot: string): Pr
 
 /** In-process, serial-only SDK runtime. AuthStorage and ModelRegistry are app-owned singleton inputs. */
 export class GjcBunSdkAdapter implements GjcWorkerRuntime {
+  readonly #generation = randomUUID();
+  #revision = 0;
+  #operations = 0;
+  #backgroundTitles = 0;
+  #sdkBackgroundOwnershipUnproven = false;
   #cleanupFailure?: GjcCleanupUnconfirmedError;
+
+  getGeneration(): string {
+    return `${this.#generation}:${this.#revision}:${this.oauth.getGeneration()}`;
+  }
+
+  /** Fixed-size, credential-free observation. Never polls or disposes the SDK. */
+  snapshotActivity(): GjcSdkActivitySnapshot {
+    const oauth = this.oauth.snapshotActivity();
+    let starting = 0;
+    let running = 0;
+    let settling = 0;
+    for (const runId of this.#starting.keys()) if (!this.#runs.has(runId)) starting += 1;
+    for (const run of this.#runs.values()) {
+      if (run.settling) settling += 1;
+      else running += 1;
+    }
+    const unknown: GjcSdkActivitySnapshot['unknown'][number][] = [];
+    if (this.#sdkBackgroundOwnershipUnproven) unknown.push('sdk_background_ownership_unproven');
+    if (this.#cleanupFailure) unknown.push('sdk_cleanup_unconfirmed');
+    return {
+      generation: this.getGeneration(), revision: this.#revision + oauth.revision,
+      starting, running, settling, background: this.#backgroundTitles, operations: this.#operations,
+      oauth, complete: unknown.length === 0, unknown,
+    };
+  }
+
+  async #withOperation<T>(operation: () => Promise<T>): Promise<T> {
+    this.#operations += 1;
+    this.#revision += 1;
+    try { return await operation(); }
+    finally {
+      this.#operations -= 1;
+      this.#revision += 1;
+    }
+  }
+
+  async #withTitleTask(operation: () => Promise<void>): Promise<void> {
+    // Reserve synchronously, including before an injected generator can throw.
+    // The lifetime includes setSessionName persistence and the title callback.
+    this.#backgroundTitles += 1;
+    this.#revision += 1;
+    try { await operation(); }
+    catch { /* A title failure does not fail the user's turn. */ }
+    finally {
+      this.#backgroundTitles -= 1;
+      this.#revision += 1;
+    }
+  }
 
   #assertHealthy(): void {
     if (this.#cleanupFailure) throw this.#cleanupFailure;
@@ -393,6 +464,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
   #poison(): GjcCleanupUnconfirmedError {
     if (this.#cleanupFailure) return this.#cleanupFailure;
     const failure = this.#cleanupFailure = new GjcCleanupUnconfirmedError();
+    this.#revision += 1;
     // Fence every session in this shared runtime immediately. These are only
     // best-effort aborts; the Node supervisor must prove whole-worker reaping.
     for (const starting of this.#starting.values()) starting.abortRequested = true;
@@ -412,9 +484,9 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     return failure;
   }
   readonly #runs = new Map<string, ActiveRun>();
-  /** Runs accepted but not yet holding a session; an abort can still reach them. */
+  /** Accepted roots through settlement; pre-session aborts still reach them here. */
   readonly #starting = new Map<string, { abortRequested: boolean }>();
-  readonly oauth: GjcWorkerOAuthRuntime;
+  readonly oauth: GjcWorkerOAuthRuntime & Pick<GjcBunOAuthController, 'snapshotActivity' | 'getGeneration'>;
 
   constructor(
     private readonly authStorage: AuthStorage,
@@ -431,11 +503,17 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
       cancel: (attemptId) => oauth.cancel(attemptId),
       subscribe: (listener) => oauth.subscribe(listener),
       close: () => oauth.close(),
+      snapshotActivity: () => oauth.snapshotActivity(),
+      getGeneration: () => oauth.getGeneration(),
     };
   }
 
   async modelCatalog() {
     this.#assertHealthy();
+    return this.#withOperation(() => this.#modelCatalog());
+  }
+
+  async #modelCatalog() {
     const seen = new Set<string>();
     const models = [];
     const candidates = await modelsForCredential(this.authStorage, this.modelRegistry, { kind: 'stored' });
@@ -471,6 +549,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     const config = configFromOptions(options);
     if (!runId || this.#runs.has(runId) || this.#starting.has(runId)) throw new Error(FAILURE);
     this.#starting.set(runId, { abortRequested: false });
+    this.#revision += 1;
     const guardedWriter: GjcWorkerWriter = {
       send: (value) => { if (!this.#cleanupFailure) writer.send(value); },
       ...(writer.setSessionId ? { setSessionId: (id: string) => { if (!this.#cleanupFailure) writer.setSessionId!(id); } } : {}),
@@ -480,7 +559,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
       ...(writer.setModel ? { setModel: (model: string) => { if (!this.#cleanupFailure) writer.setModel!(model); } } : {}),
       ...(writer.setAborted ? { setAborted: () => { if (!this.#cleanupFailure) writer.setAborted!(); } } : {}),
     };
-    const task = this.#run(runId, message, options, config, guardedWriter).finally(() => this.#starting.delete(runId));
+    const task = this.#run(runId, message, options, config, guardedWriter).finally(() => {
+      this.#starting.delete(runId);
+      this.#revision += 1;
+    });
     return Object.assign(task, { abortHandle: runId });
   }
 
@@ -499,6 +581,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
    */
   async steerGjcSession(runHandle: string, message: string): Promise<boolean> {
     this.#assertHealthy();
+    return this.#withOperation(() => this.#steerGjcSession(runHandle, message));
+  }
+
+  async #steerGjcSession(runHandle: string, message: string): Promise<boolean> {
     const run = this.#runs.get(runHandle);
     if (!run || run.abortState !== 'idle') return false;
     if (run.session.isStreaming === false) return false;
@@ -515,6 +601,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
 
   async abortGjcSession(sessionId: string): Promise<boolean> {
     this.#assertHealthy();
+    return this.#withOperation(() => this.#abortGjcSession(sessionId));
+  }
+
+  async #abortGjcSession(sessionId: string): Promise<boolean> {
     const run = this.#runs.get(sessionId);
     if (!run) {
       // Stop pressed while the session is still being built (model and
@@ -524,6 +614,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
       const starting = this.#starting.get(sessionId);
       if (!starting || starting.abortRequested) return false;
       starting.abortRequested = true;
+      this.#revision += 1;
       return true;
     }
     if (run.abortState !== 'idle') return false;
@@ -532,6 +623,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     // `session.abort()` is still in flight, and that turn must not be reported
     // back to the user as an unexpected interruption.
     run.state.abortPending = true;
+    this.#revision += 1;
     const closeAutomation = this.options.closeAutomationSession
       ?? (this.options.automationBridge
         ? (appSessionId: string) => closeGjcAutomationSession(appSessionId, this.options.automationBridge)
@@ -547,6 +639,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
       run.askController.dispose();
       run.abortState = 'aborted';
       run.state.abortRequested = true;
+      this.#revision += 1;
       run.markAborted?.();
       await automationCleanup;
       return true;
@@ -554,12 +647,15 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
       await automationCleanup;
       run.abortState = 'idle';
       run.state.abortPending = false;
+      this.#revision += 1;
       return false;
     }
   }
 
   resolveGjcToolApproval(requestId: string, decision: unknown): boolean {
     this.#assertHealthy();
+    // Resolution may synchronously enqueue an owned SDK continuation.
+    this.#revision += 1;
     for (const run of this.#runs.values()) {
       if (run.askController.resolve(requestId, decision)) return true;
     }
@@ -568,6 +664,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
 
   async inspectGjcGoal(scope: GjcGoalScope, providerSessionId: string, sessionRoot: string): Promise<GjcGoalSnapshot> {
     this.#assertHealthy();
+    return this.#withOperation(() => this.#inspectGjcGoal(scope, providerSessionId, sessionRoot));
+  }
+
+  async #inspectGjcGoal(scope: GjcGoalScope, providerSessionId: string, sessionRoot: string): Promise<GjcGoalSnapshot> {
     const manager = await resumeManager(providerSessionId, sessionRoot);
     try {
       const { state, scope: owner } = readPersistedGjcGoal(manager);
@@ -583,6 +683,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
 
   async controlGjcGoal(runId: string, scope: GjcGoalScope, command?: GjcGoalCommand, stopAfterMutation = true): Promise<GjcGoalSnapshot> {
     this.#assertHealthy();
+    return this.#withOperation(() => this.#controlGjcGoal(runId, scope, command, stopAfterMutation));
+  }
+
+  async #controlGjcGoal(runId: string, scope: GjcGoalScope, command?: GjcGoalCommand, stopAfterMutation: boolean = true): Promise<GjcGoalSnapshot> {
     const run = this.#runs.get(runId);
     if (!run || run.abortState !== 'idle' || !matchesGjcGoalOwner(run.goalScope, scope)) throw new Error('No controllable goal exists for this run.');
     if (!run.goals) {
@@ -622,6 +726,8 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     }
     if (active) {
       const run = active;
+      run.settling = true;
+      this.#revision += 1;
       for (const cleanup of [
         () => run.goals?.dispose(),
         () => run.unsubscribe(),
@@ -638,6 +744,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
       }
       this.#assertHealthy();
       this.#runs.delete(runId);
+      this.#revision += 1;
       forwardPromptTerminal(writer, run.state, didRunFail ? runError ?? new Error(FAILURE) : undefined);
     }
     this.#assertHealthy();
@@ -735,6 +842,17 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           delegation.setToolUIContext(askController.uiContext);
         }
         this.#assertHealthy();
+        // SDK 0.16.4 exposes diagnostic job/message counts, but no atomic,
+        // revisioned proof covering registrations, deliveries, continuations
+        // and physical bash descendants. Even dispose() can outlive its public
+        // deadline. Withholding job/cron or seeing empty snapshots is not proof.
+        // Retain one bounded unknown across normal cleanup and failed creation;
+        // only verified reaping of the owning worker can discharge it. Do
+        // not invoke teardown, disable async bash, or read SDK private state.
+        if (!this.#sdkBackgroundOwnershipUnproven) {
+          this.#sdkBackgroundOwnershipUnproven = true;
+          this.#revision += 1;
+        }
         const result = await (this.options.createSessionFactory ?? createAgentSession)({
           ...sessionOptions,
           // CustomTool is the public SDK replacement API. Never construct the
@@ -797,6 +915,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
         // footer snapshot is read here and handed to the event mapper.
         let goals: GjcGoalSession | undefined;
         const unsubscribe = result.session.subscribe((event: unknown) => {
+          this.#revision += 1;
           goals?.onEvent(event);
           forwardSdkEvent(
             event,
@@ -814,11 +933,13 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           askController,
           state,
           abortState: 'idle',
+          settling: false,
           ...(delegation ? { delegation } : {}),
           ...(config.appSessionId ? { appSessionId: config.appSessionId } : {}),
         };
         setActive(activeRun);
         this.#runs.set(runId, activeRun);
+        this.#revision += 1;
         if (goalEnabled && goalScope) {
           goals = new GjcGoalSession(result.session, sessionManager, goalScope, runId,
             (goal) => writer.send({ kind: 'status', text: 'session_state', sessionState: { goal } }),
@@ -836,6 +957,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           activeRun.abortState = 'aborted';
           state.abortPending = true;
           state.abortRequested = true;
+          this.#revision += 1;
           return;
         }
         if (!resumedId) writer.setSessionId?.(sessionManager.getSessionId());
@@ -907,12 +1029,11 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
         // it or opted out. The title reaches the app as a `session_title`
         // message that the server stores and never shows as chat.
         const titleTask = !resumedId && promptMessage !== null && !sessionManager.getSessionName() && !sessionTitlesDisabled()
-          ? (this.options.generateSessionTitle ?? runtimeSessionTitle)(message, this.modelRegistry, settings, model)
-            .then(async (title) => {
+          ? this.#withTitleTask(async () => {
+              const title = await (this.options.generateSessionTitle ?? runtimeSessionTitle)(message, this.modelRegistry, settings, model);
               if (!title || !(await sessionManager.setSessionName(title, 'auto'))) return;
               writer.send({ kind: 'session_title', title: sessionManager.getSessionName(), source: 'auto', sessionId: sessionManager.getSessionId() });
             })
-            .catch(() => {})
           : null;
         let promptError: unknown;
         try {
@@ -927,7 +1048,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
         }
         if (titleTask) {
           let grace: ReturnType<typeof setTimeout> | undefined;
-          await Promise.race([titleTask, new Promise<void>((resolve) => { grace = setTimeout(resolve, SESSION_TITLE_GRACE_MS); })]);
+          const requestedGrace = this.options.sessionTitleGraceMs;
+          const graceMs = requestedGrace !== undefined && Number.isSafeInteger(requestedGrace) && requestedGrace >= 0
+            ? Math.min(requestedGrace, SESSION_TITLE_GRACE_MS) : SESSION_TITLE_GRACE_MS;
+          await Promise.race([titleTask, new Promise<void>((resolve) => { grace = setTimeout(resolve, graceMs); })]);
           clearTimeout(grace);
         }
         await delegation?.dispose();

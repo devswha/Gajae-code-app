@@ -156,7 +156,7 @@ router.post('/migrate-legacy-stars', asyncHandler(async (request, response) => {
   response.json({ success: true, updated: applyLegacyStarredProjectIds(projectIds).updated });
 }));
 
-router.get('/clone-progress', async (request, response) => {
+router.get('/clone-progress', asyncHandler(async (request, response) => {
   response.setHeader('Content-Type', 'text/event-stream');
   response.setHeader('Cache-Control', 'no-cache');
   response.setHeader('Connection', 'keep-alive');
@@ -194,16 +194,16 @@ router.get('/clone-progress', async (request, response) => {
     request.off('close', cancelClone);
     if (!response.writableEnded) response.end();
   }
-});
+}));
 
-router.put('/:projectId/rename', (request, response) => {
+router.put('/:projectId/rename', asyncHandler((request, response) => {
   try {
     const body: { displayName?: unknown } = request.body;
     updateProjectDisplayName(routeProjectId(request.params.projectId), body.displayName);
   } catch (error) {
     response.status(500).json({ error: error instanceof Error ? error.message : 'Failed to rename project' });
   }
-});
+}));
 
 router.post('/:projectId/toggle-star', asyncHandler(async (request, response) => {
   response.json({ success: true, isStarred: toggleProjectStar(routeProjectId(request.params.projectId)).isStarred });

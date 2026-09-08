@@ -95,6 +95,8 @@
     },
     "scrollToBottom": "Vai all'ultimo",
     "queue": {
+      "reviewBeforeSending": "Modifica e controlla prima di inviare",
+      "recoveryNotice": "I messaggi recuperati sono in pausa per evitare invii duplicati. Modifica un messaggio, controlla testo e allegati, quindi invialo. La bozza attuale viene conservata.",
       "sendNext": "Metti in coda un altro messaggio",
       "label": "In coda",
       "willSend": "Invia al termine dell'esecuzione corrente",
@@ -107,6 +109,14 @@
       "images_one": "Aggiunta immagine {{count}}",
       "images_other": "Aggiunte immagini {{count}}",
       "steerNow": "Orienta il turno attivo"
+    },
+    "draftPersistence": {
+      "failed": "Impossibile salvare la bozza. Tieni aperta questa finestra.",
+      "retry": "Riprova a salvare la bozza",
+      "failedInline": "Salvataggio di bozza e allegati non riuscito ({{reason}}). Il testo inserito è conservato. Riprova il salvataggio e non chiudere la finestra né riavviare l’app prima che riesca.",
+      "recoveredRetry": "Bozza salvata. Controlla testo e allegati, quindi premi nuovamente Invia.",
+      "recoveryStillFailed": "Recupero non riuscito. Il testo inserito e i dati salvati sono conservati.",
+      "recoveryNotReady": "Il recupero della bozza è in corso. Il testo inserito è conservato. Riprova al termine."
     },
     "skills": {
       "label": "Scegli una skill",

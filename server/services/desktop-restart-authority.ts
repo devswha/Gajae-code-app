@@ -80,6 +80,7 @@ type Attempt = {
   expiresAt?: number;
   cancelExpiry?: () => void;
   generations?: ReadonlyMap<string, string>;
+  preparedRevision?: number;
   committing?: Promise<DesktopRestartCommitResult>;
   resolveCommit?: (result: DesktopRestartCommitResult) => void;
 };
@@ -163,6 +164,18 @@ export class DesktopRestartAuthority {
     if (typeof source !== 'string' || !source.trim() || source.length > 256) throw new TypeError('An admission source is required.');
     this.expire();
     if (this.attempt) throw Object.assign(new Error('Desktop restart admission is fenced.'), { code: 'DESKTOP_RESTART_FENCED' });
+    return this.acquire();
+  }
+
+  /** Only callers which have validated existing ownership may use this path. */
+  enterCompletion(source: string): () => void {
+    if (typeof source !== 'string' || !source.trim() || source.length > 256) throw new TypeError('An admission source is required.');
+    this.expire();
+    if (this.attempt?.phase === 'committed') throw Object.assign(new Error('Desktop restart admission is fenced.'), { code: 'DESKTOP_RESTART_FENCED' });
+    return this.acquire();
+  }
+
+  private acquire(): () => void {
     this.ingress += 1;
     this.revision += 1;
     let released = false;
@@ -270,6 +283,7 @@ export class DesktopRestartAuthority {
     attempt.expiresAt = this.now() + this.tokenTtlMs;
     attempt.phase = 'prepared';
     this.revision += 1;
+    attempt.preparedRevision = this.revision;
     attempt.cancelExpiry = this.schedule(() => this.expire(), this.tokenTtlMs);
     return { ok: true, token: attempt.token, attemptId: attempt.attemptId, epoch: attempt.epoch, expiresAt: attempt.expiresAt, snapshot: { ...snapshot, state: 'prepared', revision: this.revision } };
   }
@@ -280,6 +294,7 @@ export class DesktopRestartAuthority {
     this.expire();
     if (this.attempt !== attempt) return failure('cancelled');
     const blockers = [...snapshot.blockers, ...this.checkGenerations(snapshot.owners)];
+    if (attempt.preparedRevision !== snapshot.revision) blockers.push(unknown('activity_changed'));
     for (const owner of snapshot.owners) {
       if (attempt.generations?.get(owner.owner) !== owner.generation) blockers.push(unknown('owner_stale', owner.owner));
     }

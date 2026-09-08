@@ -101,6 +101,38 @@ test('known ingress returns busy immediately without waiting for any owner reade
   release();
 });
 
+test('owned completion may finish under a reversible fence but invalidates its prepared proof', async () => {
+  const { authority } = fixture();
+  const result = await authority.prepare(attempt);
+  prepared(result);
+  const release = authority.enterCompletion('ws:approval');
+  release();
+  const committed = await authority.commit(result.token, attempt.epoch);
+  assert.equal(committed.ok, false);
+  assert.equal(authority.state, 'open');
+});
+
+test('completion arriving during preparation cannot disappear behind a zero ingress count', async () => {
+  const { authority, owner } = fixture();
+  const read = deferred<DesktopOwnerActivity>();
+  owner.read = () => read.promise;
+  const pending = authority.prepare(attempt);
+  const release = authority.enterCompletion('ws:abort');
+  release();
+  read.resolve(idle());
+  const result = await pending;
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.ok(result.blockers.some((blocker) => blocker.code === 'activity_changed'));
+});
+
+test('committed shutdown rejects even a formerly owned completion', async () => {
+  const { authority } = fixture();
+  const result = await authority.prepare(attempt);
+  prepared(result);
+  assert.equal((await authority.commit(result.token, attempt.epoch)).ok, true);
+  assert.throws(() => authority.enterCompletion('ws:approval'), { code: 'DESKTOP_RESTART_FENCED' });
+});
+
 for (const count of ['starting', 'queued', 'running', 'settling', 'approvals', 'retained'] as const) {
   test(`owner ${count} blocks prepare without cancelling work`, async () => {
     const { authority, owner } = fixture();

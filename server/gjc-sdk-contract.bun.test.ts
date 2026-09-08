@@ -147,6 +147,7 @@ class FakeAgentSession {
   isStreaming = true;
   abortDeferred: Deferred<void> | undefined;
   disposeError: Error | undefined;
+  disposeDeferred: Deferred<void> | undefined;
   promptCalls = 0;
   /** Messages that arrived while a turn was already running. */
   readonly steeredMessages: string[] = [];
@@ -204,6 +205,7 @@ class FakeAgentSession {
   }
   async dispose(): Promise<void> {
     this.disposed = true;
+    await this.disposeDeferred?.promise;
     if (this.disposeError) throw this.disposeError;
   }
   async setModelTemporary(model: unknown, thinkingLevel: unknown, options: unknown): Promise<void> {
@@ -2706,6 +2708,295 @@ test('the first turn of a new session titles it from the first message and tells
     // The title precedes the terminal frame: the turn waits for it.
     const order = f.frames.filter((frame) => frame.kind === 'event').map((frame) => (frame.payload as { message?: { kind?: string } })?.message?.kind);
     assert.ok(order.indexOf('session_title') < order.indexOf('complete'), `expected title before complete in ${order.join(',')}`);
+  } finally { await f.close(); }
+});
+
+test('SDK activity retains late title generation and persistence after the UI grace expires', async () => {
+  const generated = deferred<string | null>();
+  const persisted = deferred<void>();
+  const writing = deferred<void>();
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, {
+    sessionTitleGraceMs: 0,
+    generateSessionTitle: () => generated.promise,
+  });
+  try {
+    const run = f.host.handle(request('session.start', 'late-title', { message: 'title-canary', options: f.options }));
+    const session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    const manager = f.factoryOptions[0]!.sessionManager as SessionManager;
+    const setName = manager.setSessionName.bind(manager);
+    manager.setSessionName = async (name, source) => {
+      writing.resolve();
+      await persisted.promise;
+      return setName(name, source);
+    };
+    assert.equal(f.adapter.snapshotActivity().background, 1);
+    session.complete();
+    await run;
+    assert.ok(f.frames.some((frame) => (frame.payload as { message?: { kind?: string } })?.message?.kind === 'complete'),
+      'the title request must not hold UI completion past its grace period');
+    const terminal = f.adapter.snapshotActivity();
+    assert.equal(terminal.running + terminal.starting + terminal.settling, 0);
+    assert.equal(terminal.background, 1, 'UI complete is not background task completion');
+    assert.equal(JSON.stringify(terminal).includes('title-canary'), false);
+    generated.resolve('Delayed title');
+    await writing.promise;
+    assert.equal(f.adapter.snapshotActivity().background, 1, 'title persistence is part of the owned task');
+    persisted.resolve();
+    await waitFor(() => f.adapter.snapshotActivity().background === 0 ? true : undefined);
+    assert.ok(f.adapter.snapshotActivity().revision > terminal.revision);
+    assert.notEqual(f.adapter.getGeneration(), terminal.generation);
+    assert.equal(terminal.background, 1, 'earlier snapshots must remain detached');
+  } finally {
+    generated.resolve(null); persisted.resolve();
+    for (const session of f.sessions) session.complete();
+    await waitFor(() => f.adapter.snapshotActivity().background === 0 ? true : undefined);
+    await f.close();
+  }
+});
+
+for (const outcome of ['resolve', 'reject'] as const) {
+  test(`SDK activity retains a title after user cancellation until its actual ${outcome}`, async () => {
+    const generated = deferred<string | null>();
+    const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, {
+      sessionTitleGraceMs: 0,
+      generateSessionTitle: () => generated.promise,
+    });
+    try {
+      const run = f.adapter.spawnGjc('cancel title', { ...f.options, runHandle: 'cancel-title' }, { send() {} });
+      const session = await firstSession(f.sessions);
+      await session.promptStarted.promise;
+      const before = f.adapter.getGeneration();
+      assert.equal(await f.adapter.abortGjcSession('cancel-title'), true);
+      await run;
+      const cancelled = f.adapter.snapshotActivity();
+      assert.equal(cancelled.background, 1);
+      assert.equal(cancelled.running + cancelled.starting + cancelled.settling + cancelled.operations, 0);
+      assert.notEqual(cancelled.generation, before);
+      if (outcome === 'resolve') generated.resolve(null);
+      else generated.reject(new Error('late-title-credential-canary'));
+      await waitFor(() => f.adapter.snapshotActivity().background === 0 ? true : undefined);
+      assert.ok(f.adapter.snapshotActivity().revision > cancelled.revision);
+      assert.equal(JSON.stringify(f.adapter.snapshotActivity()).includes('late-title-credential-canary'), false);
+    } finally {
+      generated.resolve(null);
+      for (const session of f.sessions) session.complete();
+      await waitFor(() => f.adapter.snapshotActivity().background === 0 ? true : undefined);
+      await f.close();
+    }
+  });
+}
+
+test('SDK activity releases overlapping title tasks independently and absorbs synchronous generator failure', async () => {
+  const first = deferred<string | null>();
+  const second = deferred<string | null>();
+  let titles = 0;
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, {
+    sessionTitleGraceMs: 0,
+    generateSessionTitle: () => {
+      titles += 1;
+      if (titles === 1) return first.promise;
+      if (titles === 2) return second.promise;
+      throw new Error('synchronous title failure');
+    },
+  });
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      const run = f.adapter.spawnGjc('title', { ...f.options, runHandle: `overlap-${index}` }, { send() {} });
+      const session = await waitFor(() => f.sessions[index]);
+      await session.promptStarted.promise;
+      session.complete();
+      await run;
+    }
+    assert.equal(f.adapter.snapshotActivity().background, 2);
+    const before = f.adapter.getGeneration();
+    second.reject(new Error('second title failure'));
+    await waitFor(() => f.adapter.snapshotActivity().background === 1 ? true : undefined);
+    assert.notEqual(f.adapter.getGeneration(), before);
+    first.resolve(null);
+    await waitFor(() => f.adapter.snapshotActivity().background === 0 ? true : undefined);
+  } finally {
+    first.resolve(null); second.resolve(null);
+    for (const session of f.sessions) session.complete();
+    await waitFor(() => f.adapter.snapshotActivity().background === 0 ? true : undefined);
+    await f.close();
+  }
+});
+
+test('SDK activity revisions cover reservation, SDK events and actual cleanup settlement', async () => {
+  const disposed = deferred<void>();
+  const f = await fixture();
+  try {
+    const initial = f.adapter.snapshotActivity();
+    assert.equal(initial.complete, true);
+    assert.equal(initial.revision, 0);
+    const run = f.adapter.spawnGjc('hello', { ...f.options, runHandle: 'activity-root' }, { send() {} });
+    const starting = f.adapter.snapshotActivity();
+    assert.equal(starting.starting, 1, 'reserve before the first await');
+    assert.ok(starting.revision > initial.revision);
+    const session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    session.disposeDeferred = disposed;
+    const active = f.adapter.snapshotActivity();
+    assert.equal(active.starting, 0);
+    assert.equal(active.running, 1);
+    assert.deepEqual(f.adapter.snapshotActivity(), active);
+    assert.equal(f.adapter.getGeneration(), active.generation);
+    session.emit({ type: 'tool_execution_start', toolCallId: 'canary', toolName: 'bash', args: { command: 'secret-command-canary' } });
+    assert.notEqual(f.adapter.getGeneration(), active.generation);
+    session.complete();
+    await waitFor(() => session.disposed ? true : undefined);
+    const settling = f.adapter.snapshotActivity();
+    assert.equal(settling.settling, 1);
+    assert.equal(settling.running + settling.starting, 0);
+    assert.equal(JSON.stringify(settling).includes('secret-command-canary'), false);
+    disposed.resolve();
+    await run;
+    const completed = f.adapter.snapshotActivity();
+    assert.equal(completed.running + completed.starting + completed.settling + completed.background, 0);
+    assert.ok(completed.revision > settling.revision);
+    assert.equal(completed.complete, false, 'adapter counts alone do not prove SDK background containment');
+    assert.deepEqual(completed.unknown, ['sdk_background_ownership_unproven']);
+  } finally {
+    disposed.resolve();
+    for (const session of f.sessions) session.complete();
+    await f.close();
+  }
+});
+
+test('SDK activity keeps a user-abort operation owned after the run has completed', async () => {
+  const automationClosed = deferred<void>();
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, {
+    closeAutomationSession: async () => automationClosed.promise,
+  });
+  try {
+    const run = f.adapter.spawnGjc('hello', { ...f.options, appSessionId: 'owned-app', runHandle: 'owned-abort' }, { send() {} });
+    const session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    const abort = f.adapter.abortGjcSession('owned-abort');
+    assert.equal(f.adapter.snapshotActivity().operations, 1);
+    await run;
+    const waiting = f.adapter.snapshotActivity();
+    assert.equal(waiting.running + waiting.starting + waiting.settling, 0);
+    assert.equal(waiting.operations, 1);
+    assert.deepEqual(f.adapter.snapshotActivity(), waiting, 'snapshot must never dispose work to become idle');
+    automationClosed.resolve();
+    assert.equal(await abort, true);
+    assert.equal(f.adapter.snapshotActivity().operations, 0);
+    assert.ok(f.adapter.snapshotActivity().revision > waiting.revision);
+  } finally {
+    automationClosed.resolve();
+    for (const session of f.sessions) session.complete();
+    await f.close();
+  }
+});
+
+test('SDK activity composes OAuth cancellation settlement and revisions without inspecting credentials', async () => {
+  const loginDone = deferred<void>();
+  const loginStarted = deferred<void>();
+  const f = await fixture(undefined, undefined, undefined, undefined, async () => {
+    loginStarted.resolve();
+    await loginDone.promise;
+  });
+  try {
+    const initial = f.adapter.snapshotActivity();
+    const attempt = f.adapter.oauth.start('openai-codex');
+    assert.equal(typeof attempt.attemptId, 'string');
+    assert.equal(f.adapter.snapshotActivity().oauth.starting, 1);
+    assert.notEqual(f.adapter.getGeneration(), initial.generation);
+    await loginStarted.promise;
+    f.adapter.oauth.cancel(attempt.attemptId as string);
+    const cancelled = f.adapter.snapshotActivity();
+    assert.equal(cancelled.oauth.settling, 1);
+    assert.ok(cancelled.revision > initial.revision);
+    assert.deepEqual(f.adapter.snapshotActivity(), cancelled);
+    const exportSnapshot = f.authStorage.exportSnapshot;
+    f.authStorage.exportSnapshot = () => { throw new Error('activity must not access credentials'); };
+    try { assert.deepEqual(f.adapter.snapshotActivity(), cancelled); }
+    finally { f.authStorage.exportSnapshot = exportSnapshot; }
+    loginDone.resolve();
+    await waitFor(() => f.adapter.snapshotActivity().oauth.settling === 0 ? true : undefined);
+    assert.ok(f.adapter.snapshotActivity().revision > cancelled.revision);
+    assert.equal(f.adapter.snapshotActivity().complete, true, 'no SDK session was created');
+  } finally {
+    f.adapter.oauth.close(); loginDone.resolve();
+    await waitFor(() => f.adapter.snapshotActivity().oauth.settling === 0 ? true : undefined);
+    await f.close();
+  }
+});
+
+test('SDK activity never treats empty diagnostics after background cleanup as proof of idle', async () => {
+  const runnerDone = deferred<string>();
+  const runnerStarted = deferred<void>();
+  let runnerSettled = false;
+  let retainedSettled = false;
+  const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+  const f = await fixture();
+  try {
+    const run = f.adapter.spawnGjc('background work', { ...f.options, toolNames: ['bash'], runHandle: 'background-bash' }, { send() {} });
+    const session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    manager.register('bash', 'background-command-canary', async () => {
+      runnerStarted.resolve();
+      try { return await runnerDone.promise; }
+      finally { runnerSettled = true; }
+    });
+    await runnerStarted.promise;
+    let diagnosticsRead = false;
+    Object.assign(session, {
+      getAsyncJobSnapshot: () => { diagnosticsRead = true; return { running: [], recent: [] }; },
+      pendingMessageCounts: { steering: 0, followUp: 0, nextTurn: 0 },
+      hasPostPromptWork: false,
+    });
+    // Reproduce the SDK's lossy public diagnostic surface with its REAL job
+    // manager: cancellation clears diagnostic rows while an ignoring runner
+    // is still retained. This is a cleanup fixture, not updater-driven drain.
+    session.dispose = async () => {
+      assert.equal(await manager.dispose({ timeoutMs: 0 }), false);
+      session.disposed = true;
+    };
+    session.complete();
+    await run;
+    const retained = manager.awaitRetainedDisposalCompletion().then(() => { retainedSettled = true; });
+    assert.equal(manager.getRunningJobs().length, 0);
+    assert.equal(runnerSettled, false);
+    assert.equal(retainedSettled, false);
+    const snapshot = f.adapter.snapshotActivity();
+    assert.equal(snapshot.running + snapshot.starting + snapshot.settling + snapshot.background, 0);
+    assert.equal(snapshot.complete, false);
+    assert.deepEqual(snapshot.unknown, ['sdk_background_ownership_unproven']);
+    assert.equal(diagnosticsRead, false, 'a read must not replace ownership proof with diagnostics');
+    assert.equal(JSON.stringify(snapshot).includes('background-command-canary'), false);
+    runnerDone.resolve('finished');
+    await retained;
+    assert.equal(runnerSettled, true);
+    assert.equal(f.adapter.snapshotActivity().complete, false, 'the adapter has no complete SDK proof to clear the unknown');
+  } finally {
+    runnerDone.resolve('finished');
+    for (const session of f.sessions) session.complete();
+    await manager.dispose();
+    await manager.awaitRetainedDisposalCompletion();
+    await f.close();
+  }
+});
+
+test('SDK activity retains cleanup failure as unknown and never clears it on a read', async () => {
+  const f = await fixture();
+  try {
+    const run = f.adapter.spawnGjc('hello', { ...f.options, runHandle: 'failed-cleanup' }, { send() {} });
+    const failed = assert.rejects(run, { name: 'GjcCleanupUnconfirmedError' });
+    const session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    session.disposeError = new Error('cleanup-secret-canary');
+    session.complete();
+    await failed;
+    const snapshot = f.adapter.snapshotActivity();
+    assert.equal(snapshot.complete, false);
+    assert.equal(snapshot.settling, 1);
+    assert.deepEqual(snapshot.unknown, ['sdk_background_ownership_unproven', 'sdk_cleanup_unconfirmed']);
+    assert.deepEqual(f.adapter.snapshotActivity(), snapshot);
+    assert.equal(f.adapter.getGeneration(), snapshot.generation);
+    assert.equal(JSON.stringify(snapshot).includes('cleanup-secret-canary'), false);
   } finally { await f.close(); }
 });
 

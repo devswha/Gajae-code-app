@@ -8,6 +8,11 @@ export function subscribeQueuedMessages(listener: (sessionId: string) => void): 
   return () => { queuedMessageListeners.delete(listener); };
 }
 
+/** Publish only after the caller has successfully changed its queue projection. */
+export function notifyQueuedMessages(sessionId: string): void {
+  queuedMessageListeners.forEach((listener) => listener(sessionId));
+}
+
 const matchingKeys = (prefix: string, retained: string) => Object.keys(localStorage).filter((key) => key.startsWith(prefix) && key !== retained);
 const removeKeys = (keys: string[]) => { keys.forEach((key) => localStorage.removeItem(key)); return keys.length; };
 
@@ -35,7 +40,7 @@ export const safeLocalStorage = {
 };
 
 export type QueuedSendOptions = Record<string, unknown>;
-export type StoredQueuedMessage = { id?: string; content: string; options?: QueuedSendOptions; pendingSteer?: boolean };
+export type StoredQueuedMessage = { id?: string; content: string; options?: QueuedSendOptions; pendingSteer?: boolean; composerRoute?: string; attachmentCount?: number; requiresReview?: boolean };
 
 const sessionDraftKey = (sessionId: string) => `${DRAFT_KEY_PREFIX}session_${sessionId}`;
 export const queuedMessageKey = (sessionId: string) => `${QUEUE_KEY_PREFIX}${sessionId}`;
@@ -49,9 +54,9 @@ export function draftKeysToClear(projectId: string, sessionId?: string | null, s
 
 function validQueuedMessage(value: unknown): StoredQueuedMessage | null {
   if (!value || typeof value !== 'object') return null;
-  const { id, content, options, pendingSteer } = value as StoredQueuedMessage;
-  if (typeof content !== 'string' || !content.trim()) return null;
-  return { ...(typeof id === 'string' && id ? { id } : {}), content, ...(options === undefined ? {} : { options }), ...(pendingSteer === true ? { pendingSteer: true } : {}) };
+  const { id, content, options, pendingSteer, composerRoute, attachmentCount, requiresReview } = value as StoredQueuedMessage;
+  if (typeof content !== 'string' || (!content.trim() && !attachmentCount)) return null;
+  return { ...(typeof id === 'string' && id ? { id } : {}), content, ...(options === undefined ? {} : { options }), ...(pendingSteer === true ? { pendingSteer: true } : {}), ...(typeof composerRoute === 'string' ? { composerRoute } : {}), ...(typeof attachmentCount === 'number' && attachmentCount > 0 ? { attachmentCount } : {}), ...(requiresReview === true ? { requiresReview: true } : {}) };
 }
 
 export function readQueuedMessages(sessionId: string): StoredQueuedMessage[] {
@@ -68,11 +73,17 @@ export function readQueuedMessages(sessionId: string): StoredQueuedMessage[] {
   return raw.trim() ? [{ content: raw }] : [];
 }
 
-export function writeQueuedMessages(sessionId: string, messages: StoredQueuedMessage[]): void {
-  const queue = messages.filter((message) => message.content.trim());
-  if (!queue.length) safeLocalStorage.removeItem(queuedMessageKey(sessionId));
-  else safeLocalStorage.setItem(queuedMessageKey(sessionId), JSON.stringify(queue));
-  queuedMessageListeners.forEach((listener) => listener(sessionId));
+export function writeQueuedMessages(sessionId: string, messages: StoredQueuedMessage[]): boolean {
+  const queue = messages.filter((message) => message.content.trim() || message.attachmentCount);
+  try {
+    if (!queue.length) localStorage.removeItem(queuedMessageKey(sessionId));
+    else localStorage.setItem(queuedMessageKey(sessionId), JSON.stringify(queue));
+  } catch {
+    console.warn('Queued messages could not be saved; no other drafts were removed.');
+    return false;
+  }
+  notifyQueuedMessages(sessionId);
+  return true;
 }
 
 export function clearQueuedMessages(sessionId: string): void { writeQueuedMessages(sessionId, []); }

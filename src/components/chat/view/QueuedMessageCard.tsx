@@ -5,6 +5,7 @@ interface QueuedMessageCardProps {
   content: string;
   imageCount?: number;
   pendingSteer?: boolean;
+  requiresReview?: boolean;
   /** 1-based place in the send order. */
   position: number;
   total: number;
@@ -19,6 +20,7 @@ export default function QueuedMessageCard({
   content,
   imageCount = 0,
   pendingSteer = false,
+  requiresReview = false,
   position,
   total,
   onEdit,
@@ -49,7 +51,7 @@ export default function QueuedMessageCard({
             <span className="text-muted-foreground/60 normal-case">
               {/* Only the head is sent when the current turn ends; the rest
                   follow one per turn, so promising otherwise would be a lie. */}
-              · {pendingSteer ? t('input.queue.awaitingSteer') : isNext ? t('input.queue.willSend') : t('input.queue.willFollow')}
+              · {requiresReview ? t('input.queue.reviewBeforeSending', { defaultValue: 'Edit and review before sending' }) : pendingSteer ? t('input.queue.awaitingSteer') : isNext ? t('input.queue.willSend') : t('input.queue.willFollow')}
             </span>
           </div>
           <p className="mt-0.5 line-clamp-2 text-sm wrap-break-word text-foreground/90">{content}</p>

@@ -17,6 +17,7 @@ import { classifyCommandInput, isAutoSendable } from '../commandDispatchPolicy';
 import { useVoiceInput } from '../hooks/useVoiceInput';
 import { useVoiceAvailable } from '../hooks/useVoiceAvailable';
 import type { PendingCommandGate, QueuedDraft } from '../hooks/useChatComposerState';
+import type { DraftPersistenceStatus } from '../hooks/useDurableComposerDraft';
 import type { WorkspaceCandidate } from '../hooks/useWorkspaceTarget';
 import type { PendingPermissionRequest, PermissionDecision } from '../types/types';
 import type { ProviderModelOption } from '../../../types/app';
@@ -31,6 +32,7 @@ import {
   PromptInputButton,
   PromptInputSubmit,
   Tooltip,
+  Button,
 } from '../../../shared/view/ui';
 
 import CommandMenu from './CommandMenu';
@@ -63,6 +65,8 @@ interface SlashCommand {
 }
 
 interface ChatComposerProps {
+  draftPersistence?: DraftPersistenceStatus;
+  onRetryDraftPersistence?: () => Promise<boolean>;
   pendingPermissionRequests: PendingPermissionRequest[];
   handlePermissionDecision: (requestIds: string | string[], decision: PermissionDecision) => void;
   /** A run is in flight for the viewed session: the primary button is Stop, Enter queues. */
@@ -144,6 +148,8 @@ interface ChatComposerProps {
 }
 
 export default function ChatComposer({
+  draftPersistence,
+  onRetryDraftPersistence,
   pendingPermissionRequests,
   handlePermissionDecision,
   isLoading,
@@ -309,6 +315,7 @@ export default function ChatComposer({
           content={draft.content}
           imageCount={draft.images.length}
           pendingSteer={draft.pendingSteer}
+          requiresReview={draft.requiresReview}
           position={index + 1}
           total={queuedDrafts.length}
           onEdit={() => onEditQueuedDraft(index)}
@@ -317,6 +324,15 @@ export default function ChatComposer({
           onMoveDown={index < queuedDrafts.length - 1 ? () => onMoveQueuedDraft(index, index + 1) : undefined}
         />
       ))}
+
+      {draftPersistence?.phase === 'error' && onRetryDraftPersistence && (
+        <div role="alert" className="mx-auto mb-2 flex max-w-chat items-center justify-between gap-2 rounded-md border border-destructive/30 p-2 text-xs text-destructive">
+          <span>{t('input.draftPersistence.failed', { defaultValue: 'Draft saving failed. Keep this window open.' })} ({draftPersistence.reason})</span>
+          <Button type="button" size="sm" variant="outline" onClick={() => { void onRetryDraftPersistence(); }}>
+            {t('input.draftPersistence.retry', { defaultValue: 'Retry draft saving' })}
+          </Button>
+        </div>
+      )}
 
       {isWorkspace && (
         <WorkspaceTargetChip

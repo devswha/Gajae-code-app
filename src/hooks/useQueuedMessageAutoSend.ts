@@ -29,6 +29,9 @@ export function decideQueuedDispatch(
   if (queued === null || queued === undefined) return hold('no-draft');
   if (!socketOpen) return hold('socket-closed');
   if (queued.pendingSteer) return hold('awaiting-steer');
+  // This background path has no attachment upload/review surface. Text-only
+  // durable queues retain their existing automatic dispatch behavior.
+  if (queued.attachmentCount || queued.requiresReview) return hold('needs-session-ui');
 
   const command = classifyCommandInput(queued.content);
   if (!isAutoSendable(command)) return hold('needs-session-ui');

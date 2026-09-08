@@ -6,11 +6,15 @@ import path from 'node:path';
 import pty, { type IPty } from 'node-pty';
 import { WebSocket, type RawData } from 'ws';
 
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
 import { parseIncomingJsonObject } from '@/shared/utils.js';
+
+import type { DesktopOwnerActivity } from '../../../../shared/desktopUpdateProtocol.js';
 
 type ShellIncomingMessage = { type?: string; data?: string; cols?: number; rows?: number; projectPath?: string; sessionId?: string; hasSession?: boolean; provider?: string; initialCommand?: string; isPlainShell?: boolean; forceRestart?: boolean; };
 type PtySessionEntry = { pty: IPty; ws: WebSocket | null; buffer: string[]; timeoutId: NodeJS.Timeout | null; projectPath: string; sessionId: string | null; urlText: string; reportedUrls: Set<string>; };
 type ShellWebSocketDependencies = {
+  desktopRestartAdmission?: DesktopWorkAdmission;
   resolveProviderSessionId: (sessionId: string, provider: string) => string | null | undefined;
   stripAnsiSequences: (content: string) => string;
   normalizeDetectedUrl: (url: string) => string | null;
@@ -19,6 +23,38 @@ type ShellWebSocketDependencies = {
 };
 
 const sessions = new Map<string, PtySessionEntry>();
+// A key may already name a replacement while its old PTY is still exiting.
+// These are the same owned entries, retained until their own onExit callback.
+const retiringSessions = new Set<PtySessionEntry>();
+let shellActivityRevision = 0n;
+let startingPtys = 0;
+// node-pty proves only the leader's exit, not arbitrary detached descendants.
+// Keep one bounded, process-lifetime uncertainty latch; neither kill(), onExit,
+// timer expiry nor a socket disconnect can independently clear this proof gap.
+let unverifiedPtyDescendants = false;
+
+export function getShellActivityGeneration(): string {
+  return `shell:${shellActivityRevision}`;
+}
+
+export function snapshotShellActivity(): DesktopOwnerActivity {
+  let retained = 0;
+  for (const session of sessions.values()) {
+    if (session.ws === null) retained += 1;
+  }
+  return {
+    owner: 'shell', generation: getShellActivityGeneration(), complete: !unverifiedPtyDescendants,
+    starting: startingPtys, queued: 0, running: sessions.size, settling: retiringSessions.size,
+    approvals: 0, retained, unknown: unverifiedPtyDescendants ? ['pty_descendants_unverified'] : [],
+  };
+}
+
+function retireSession(session: PtySessionEntry): void {
+  if (retiringSessions.has(session)) return;
+  retiringSessions.add(session);
+  shellActivityRevision += 1n;
+}
+
 // Revocation outlives the PTY entry: its exit must not let a delayed init from
 // a replaced connection seize the session before the current owner restarts.
 const supersededSockets = new WeakSet<WebSocket>();
@@ -107,18 +143,29 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
     const timer = setTimeout(() => {
       // A cancelled callback may already be queued when a new owner attaches.
       if (sessions.get(id) !== current || current.ws !== null || current.timeoutId !== timer) return;
+      retireSession(current);
       sessions.delete(id);
+      current.timeoutId = null;
+      shellActivityRevision += 1n;
       current.pty.kill();
     }, SESSION_GRACE_PERIOD);
     current.timeoutId = timer;
+    shellActivityRevision += 1n;
   };
   const clearSavedSession = (id: string) => {
     const old = sessions.get(id);
     if (!old) return;
     if (old.ws && old.ws !== ws) supersededSockets.add(old.ws);
     if (old.timeoutId) clearTimeout(old.timeoutId);
+    old.timeoutId = null;
+    shellActivityRevision += 1n;
+    retireSession(old);
     old.pty.kill();
-    sessions.delete(id);
+    // kill() may report exit synchronously. Never remove a newer generation.
+    if (sessions.get(id) === old) {
+      sessions.delete(id);
+      shellActivityRevision += 1n;
+    }
   };
   const relayOutput = (id: string, child: IPty) => {
     return (chunk: string) => {
@@ -126,10 +173,12 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
       if (!current || current.pty !== child) return;
       if (current.buffer.length === 5000) current.buffer.shift();
       current.buffer.push(chunk);
+      shellActivityRevision += 1n;
       if (!current.ws || current.ws.readyState !== WebSocket.OPEN) return;
 
       const stripped = dependencies.stripAnsiSequences(chunk);
       current.urlText = `${current.urlText}${stripped}`.slice(-URL_WINDOW_LENGTH);
+      shellActivityRevision += 1n;
       const output = chunk.replace(/OPEN_URL:\s*(https?:\/\/[^\s\x1b\x07]+)/g, '[INFO] Opening in browser: $1');
       const urls = Array.from(new Set(dependencies.extractUrlsFromText(current.urlText)
         .map((url) => dependencies.normalizeDetectedUrl(url))
@@ -138,6 +187,7 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
       const announce = (url: string, autoOpen: boolean) => {
         if (current.reportedUrls.has(url)) return;
         current.reportedUrls.add(url);
+        shellActivityRevision += 1n;
         current.ws?.send(JSON.stringify({ type: 'auth_url', url, autoOpen }));
       };
       urls.forEach((url) => announce(url, false));
@@ -180,6 +230,7 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
       previous.timeoutId = null;
       if (previous.ws && previous.ws !== ws) supersededSockets.add(previous.ws);
       previous.ws = ws;
+      shellActivityRevision += 1n;
       write({ type: 'output', data: '\x1b[36m[Reconnected to existing session]\x1b[0m\r\n' });
       previous.buffer.forEach((data) => write({ type: 'output', data }));
       return;
@@ -188,21 +239,35 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
     const commandLine = shellCommand(data, dependencies);
     const resumeId = nativeSession(data, dependencies);
     const npmPath = preferredPath(process.env);
-    activePty = pty.spawn(executable, os.platform() === 'win32' ? ['-Command', commandLine] : ['-c', commandLine], {
-      name: 'xterm-256color', cols: dimension(data.cols, 80), rows: dimension(data.rows, 24), cwd,
-      env: { ...process.env, [npmPath.key]: npmPath.value, TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3' },
-    });
-    const child = activePty;
-    sessions.set(key, { pty: child, ws, buffer: [], timeoutId: null, projectPath, sessionId, urlText: '', reportedUrls: new Set() });
-    child.onData(relayOutput(nextKey, child));
+    startingPtys += 1;
+    // Even a throwing native spawn may have started a process before failing.
+    unverifiedPtyDescendants = true;
+    shellActivityRevision += 1n;
+    let entry: PtySessionEntry;
+    try {
+      activePty = pty.spawn(executable, os.platform() === 'win32' ? ['-Command', commandLine] : ['-c', commandLine], {
+        name: 'xterm-256color', cols: dimension(data.cols, 80), rows: dimension(data.rows, 24), cwd,
+        env: { ...process.env, [npmPath.key]: npmPath.value, TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3' },
+      });
+      entry = { pty: activePty, ws, buffer: [], timeoutId: null, projectPath, sessionId, urlText: '', reportedUrls: new Set() };
+      sessions.set(key, entry);
+      shellActivityRevision += 1n;
+    } finally {
+      startingPtys -= 1;
+      shellActivityRevision += 1n;
+    }
+    const child = entry.pty;
     child.onExit((status) => {
+      if (retiringSessions.delete(entry)) shellActivityRevision += 1n;
       const current = sessions.get(nextKey);
-      if (!current || current.pty !== child) return;
-      if (current.ws?.readyState === WebSocket.OPEN) current.ws.send(JSON.stringify({ type: 'output', data: `\r\n\x1b[33mProcess exited with code ${status.exitCode}${status.signal != null ? ` (${status.signal})` : ''}\x1b[0m\r\n` }));
+      if (current !== entry) return;
       if (current.timeoutId) clearTimeout(current.timeoutId);
       sessions.delete(nextKey);
       if (activePty === child) activePty = null;
+      shellActivityRevision += 1n;
+      if (current.ws?.readyState === WebSocket.OPEN) current.ws.send(JSON.stringify({ type: 'output', data: `\r\n\x1b[33mProcess exited with code ${status.exitCode}${status.signal != null ? ` (${status.signal})` : ''}\x1b[0m\r\n` }));
     });
+    child.onData(relayOutput(nextKey, child));
     const welcome = plain
       ? `\x1b[36mStarting terminal in: ${projectPath}\x1b[0m\r\n`
       : hasSession && resumeId
@@ -216,7 +281,7 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
     resize: (data) => { ownedSession()?.pty.resize(dimension(data.cols, 80), dimension(data.rows, 24)); },
   };
 
-  ws.on('message', async (raw) => {
+  ws.on('message', (raw) => {
     try {
       if (ws.readyState !== WebSocket.OPEN || supersededSockets.has(ws)) return;
       // A replaced connection cannot reclaim, restart or control the new owner.
@@ -224,8 +289,22 @@ export function handleShellConnection(ws: WebSocket, dependencies: ShellWebSocke
       if (current && current.ws !== ws) return;
       const data = decode(raw);
       if (!data?.type) throw new Error('Invalid websocket payload');
-      handlers[data.type]?.(data);
+      if (data.type !== 'init' && data.type !== 'input' && data.type !== 'resize') return;
+      if (data.type !== 'init' && !ownedSession()) return;
+      // Admission is per producer message, not per connection. Keep its lease
+      // through the synchronous handler and transfer to the registered PTY owner.
+      const release = dependencies.desktopRestartAdmission?.enter(`shell.${data.type}`);
+      shellActivityRevision += 1n;
+      try { handlers[data.type]!(data); }
+      finally {
+        shellActivityRevision += 1n;
+        release?.();
+      }
     } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'DESKTOP_RESTART_FENCED') {
+        if (ws.readyState === WebSocket.OPEN) write({ type: 'error', code: 'DESKTOP_RESTART_FENCED', message: 'Desktop restart is being prepared. Retry this request.' });
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       console.error('[ERROR] Shell WebSocket error:', message);
       if (ws.readyState === WebSocket.OPEN) write({ type: 'output', data: `\r\n\x1b[31mError: ${message}\x1b[0m\r\n` });

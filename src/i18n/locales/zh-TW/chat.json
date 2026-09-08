@@ -94,6 +94,8 @@
     },
     "scrollToBottom": "跳轉至最新",
     "queue": {
+      "reviewBeforeSending": "編輯並確認後傳送",
+      "recoveryNotice": "為避免重複傳送，已暫停自動傳送還原的佇列訊息。請編輯訊息，檢查內容與附件後再傳送。編輯佇列訊息時，目前草稿會被保留。",
       "sendNext": "佇列另一則訊息",
       "label": "已佇列",
       "willSend": "於當前執行結束後發送",
@@ -106,6 +108,14 @@
       "images_one": "{{count}} 張圖片已加入",
       "images_other": "{{count}} 張圖片已加入",
       "steerNow": "操控當前輪次"
+    },
+    "draftPersistence": {
+      "failed": "草稿儲存失敗。請勿關閉此視窗。",
+      "retry": "重試儲存草稿",
+      "failedInline": "草稿和附件儲存失敗（{{reason}}）。目前輸入仍然保留。請重試儲存草稿。儲存成功前，請勿關閉視窗或重新啟動應用程式。",
+      "recoveredRetry": "草稿已儲存。請檢查輸入內容和附件，再次按下傳送。",
+      "recoveryStillFailed": "草稿還原失敗。目前輸入和已儲存的資料皆已保留。",
+      "recoveryNotReady": "正在還原草稿。輸入內容已保留，請在還原完成後重試。"
     },
     "skills": {
       "label": "選擇技能",

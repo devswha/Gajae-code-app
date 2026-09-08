@@ -5,6 +5,7 @@ import {
   credentialsDb,
   notificationPreferencesDb,
 } from '../modules/database/index.js';
+import { asyncHandler } from '../shared/utils.js';
 
 const router = express.Router();
 
@@ -13,7 +14,7 @@ const router = express.Router();
 // ===============================
 
 // Get all API keys for the authenticated user
-router.get('/api-keys', async (req, res) => {
+router.get('/api-keys', asyncHandler(async (req, res) => {
   try {
     const apiKeys = apiKeysDb.getApiKeys(req.user.id);
     // Don't send the full API key in the list for security
@@ -26,10 +27,10 @@ router.get('/api-keys', async (req, res) => {
     console.error('Error fetching API keys:', error);
     res.status(500).json({ error: 'Failed to fetch API keys' });
   }
-});
+}));
 
 // Create a new API key
-router.post('/api-keys', async (req, res) => {
+router.post('/api-keys', asyncHandler(async (req, res) => {
   try {
     const { keyName } = req.body;
 
@@ -46,10 +47,10 @@ router.post('/api-keys', async (req, res) => {
     console.error('Error creating API key:', error);
     res.status(500).json({ error: 'Failed to create API key' });
   }
-});
+}));
 
 // Delete an API key
-router.delete('/api-keys/:keyId', async (req, res) => {
+router.delete('/api-keys/:keyId', asyncHandler(async (req, res) => {
   try {
     const { keyId } = req.params;
     const success = apiKeysDb.deleteApiKey(req.user.id, parseInt(keyId));
@@ -63,10 +64,10 @@ router.delete('/api-keys/:keyId', async (req, res) => {
     console.error('Error deleting API key:', error);
     res.status(500).json({ error: 'Failed to delete API key' });
   }
-});
+}));
 
 // Toggle API key active status
-router.patch('/api-keys/:keyId/toggle', async (req, res) => {
+router.patch('/api-keys/:keyId/toggle', asyncHandler(async (req, res) => {
   try {
     const { keyId } = req.params;
     const { isActive } = req.body;
@@ -86,14 +87,14 @@ router.patch('/api-keys/:keyId/toggle', async (req, res) => {
     console.error('Error toggling API key:', error);
     res.status(500).json({ error: 'Failed to toggle API key' });
   }
-});
+}));
 
 // ===============================
 // Generic Credentials Management
 // ===============================
 
 // Get all credentials for the authenticated user (optionally filtered by type)
-router.get('/credentials', async (req, res) => {
+router.get('/credentials', asyncHandler(async (req, res) => {
   try {
     const { type } = req.query;
     const credentials = credentialsDb.getCredentials(req.user.id, type || null);
@@ -103,10 +104,10 @@ router.get('/credentials', async (req, res) => {
     console.error('Error fetching credentials:', error);
     res.status(500).json({ error: 'Failed to fetch credentials' });
   }
-});
+}));
 
 // Create a new credential
-router.post('/credentials', async (req, res) => {
+router.post('/credentials', asyncHandler(async (req, res) => {
   try {
     const { credentialName, credentialType, credentialValue, description } = req.body;
 
@@ -138,10 +139,10 @@ router.post('/credentials', async (req, res) => {
     console.error('Error creating credential:', error);
     res.status(500).json({ error: 'Failed to create credential' });
   }
-});
+}));
 
 // Delete a credential
-router.delete('/credentials/:credentialId', async (req, res) => {
+router.delete('/credentials/:credentialId', asyncHandler(async (req, res) => {
   try {
     const { credentialId } = req.params;
     const success = credentialsDb.deleteCredential(req.user.id, parseInt(credentialId));
@@ -155,10 +156,10 @@ router.delete('/credentials/:credentialId', async (req, res) => {
     console.error('Error deleting credential:', error);
     res.status(500).json({ error: 'Failed to delete credential' });
   }
-});
+}));
 
 // Toggle credential active status
-router.patch('/credentials/:credentialId/toggle', async (req, res) => {
+router.patch('/credentials/:credentialId/toggle', asyncHandler(async (req, res) => {
   try {
     const { credentialId } = req.params;
     const { isActive } = req.body;
@@ -178,13 +179,13 @@ router.patch('/credentials/:credentialId/toggle', async (req, res) => {
     console.error('Error toggling credential:', error);
     res.status(500).json({ error: 'Failed to toggle credential' });
   }
-});
+}));
 
 // ===============================
 // Notification Preferences
 // ===============================
 
-router.get('/notification-preferences', async (req, res) => {
+router.get('/notification-preferences', asyncHandler(async (req, res) => {
   try {
     const preferences = notificationPreferencesDb.getPreferences(req.user.id);
     res.json({ success: true, preferences });
@@ -192,9 +193,9 @@ router.get('/notification-preferences', async (req, res) => {
     console.error('Error fetching notification preferences:', error);
     res.status(500).json({ error: 'Failed to fetch notification preferences' });
   }
-});
+}));
 
-router.put('/notification-preferences', async (req, res) => {
+router.put('/notification-preferences', asyncHandler(async (req, res) => {
   try {
     const preferences = notificationPreferencesDb.updatePreferences(req.user.id, req.body || {});
     res.json({ success: true, preferences });
@@ -202,6 +203,6 @@ router.put('/notification-preferences', async (req, res) => {
     console.error('Error saving notification preferences:', error);
     res.status(500).json({ error: 'Failed to save notification preferences' });
   }
-});
+}));
 
 export default router;

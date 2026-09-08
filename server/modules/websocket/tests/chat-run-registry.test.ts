@@ -55,6 +55,33 @@ function framesOf(socket: SocketCapture, kind: string): Array<Record<string, unk
 }
 
 describe('chat run event protocol', () => {
+  test('restart snapshot retains approvals and publication work beyond visible run completion', async () => {
+    await openDatabase(async () => {
+      const initial = chatRunRegistry.getGeneration();
+      const { run } = createRun('restart-activity');
+      assert.notEqual(chatRunRegistry.getGeneration(), initial);
+      assert.equal(chatRunRegistry.snapshotActivity().running, 1);
+      run.writer.send({ kind: 'permission_request', requestId: 'approval-1', toolName: 'bash' });
+      const pendingRevision = chatRunRegistry.getGeneration();
+      assert.equal(chatRunRegistry.snapshotActivity().approvals, 1);
+      assert.deepEqual(chatRunRegistry.getPendingApproval('approval-1'), { appSessionId: 'restart-activity', toolName: 'bash' });
+      assert.equal(chatRunRegistry.getGeneration(), pendingRevision, 'read-only lookup must not mutate ownership');
+      chatRunRegistry.resolvePendingApproval('approval-1');
+      assert.equal(chatRunRegistry.snapshotActivity().approvals, 0);
+      assert.notEqual(chatRunRegistry.getGeneration(), pendingRevision);
+      run.writer.send({ kind: 'session_created', provider: 'gjc', sessionId: 'native-activity', newSessionId: 'native-activity' });
+      run.writer.send({ kind: 'complete', provider: 'gjc', exitCode: 0 });
+      assert.equal(chatRunRegistry.snapshotActivity().running, 0);
+      assert.equal(chatRunRegistry.snapshotActivity().settling, 1, 'async publication remains owned after terminal UI state');
+      chatRunRegistry.clearAll();
+      assert.equal(chatRunRegistry.snapshotActivity().settling, 1, 'clearing the run registry cannot erase an unsettled publication');
+      await new Promise((resolve) => setImmediate(resolve));
+      const settled = chatRunRegistry.snapshotActivity();
+      assert.equal(settled.settling, 0);
+      assert.equal(settled.generation, chatRunRegistry.getGeneration());
+    });
+  });
+
   test('uses the application session and increasing event positions', async () => {
     await openDatabase(() => {
       const { run, socket } = createRun('sequence');

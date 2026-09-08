@@ -245,6 +245,8 @@ function ChatInterface({
 
   const composerNode = (
     <ComposerSurface
+      draftPersistence={composer.draftPersistence}
+      onRetryDraftPersistence={composer.retryDraftPersistence}
       pendingPermissionRequests={pendingPermissionRequests}
       handlePermissionDecision={composer.handlePermissionDecision}
       isLoading={session.isProcessing}
