@@ -43,6 +43,7 @@
     "server/gjc-ask-decision.bun.test.ts",
     "server/gjc-automation-tools.test.ts",
     "server/gjc-bun-ask-controller.test.ts",
+    "server/gjc-bun-oauth-controller.bun.test.ts",
     "server/gjc-bun-permission-gate.test.ts",
     "server/gjc-bun-sdk-events.contract.test.ts",
     "server/gjc-bun-sdk-events.test.ts",
