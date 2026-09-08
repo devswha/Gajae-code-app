@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "gjcSdk": "0.16.4",
   "bun": "1.4.0",
   "natives": "0.16.4",
@@ -57,5 +57,55 @@
         }
       ]
     }
+  },
+  "sdkLifecycle": {
+    "id": "gjc-sdk-lifecycle-v1",
+    "packages": {
+      "@gajae-code/coding-agent": "0.16.4",
+      "@gajae-code/agent-core": "0.16.4",
+      "@gajae-code/ai": "0.16.4"
+    },
+    "files": [
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/session.ts",
+        "sha256": "1e44f523dbecdc4ecb2dae903fdc857fc3ebdff323d697bcd2b5f928687a6b54"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/session/agent-session.ts",
+        "sha256": "e5ff2bb9e218c78d989701ff327e01d514ebfe963f829031b035d120f095cedd"
+      },
+      {
+        "package": "@gajae-code/agent-core",
+        "path": "src/run-resource-ledger.ts",
+        "sha256": "96439647694a120c184359caa57905bcd99da5748945af4d42de110a1be5cccb"
+      },
+      {
+        "package": "@gajae-code/agent-core",
+        "path": "src/agent-loop.ts",
+        "sha256": "1ad8e7d4e22db66db81fcbd2cd7e7dd60e136f66c049c557648e15ccb298c7a1"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/config/model-registry.ts",
+        "sha256": "60529fec5306da95d08127b014ee7b13e83adf6a5e6ebdfff3df53010fff4f67"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/config/model-preset-registry.ts",
+        "sha256": "0a7f77c3d3a1cdf09db189d22bfefd4129de6adf3dc5cf72a18b6ef0a7b77835"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/auth-storage.ts",
+        "sha256": "a005e9f1d9d3dc515ae04668ab364aef497f7fbce093d12fac97182981240581"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/config/settings.ts",
+        "sha256": "9e31c89d986f2f200ec6fb35dd4d68be9f3f5987d80eead57bf1a9d1d8303f38"
+      }
+    ]
   }
 }

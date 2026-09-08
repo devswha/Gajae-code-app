@@ -12,9 +12,8 @@ import { DESKTOP_NODE_VERSION, desktopPlatform } from './desktop-platforms.mjs';
 import { pruneForeignPrebuilds } from './desktop-prebuilds.mjs';
 import { smokeEnvironment } from './packaged-server-paths.mjs';
 
-const desktop = desktopPlatform();
+let desktop;
 const NODE_VERSION = DESKTOP_NODE_VERSION;
-const NODE_ARCHIVE_SHA256 = desktop.nodeSha256;
 const BUN_VERSION = '1.4.0';
 const NATIVE_MODULES = ['better-sqlite3', 'node-pty'];
 const RUNTIME_DEPENDENCIES = [
@@ -39,7 +38,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..', '..');
 const payloadDir = path.join(rootDir, 'src-tauri', 'resources', 'server-payload');
 const sidecarDir = path.join(rootDir, 'src-tauri', 'binaries');
-const sidecarPath = path.join(sidecarDir, `gajae-app-server-${desktop.target}`);
+let sidecarPath;
 
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -81,13 +80,13 @@ async function sha256(filePath) {
   return crypto.createHash('sha256').update(await fs.readFile(filePath)).digest('hex');
 }
 
-async function copy(relativePath) {
-  await fs.cp(path.join(rootDir, relativePath), path.join(payloadDir, relativePath), { recursive: true });
+async function copy(relativePath, sourceRoot = rootDir, destination = payloadDir) {
+  await fs.cp(path.join(sourceRoot, relativePath), path.join(destination, relativePath), { recursive: true });
 }
 
-async function restrictRuntimeDependencies() {
-  const packagePath = path.join(payloadDir, 'package.json');
-  const lockPath = path.join(payloadDir, 'package-lock.json');
+export async function restrictRuntimeDependencies(directory = payloadDir) {
+  const packagePath = path.join(directory, 'package.json');
+  const lockPath = path.join(directory, 'package-lock.json');
   const packageJson = JSON.parse(await fs.readFile(packagePath, 'utf8'));
   const packageLock = JSON.parse(await fs.readFile(lockPath, 'utf8'));
   const dependencies = {};
@@ -102,7 +101,35 @@ async function restrictRuntimeDependencies() {
   packageJson.dependencies = dependencies;
   delete packageJson.devDependencies;
   delete packageJson.optionalDependencies;
-  packageJson.scripts = {};
+  // Keep exactly the reviewed install hooks; never stage dev/prepare hooks.
+  packageJson.scripts = Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch'].map(name => {
+    const command = packageJson.scripts?.[name];
+    if (typeof command !== 'string' || !command) throw new Error(`Missing required SDK installation script: ${name}`);
+    return [name, command];
+  }));
+  await fs.writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+}
+
+export async function installDesktopPayloadDependencies(payloadNode, npmCli, npmEnvironment, directory = payloadDir, execute = run) {
+  await restrictRuntimeDependencies(directory);
+  await execute(payloadNode, [npmCli, 'install', '--package-lock-only', '--ignore-scripts', '--omit=dev'], { cwd: directory, env: npmEnvironment });
+  await execute(payloadNode, [npmCli, 'ci', '--omit=dev'], { cwd: directory, env: npmEnvironment });
+  // An ignored/failed postinstall must not silently produce an unpatched SDK.
+  // Resolve the CLI from its stage cwd (as npm does), including /var ->
+  // /private/var aliases on macOS; never invoke a checkout-relative fallback.
+  await execute(payloadNode, ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], { cwd: directory, env: npmEnvironment });
+  await execute(payloadNode, [npmCli, 'rebuild', '--omit=dev', '--build-from-source', ...NATIVE_MODULES], { cwd: directory, env: { ...npmEnvironment, npm_config_build_from_source: 'true' } });
+  await execute(payloadNode, [path.join(directory, 'scripts', 'fix-node-pty.js')], { cwd: directory, env: npmEnvironment });
+}
+
+export async function finalizeDesktopPayloadMetadata(directory = payloadDir) {
+  await fs.rm(path.join(directory, 'package-lock.json'), { force: true });
+  await fs.rm(path.join(directory, 'scripts', 'fix-node-pty.js'), { force: true });
+  const packagePath = path.join(directory, 'package.json');
+  const packageJson = JSON.parse(await fs.readFile(packagePath, 'utf8'));
+  // The immutable payload has no lockfile/reinstall entrypoint. Retain the
+  // verifier and evidence, not postinstall hooks pointing at removed tools.
+  packageJson.scripts = { 'check:sdk-patch': packageJson.scripts['check:sdk-patch'] };
   await fs.writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
 }
 
@@ -131,7 +158,7 @@ async function downloadPinnedNode() {
     const chunks = [];
     for await (const chunk of response.body) chunks.push(chunk);
     await fs.writeFile(archive, Buffer.concat(chunks), { mode: 0o600 });
-    if (await sha256(archive) !== NODE_ARCHIVE_SHA256) throw new Error('Pinned Node archive failed SHA-256 verification.');
+    if (await sha256(archive) !== desktop.nodeSha256) throw new Error('Pinned Node archive failed SHA-256 verification.');
     await run('tar', ['-xzf', archive, '-C', payloadDir]);
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
@@ -241,6 +268,7 @@ async function smoke(payloadNode) {
         await fs.mkdir(directory, { recursive: true });
       }
       await fs.symlink(payloadNode, path.join(smokeHome, 'bin', 'node'));
+      await run(payloadNode, ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], { cwd: copyDir, env });
       await run(payloadNode, ['--input-type=module', '--eval', smoke], {
         cwd: copyDir,
         env,
@@ -251,52 +279,68 @@ async function smoke(payloadNode) {
   }, { filter: (source) => source !== buildOnlyNode && !source.startsWith(`${buildOnlyNode}${path.sep}`) });
 }
 
-await required(['dist', 'dist-server', 'shared', 'public', 'package.json', 'package-lock.json', 'server/gjc-runtime-manifest.json', 'scripts/fix-node-pty.js', 'dist-native/gajae-core', 'dist-native/bun', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']);
-await fs.rm(payloadDir, { recursive: true, force: true });
-await fs.mkdir(payloadDir, { recursive: true });
-try {
-  // LICENSE and NOTICE ship with the payload for the same reason the server
-  // tarball carries them: MIT requires the licence text and copyright notice to
-  // travel with every copy, and NOTICE carries the origin attribution this
-  // project keeps voluntarily. The desktop bundle used to omit both while the
-  // tarball included them, so compliance depended on which artifact a user
-  // happened to install.
-  for (const input of ['dist', 'dist-server', 'shared', 'public', 'server/gjc-runtime-manifest.json', 'scripts/fix-node-pty.js', 'scripts/gajae-app-runtime.mjs', 'package.json', 'package-lock.json', 'dist-native', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']) await copy(input);
-  await downloadPinnedNode();
-  const payloadNode = path.join(payloadDir, 'node', 'bin', 'node');
-  if ((await capture(payloadNode, ['--version'])).trim() !== `v${NODE_VERSION}`) throw new Error('Pinned Node runtime version verification failed.');
-  const payloadNodeBin = path.dirname(payloadNode);
-  const npmEnvironment = { ...process.env, PATH: `${payloadNodeBin}:/usr/bin:/bin`, npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false' };
-  const npmCli = path.join(payloadDir, 'node', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  await restrictRuntimeDependencies();
-  await run(payloadNode, [npmCli, 'install', '--package-lock-only', '--ignore-scripts', '--omit=dev'], { cwd: payloadDir, env: npmEnvironment });
-  await run(payloadNode, [npmCli, 'ci', '--omit=dev'], { cwd: payloadDir, env: npmEnvironment });
-  await run(payloadNode, [npmCli, 'rebuild', '--omit=dev', '--build-from-source', ...NATIVE_MODULES], { cwd: payloadDir, env: { ...npmEnvironment, npm_config_build_from_source: 'true' } });
-  await run(payloadNode, [path.join(payloadDir, 'scripts', 'fix-node-pty.js')], { cwd: payloadDir, env: npmEnvironment });
-  await verifyManifest();
-  // Nothing upstream is patched: the packages install normally and are deleted
-  // from this payload (a first-party stub takes the place of any that is
-  // imported at module scope), so a runtime bump re-applies the decision
-  // without anyone remembering to. `npm run check:licenses` is what notices
-  // when the tree grows a new one.
-  console.log(describeDistributionExclusions(await removeExcludedDistributionPackages(fs, path, path.join(payloadDir, 'node_modules'))));
-  if (process.platform === 'linux') {
-    const foreignPrebuilds = await pruneForeignPrebuilds(path.join(payloadDir, 'node_modules'));
-    console.log(`Removed ${foreignPrebuilds.length} incompatible native directories from the Linux payload.`);
-  }
-  const prunedMetadataFiles = await pruneNonRuntimeMetadata(path.join(payloadDir, 'node_modules'))
-    + await pruneNonRuntimeMetadata(path.join(payloadDir, 'dist-server'));
-  const nonAsciiRemoved = process.platform === 'darwin' ? await removeNonAsciiPaths(fs, path, payloadDir) : [];
-  if (nonAsciiRemoved.length) console.log(`Removed non-ASCII bin links that would break the code signature on copy: ${nonAsciiRemoved.join(', ')}`);
-  await codesignNativeClosure(payloadDir);
-  await stageSidecar(payloadNode);
-  await fs.rm(path.join(payloadDir, 'package-lock.json'), { force: true });
-  await fs.rm(path.join(payloadDir, 'scripts', 'fix-node-pty.js'), { force: true });
-  await smoke(sidecarPath);
-  await fs.rm(path.join(payloadDir, 'node'), { recursive: true, force: true });
-  console.log(`Built and verified ${desktop.label} server payload at ${path.relative(rootDir, payloadDir)}; pruned ${prunedMetadataFiles} non-runtime metadata files.`);
-} catch (error) {
-  await fs.rm(payloadDir, { recursive: true, force: true });
-  await fs.rm(sidecarPath, { force: true });
-  throw error;
+export const DESKTOP_PAYLOAD_INPUTS = [
+  'dist', 'dist-server', 'shared', 'public', 'server/gjc-runtime-manifest.json',
+  'scripts/fix-node-pty.js', 'scripts/gajae-app-runtime.mjs', 'scripts/apply-sdk-lifecycle-patch.mjs',
+  'patches/gjc-sdk-lifecycle/manifest.json',
+  'package.json', 'package-lock.json', 'dist-native', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md',
+];
+
+export async function stageDesktopPayloadFiles(sourceRoot = rootDir, directory = payloadDir) {
+  for (const input of DESKTOP_PAYLOAD_INPUTS) await copy(input, sourceRoot, directory);
+  const readme = 'patches/gjc-sdk-lifecycle/README.md';
+  if (await exists(path.join(sourceRoot, readme))) await copy(readme, sourceRoot, directory);
 }
+
+export async function buildDesktopServerPayload() {
+  desktop = desktopPlatform();
+  sidecarPath = path.join(sidecarDir, `gajae-app-server-${desktop.target}`);
+  await required([...DESKTOP_PAYLOAD_INPUTS, 'dist-native/gajae-core', 'dist-native/bun']);
+  await fs.rm(payloadDir, { recursive: true, force: true });
+  await fs.mkdir(payloadDir, { recursive: true });
+  try {
+    // LICENSE and NOTICE ship with the payload for the same reason the server
+    // tarball carries them: MIT requires the licence text and copyright notice to
+    // travel with every copy, and NOTICE carries the origin attribution this
+    // project keeps voluntarily. The desktop bundle used to omit both while the
+    // tarball included them, so compliance depended on which artifact a user
+    // happened to install.
+    await stageDesktopPayloadFiles();
+    await downloadPinnedNode();
+    const payloadNode = path.join(payloadDir, 'node', 'bin', 'node');
+    if ((await capture(payloadNode, ['--version'])).trim() !== `v${NODE_VERSION}`) throw new Error('Pinned Node runtime version verification failed.');
+    const payloadNodeBin = path.dirname(payloadNode);
+    const npmEnvironment = { ...process.env, PATH: `${payloadNodeBin}:/usr/bin:/bin`, npm_config_audit: 'false', npm_config_fund: 'false', npm_config_update_notifier: 'false' };
+    const npmCli = path.join(payloadDir, 'node', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    await installDesktopPayloadDependencies(payloadNode, npmCli, npmEnvironment);
+    await verifyManifest();
+    // Distribution exclusions remain a separate policy from the hash-checked
+    // SDK lifecycle patch. Excluded code is deleted (or replaced by a first-party
+    // stub); the SDK patch does not change this policy or its license gate.
+    console.log(describeDistributionExclusions(await removeExcludedDistributionPackages(fs, path, path.join(payloadDir, 'node_modules'))));
+    if (process.platform === 'linux') {
+      const foreignPrebuilds = await pruneForeignPrebuilds(path.join(payloadDir, 'node_modules'));
+      console.log(`Removed ${foreignPrebuilds.length} incompatible native directories from the Linux payload.`);
+    }
+    const prunedMetadataFiles = await pruneNonRuntimeMetadata(path.join(payloadDir, 'node_modules'))
+      + await pruneNonRuntimeMetadata(path.join(payloadDir, 'dist-server'));
+    const nonAsciiRemoved = process.platform === 'darwin' ? await removeNonAsciiPaths(fs, path, payloadDir) : [];
+    if (nonAsciiRemoved.length) console.log(`Removed non-ASCII bin links that would break the code signature on copy: ${nonAsciiRemoved.join(', ')}`);
+    await codesignNativeClosure(payloadDir);
+    await stageSidecar(payloadNode);
+    await finalizeDesktopPayloadMetadata();
+    await smoke(sidecarPath);
+    await fs.rm(path.join(payloadDir, 'node'), { recursive: true, force: true });
+    console.log(`Built and verified ${desktop.label} server payload at ${path.relative(rootDir, payloadDir)}; pruned ${prunedMetadataFiles} non-runtime metadata files.`);
+  } catch (error) {
+    await fs.rm(payloadDir, { recursive: true, force: true });
+    await fs.rm(sidecarPath, { force: true });
+    throw error;
+  }
+}
+
+// Platform wrappers import this module as their executable implementation.
+// Imports from tests expose staging helpers without downloading/building.
+const entry = process.argv[1] ? await fs.realpath(process.argv[1]).catch(() => null) : null;
+if (['build-desktop-server-payload.mjs', 'build-linux-server-payload.mjs', 'build-macos-server-payload.mjs']
+  .some(name => entry === path.join(__dirname, name))) await buildDesktopServerPayload();

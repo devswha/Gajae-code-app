@@ -56,6 +56,7 @@
     "server/gjc-goal-session.test.ts",
     "server/gjc-goal-protocol.test.ts",
     "server/gjc-permission-policy.test.ts",
+    "server/gjc-runtime-manifest.test.ts",
     "server/gjc-sdk-bridge.test.ts",
     "server/gjc-sdk-client.test.ts",
     "server/gjc-sdk-contract.bun.test.ts",

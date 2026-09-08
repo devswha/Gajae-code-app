@@ -1,5 +1,46 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 2026-09-08 현재: SDK 패치 적용·source 검증·페이지 owner 등록
+
+최신 커밋 `06bbc51`은 Linux 패키지 데이터 보존 검증에서 확인된 종료 순서
+문제를 수정한다. watcher 정리를 기다리기 전에 native job interruption을
+기록한다. 일반 CI, Linux 서버 아카이브와 Linux desktop CI가 모두 통과했다.
+
+이후 작업 트리에는 **아직 커밋하지 않은** 다음 통합이 있다.
+
+- `patches/gjc-sdk-lifecycle/manifest.json`의 8개 파일을 모두 pristine hash와
+  비교한 뒤 적용했다. SDK/core/AI 버전은 0.16.4 그대로다. prewarm, physical
+  prompt/loop/post-prompt, registry 유지보수, auth timeout loser와 설정 저장을
+  실제 Promise 정리까지 추적한다. 생성자/global owner도 adapter에서 관측한다.
+- root와 desktop/server staging의 postinstall이 같은 패치를 적용한다.
+  `check:sdk-patch`, runtime manifest schema 2의 전체 post-hash와 의존성
+  해석 경로 검사가 불완전/다른 SDK를 거부한다. applier의 symlink CLI 경로가
+  검사를 건너뛰던 문제도 회귀 테스트와 함께 수정했다.
+- `VerifiedSdkPatch`는 source 무결성만 증명한다. SDK streaming producer나
+  확장 callback의 아직 표현되지 않은 tail은 `sdk_background_ownership_unproven`
+  으로 남는다. 이를 없애거나 full G3를 통과했다고 선언하지 않는다.
+- App 최상위의 draft owner가 native가 주입한 브리지에 실제 등록된다.
+  토큰·준비 객체·현재 창 수명이 결합되며 오래된 등록/응답은 거부한다.
+  등록은 저장 ACK나 재시작이 아니다. native challenge → draft ACK → backend
+  prepare/commit → 안전 종료 거래와 production previous-owner 증명은 남아 있다.
+
+증거: `/private/tmp/gajae-sdk-integration.v1k0FL/`. 설치된 패치의 lifecycle
+24개와 replay/applier 4개, SDK 계약 101개(선택적 live 1개 제외), manifest/
+SSOT 테스트, 브리지 DOM 합집합 62개와 native bridge Rust 10개가 통과했다.
+`verify-sdk-union.log`도 통과했으며 이후 추가한 nested SDK 해석 검사는 별도
+테스트로 확인했다. 실제 macOS payload도 새로 빌드하여 pristine npm 설치에서
+8개 패치 적용, out-of-tree 재검증, 실제 Bun worker initialize/shutdown 및
+서버 health/종료 smoke를 통과했다(`macos-payload.log`). 이는 ad-hoc native
+payload 검사이며 signed/notarized 앱 교체나 GUI acceptance가 아니다.
+최종 `verify-promotion.log`도 통과했으며 코드/테스트/문서 및 적용 SDK 파일을
+포함한 38개 입력 해시가 검증 전후 동일했다. 이후 이 결과 문단만 갱신했다.
+GJC E2E 8개, browser E2E 3개와 desktop Rust 267개 + binding 10개도 통과했다
+(`gjc-e2e.log`, `browser-e2e.log`, `native-full.log`). 배포 전 native 거래/
+owner 증명과 최종 서명 앱 수용 검증은 여전히 남는다. 현재 설치 앱,
+production key, 공개 release는 바꾸지 않았다.
+
+## 이전 checkpoint
+
 ## 2026-09-08: 작업 소유권·페이지 초안 동결·worker fence 통합
 
 이 절은 `c64d8aa` 이후 소유권 통합 작업의 진행 기록이다.

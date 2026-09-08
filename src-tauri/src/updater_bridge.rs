@@ -517,9 +517,7 @@ pub(crate) fn page_load(webview: &tauri::Webview, payload: &tauri::webview::Page
 fn bridge_script(token: &str, origin: &str) -> String {
     let token = serde_json::to_string(token).expect("token string");
     let origin = serde_json::to_string(origin).expect("origin string");
-    format!(
-        r#"(()=>{{const token={token},origin={origin};const request=async(command)=>{{if(location.origin!==origin)throw Error('updater_unauthorized');const response=await fetch('/api/desktop/update',{{method:'POST',credentials:'same-origin',headers:{{'Content-Type':'application/json','X-Gajae-Update-View':token}},body:JSON.stringify(command)}});const data=await response.json();if(!response.ok)throw Error(data.error||'updater_unavailable');return data;}};Object.defineProperty(window,'__GJC_DESKTOP_UPDATE__',{{configurable:true,value:Object.freeze({{protocolVersion:1,request}})}});window.dispatchEvent(new Event('gajae:desktop-update-ready'));}})();"#
-    )
+    format!("({})({token},{origin});", include_str!("updater_bridge.js"))
 }
 
 #[cfg(test)]

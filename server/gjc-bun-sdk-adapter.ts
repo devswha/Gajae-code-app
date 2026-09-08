@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 
 import { createAgentSession, discoverAuthStorage } from '@gajae-code/coding-agent/sdk/session';
@@ -24,6 +24,7 @@ import type { GjcWorkerOAuthRuntime, GjcWorkerRuntime, GjcWorkerWriter } from '.
 import type { GjcWorkerActivity } from './gjc-worker-protocol.js';
 import { GjcBunAskController } from './gjc-bun-ask-controller.js';
 import { GjcCleanupUnconfirmedError, isGjcCleanupUnconfirmedError } from './gjc-cleanup-error.js';
+import { isVerifiedSdkPatch, type VerifiedSdkPatch } from './gjc-runtime-manifest.js';
 import { GjcDelegationExecutor, GJC_APP_DELEGATION_TOOL_NAMES, serializeGjcDelegationAutomationTools } from './gjc-delegation-executor.js';
 import { createGjcPermissionProvider, type GjcPermissionProvider } from './gjc-bun-permission-gate.js';
 import { forwardPromptTerminal, forwardSdkEvent, normalizeBuiltinCommandStdout, type SdkRunState } from './gjc-bun-sdk-events.js';
@@ -85,6 +86,8 @@ export type GjcAgentSessionFactory = typeof createAgentSession;
 /** The runtime's title generator, narrowed to what the adapter supplies. */
 export type GjcSessionTitleGenerator = (firstMessage: string, registry: ModelRegistry, settings: Settings, model: Model) => Promise<string | null>;
 export type GjcBunSdkAdapterOptions = {
+  /** Source-integrity receipt from bootstrap, never a complete ownership proof. */
+  sdkPatch?: VerifiedSdkPatch;
   createSessionFactory?: GjcAgentSessionFactory;
   generateSessionTitle?: GjcSessionTitleGenerator;
   /** Shorter UI grace for embedders/tests; never extends the ten-second cap. */
@@ -108,8 +111,38 @@ export type GjcSdkActivitySnapshot = Readonly<{
   oauth: GjcOAuthActivitySnapshot;
   /** Coverage only, NOT idle: all counts, including nested OAuth, must be zero. */
   complete: boolean;
-  unknown: readonly ('sdk_background_ownership_unproven' | 'sdk_cleanup_unconfirmed')[];
+  unknown: readonly string[];
+  registry: GjcRegistryActivity;
+  credentials: GjcRegistryActivity;
+  settings: GjcRegistryActivity;
 }>;
+
+type GjcRegistryActivity = {
+  generation: string; complete: boolean; starting: number; queued: number;
+  running: number; settling: number; unknown: readonly string[];
+};
+type GjcRegistryLifecycle = {
+  getAppLifecycleActivity(): GjcRegistryActivity;
+  setAppLifecycleAdmission(closed: boolean): void;
+};
+
+/** Public patched ownership seam only; never inspect SDK private state. */
+function readSdkLifecycleOwner(owner: unknown, unavailableReason: string): GjcRegistryActivity {
+  const unknown = { generation: unavailableReason, complete: false,
+    starting: 0, queued: 0, running: 0, settling: 0, unknown: [unavailableReason] };
+  try {
+    const source = owner as Partial<Pick<GjcRegistryLifecycle, 'getAppLifecycleActivity'>> | undefined;
+    if (typeof source?.getAppLifecycleActivity !== 'function') return unknown;
+    const value = source.getAppLifecycleActivity();
+    if (!value || Object.keys(value).length !== 7 || typeof value.generation !== 'string'
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value.generation)
+      || typeof value.complete !== 'boolean'
+      || [value.starting, value.queued, value.running, value.settling].some((count) => !Number.isSafeInteger(count) || count < 0)
+      || !Array.isArray(value.unknown) || value.unknown.length > 32
+      || value.unknown.some((reason) => typeof reason !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(reason))) return unknown;
+    return { ...value, unknown: [...value.unknown] };
+  } catch { return unknown; }
+}
 
 type ActiveRun = {
   goals?: GjcGoalSession;
@@ -424,17 +457,33 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
   #backgroundTitles = 0;
   #admissionClosed = false;
   #sdkBackgroundOwnershipUnproven = false;
+  #baseSettings?: Settings;
   #cleanupFailure?: GjcCleanupUnconfirmedError;
 
   getGeneration(): string {
-    return `${this.#generation}:${this.#revision}:${this.oauth.getGeneration()}`;
+    // Hash the component generations so adding another real owner cannot exceed
+    // the protocol's bounded identifier size during a long-running worker.
+    return createHash('sha256').update(JSON.stringify([
+      this.#generation, this.#revision, this.oauth.getGeneration(), this.#registryActivity().generation,
+      this.#credentialActivity().generation, this.#settingsActivity().generation,
+    ])).digest('hex');
   }
 
   setAdmissionFence(closed: boolean): void {
     if (this.#admissionClosed === closed) return;
     this.#admissionClosed = closed;
     this.#revision += 1;
+    const registry = this.modelRegistry as ModelRegistry & Partial<GjcRegistryLifecycle>;
+    registry.setAppLifecycleAdmission?.(closed);
   }
+
+  #registryActivity(): GjcRegistryActivity {
+    const registry = this.modelRegistry as ModelRegistry & Partial<GjcRegistryLifecycle>;
+    return readSdkLifecycleOwner(typeof registry.setAppLifecycleAdmission === 'function' ? registry : undefined,
+      'sdk_registry_ownership_unproven');
+  }
+  #credentialActivity(): GjcRegistryActivity { return readSdkLifecycleOwner(this.authStorage, 'sdk_auth_ownership_unproven'); }
+  #settingsActivity(): GjcRegistryActivity { return readSdkLifecycleOwner(this.#baseSettings, 'sdk_settings_ownership_unproven'); }
 
   #assertAdmission(): void {
     this.#assertHealthy();
@@ -447,10 +496,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     return {
       generation: value.generation,
       complete: value.complete,
-      starting: value.starting + value.oauth.starting,
-      queued: 0,
-      running: value.running + value.oauth.running,
-      settling: value.settling + value.operations + value.oauth.settling + value.background,
+      starting: value.starting + value.oauth.starting + value.registry.starting + value.credentials.starting + value.settings.starting,
+      queued: value.registry.queued + value.credentials.queued + value.settings.queued,
+      running: value.running + value.oauth.running + value.registry.running + value.credentials.running + value.settings.running,
+      settling: value.settling + value.operations + value.oauth.settling + value.background + value.registry.settling + value.credentials.settling + value.settings.settling,
       approvals: value.oauth.approvals,
       retained: 0,
       unknown: [...value.unknown],
@@ -460,6 +509,9 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
   /** Fixed-size, credential-free observation. Never polls or disposes the SDK. */
   snapshotActivity(): GjcSdkActivitySnapshot {
     const oauth = this.oauth.snapshotActivity();
+    const registry = this.#registryActivity();
+    const credentials = this.#credentialActivity();
+    const settings = this.#settingsActivity();
     let starting = 0;
     let running = 0;
     let settling = 0;
@@ -471,10 +523,18 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     const unknown: GjcSdkActivitySnapshot['unknown'][number][] = [];
     if (this.#sdkBackgroundOwnershipUnproven) unknown.push('sdk_background_ownership_unproven');
     if (this.#cleanupFailure) unknown.push('sdk_cleanup_unconfirmed');
+    // Ordinary diagnostics describe coverage. A worker admission proof, unlike
+    // those diagnostics, requires the registry's own producer fence to be shut.
+    unknown.push(...registry.unknown.filter((reason) => this.#admissionClosed || reason !== 'model_registry_admission_open'));
+    if (!registry.complete && registry.unknown.length === 0) unknown.push('sdk_registry_ownership_unproven');
+    for (const [value, reason] of [[credentials, 'sdk_auth_ownership_unproven'], [settings, 'sdk_settings_ownership_unproven']] as const) {
+      unknown.push(...value.unknown);
+      if (!value.complete && !value.unknown.length) unknown.push(reason);
+    }
     return {
       generation: this.getGeneration(), revision: this.#revision + oauth.revision,
       starting, running, settling, background: this.#backgroundTitles, operations: this.#operations,
-      oauth, complete: unknown.length === 0, unknown,
+      oauth, registry, credentials, settings, complete: unknown.length === 0, unknown: [...new Set(unknown)],
     };
   }
 
@@ -538,6 +598,8 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     private readonly options: GjcBunSdkAdapterOptions = {},
   ) {
     if (modelRegistry.authStorage !== authStorage) throw new Error(FAILURE);
+    if (options.sdkPatch !== undefined && !isVerifiedSdkPatch(options.sdkPatch)) throw new Error(FAILURE);
+    this.#baseSettings = options.settings;
     const oauth = new GjcBunOAuthController(authStorage, modelRegistry, options.oauth);
     this.oauth = {
       providers: () => oauth.providers(),
@@ -806,6 +868,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
         ?? await Settings.init(
           process.env.GJC_WORKER_AGENT_DIR ? { agentDir: process.env.GJC_WORKER_AGENT_DIR } : {},
         );
+      this.#baseSettings = globalSettings;
       const configuredModelId = config.modelId === 'default'
         ? await configuredDefaultModelIdWithRefresh(
           globalSettings,
@@ -886,13 +949,10 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           delegation.setToolUIContext(askController.uiContext);
         }
         this.#assertHealthy();
-        // SDK 0.16.4's retained disposal joins coordinator handlers, registered
-        // tool cleanups and async-job runners. It does NOT own the detached
-        // Codex credential/prewarm task in sdk/session.ts (4678), nor join a
-        // physical Agent loop abandoned by forceSessionRecovery (14610).
-        // awaitDisposeCompletion is therefore useful cleanup, not complete
-        // session-lifetime proof. Keep unknown until upstream closes those
-        // ownership gaps; never infer it from empty job/message diagnostics.
+        // The app patch retains prewarm/force-recovered work, but source integrity
+        // alone does not prove unrepresented provider tails, reactive callbacks,
+        // shared registry maintenance or all external descendants have settled.
+        // Keep that coverage failure explicit until their real owners are wired.
         if (!this.#sdkBackgroundOwnershipUnproven) {
           this.#sdkBackgroundOwnershipUnproven = true;
           this.#revision += 1;
@@ -1121,7 +1181,7 @@ export async function ensureSdkThemeInitialized(): Promise<void> {
   await initTheme(false);
 }
 
-export async function createGjcBunSdkAdapter(agentDir: string = process.env.GJC_WORKER_AGENT_DIR ?? ''): Promise<GjcBunSdkAdapter> {
+export async function createGjcBunSdkAdapter(agentDir: string = process.env.GJC_WORKER_AGENT_DIR ?? '', sdkPatch?: VerifiedSdkPatch): Promise<GjcBunSdkAdapter> {
   if (!agentDir) throw new Error(FAILURE);
   if (!installGjcCliShim() && !warnedAboutGjcCliShim) {
     warnedAboutGjcCliShim = true;
@@ -1132,14 +1192,16 @@ export async function createGjcBunSdkAdapter(agentDir: string = process.env.GJC_
   // the worker environment. The model can use the injected tools but cannot
   // print or reuse the bridge token through shell commands.
   const automationBridge = takeGjcAutomationBridgeTransport();
-  const [authStorage] = await Promise.all([
+  const [authStorage, , settings] = await Promise.all([
     discoverAuthStorage(agentDir),
     ensureSdkThemeInitialized(),
+    Settings.init({ agentDir }),
   ]);
-  const modelRegistry = new ModelRegistry(authStorage);
+  const modelRegistry = new ModelRegistry(authStorage, undefined, settings, { agentDir });
   await modelRegistry.refresh();
   return new GjcBunSdkAdapter(authStorage, modelRegistry, {
-    loadSettings: () => Settings.init({ agentDir }),
+    sdkPatch,
+    settings,
     ...(automationBridge ? { automationBridge } : {}),
   });
 }

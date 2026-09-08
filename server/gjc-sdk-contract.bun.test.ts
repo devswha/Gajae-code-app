@@ -39,6 +39,7 @@ import {
 import { GjcWorkerHost } from './gjc-worker.js';
 import { GJC_MODEL_UNRESOLVED_CODE, GJC_MODEL_UNRESOLVED_MESSAGE } from './gjc-model-resolution.js';
 import { GJC_CLEANUP_UNCONFIRMED_CODE } from './gjc-cleanup-error.js';
+import { isVerifiedSdkPatch, verifyRuntimeManifest } from './gjc-runtime-manifest.js';
 
 type Listener = (event: unknown) => void;
 type Deferred<T> = { promise: Promise<T>; resolve(value: T): void; reject(error: Error): void };
@@ -256,7 +257,12 @@ async function fixture(
   const sessions: FakeAgentSession[] = [];
   const factoryOptions: Array<Record<string, unknown>> = [];
   const trace: string[] = [];
+  // These objects have no autonomous SDK work. Explicit fixture owners keep
+  // adapter tests honest without treating absent production readers as idle.
+  const idleLeaf = (name: string) => ({ generation: `fixture:${name}`, complete: true,
+    starting: 0, queued: 0, running: 0, settling: 0, unknown: [] as string[] });
   const authStorage = {
+    getAppLifecycleActivity: () => idleLeaf('auth'),
     credentials: [] as Array<{ id: number; provider: string }>,
     /** Providers `peekApiKey` reports a key for (models.yml apiKey/apiKeyEnv, env fallback). */
     resolvableProviders: new Set<string>(),
@@ -272,6 +278,8 @@ async function fixture(
   };
   const models = Array.isArray(modelOrModels) ? modelOrModels : [modelOrModels];
   const modelRegistry = {
+    getAppLifecycleActivity: () => idleLeaf('registry'),
+    setAppLifecycleAdmission: (_closed: boolean) => {},
     authStorage,
     getAll: () => models,
     getAvailable: () => models,
@@ -319,6 +327,7 @@ async function fixture(
     get: (key: string) => overrides.get(key),
   });
   const settings = {
+    getAppLifecycleActivity: () => idleLeaf('settings'),
     getModelRole: () => defaultModel || undefined,
     get: (key: string) => key === 'modelProfile.default' ? modelProfile : undefined,
     cloneForCwd: async () => settingsClone(),
@@ -346,7 +355,7 @@ async function fixture(
     spawns: 'deny',
     bashPolicy: { allowedPrefixes: [] },
   };
-  return { root, adapter, authStorage, modelRegistry, trace, factoryOptions, sessions, frames, host, options, toolPolicyOverrides: overrides, close: () => rm(root, { recursive: true, force: true }) };
+  return { root, adapter, authStorage, modelRegistry, settings, trace, factoryOptions, sessions, frames, host, options, toolPolicyOverrides: overrides, close: () => rm(root, { recursive: true, force: true }) };
 }
 
 function methods(frames: Array<Record<string, unknown>>): string[] { return frames.filter((frame) => frame.kind === 'event').map((frame) => frame.method as string); }
@@ -2949,7 +2958,7 @@ test('adapter admission fences new roots but preserves accepted session startup 
     assert.throws(() => f.adapter.spawnGjc('blocked', { ...f.options, runHandle: 'blocked' }, { send() {} }), { code: 'worker_admission_fenced' });
     assert.throws(() => f.adapter.oauth.start('openai-codex'), { code: 'worker_admission_fenced' });
     await assert.rejects(f.adapter.modelCatalog(), { code: 'worker_admission_fenced' });
-    settingsReady.resolve({ cloneForCwd: async () => ({ override() {}, get() {}, getModelRole() {} }) } as unknown as Settings);
+    settingsReady.resolve(f.settings as unknown as Settings);
     const session = await firstSession(f.sessions);
     await session.promptStarted.promise;
     assert.equal(session.aborted, false, 'fencing does not abort an accepted root during startup');
@@ -3013,10 +3022,36 @@ test('real SDK disposal completion is not broadened into an escaped-background o
       assert.equal(f.adapter.observeActivity().complete, false);
     });
     await f.sessions[0]!.awaitDisposeCompletion();
+    // Stop future maintenance admission, not accepted work; an open registry
+    // deliberately represents its next scheduled refresh as pending startup.
+    f.adapter.setAdmissionFence(true);
     const actual = f.adapter.observeActivity();
     assert.equal(actual.starting + actual.running + actual.settling, 0);
     assert.deepEqual(actual.unknown, ['sdk_background_ownership_unproven']);
     assert.equal(actual.complete, false);
+  } finally { await f.close(); }
+});
+
+test('missing constructor leaf owners remain unknown and real leaf revisions affect the worker proof', async () => {
+  const f = await fixture();
+  try {
+    for (const [owner, reason] of [[f.authStorage, 'sdk_auth_ownership_unproven'],
+      [f.modelRegistry, 'sdk_registry_ownership_unproven'], [f.settings, 'sdk_settings_ownership_unproven']] as const) {
+      const read = owner.getAppLifecycleActivity;
+      const state = { ...read(), generation: 'leaf:idle' };
+      owner.getAppLifecycleActivity = () => ({ ...state, unknown: [...state.unknown] });
+      const before = f.adapter.getGeneration();
+      state.running = 1; state.generation = 'leaf:running';
+      assert.ok(f.adapter.observeActivity().running > 0);
+      assert.notEqual(f.adapter.getGeneration(), before);
+      state.running = 0; state.generation = 'leaf:finished';
+      assert.notEqual(f.adapter.getGeneration(), before, 'an idle/busy/idle cycle cannot reuse the proof');
+      Object.defineProperty(owner, 'getAppLifecycleActivity', { configurable: true, writable: true, value: undefined });
+      assert.ok(f.adapter.observeActivity().unknown.includes(reason));
+      assert.equal(f.adapter.observeActivity().complete, false);
+      owner.getAppLifecycleActivity = read;
+    }
+    assert.equal(f.adapter.observeActivity().complete, true);
   } finally { await f.close(); }
 });
 
@@ -3207,7 +3242,7 @@ test('normal adapter cleanup retains the real SDK owner while an async-job runne
   }
 });
 
-test('pinned SDK Codex prewarm credential task outlives every public session disposal join', { timeout: 10_000 }, async () => {
+test('patched SDK retains Codex prewarm until physical completion while public disposal stays bounded', { timeout: 10_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'gjc-sdk-prewarm-lifetime-'));
   const cwd = join(root, 'project');
   const agentDir = join(root, 'agent');
@@ -3251,13 +3286,18 @@ test('pinned SDK Codex prewarm credential task outlives every public session dis
     await entered.promise;
     await session.waitForIdle();
     await session.awaitSessionSettlement();
-    await session.dispose();
-    await session.awaitDisposeCompletion();
-    assert.equal(session.isDisposed, true);
-    assert.equal(credentialPending, true,
-      'sdk/session.ts launches prewarm without registering its promise with session cleanup');
+    session.setDisposeTimeoutForTests(25);
+    await assert.rejects(session.dispose(), (error) => error instanceof SessionDisposalIncompleteError);
+    let joined = false;
+    const completion = session.awaitDisposeCompletion().then(() => { joined = true; });
+    await Promise.resolve();
+    assert.equal(credentialPending, true);
+    assert.equal(joined, false, 'caller timeout cannot release the retained prewarm owner');
     release.resolve();
     await settled.promise;
+    await completion;
+    assert.equal(session.isDisposed, true);
+    assert.equal(joined, true);
     assert.equal(credentialPending, false);
   } finally {
     release.resolve();
@@ -3266,6 +3306,15 @@ test('pinned SDK Codex prewarm credential task outlives every public session dis
     await registry.dispose(); authStorage.close(); await settings.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('the real patched runtime bootstrap mints only a nonserializable source-integrity receipt', async () => {
+  const proof = await verifyRuntimeManifest();
+  assert.equal(isVerifiedSdkPatch(proof), true);
+  assert.equal(isVerifiedSdkPatch({ ...proof }), false);
+  assert.equal(isVerifiedSdkPatch(JSON.parse(JSON.stringify(proof))), false);
+  // This receipt is deliberately not used to clear unknown streaming/extension
+  // ownership. The actual component observations still decide runtime safety.
 });
 
 test('SDK activity retains cleanup failure as unknown and never clears it on a read', async () => {

@@ -1,16 +1,12 @@
 import { captureComposerProjections, verifyComposerProjectionCoverage } from '../components/chat/utils/composerDraftVerification';
 import { ComposerStorageError } from '../components/chat/utils/composerDraftStorage';
+import type { DesktopDraftFreezeRequest, DesktopDraftReceipt, DesktopDraftFreezeReceipt } from '../../shared/desktopUpdateProtocol';
 
 /** Page-local admission and durability evidence only. This module cannot install,
  * restart, authenticate a native caller, or attest to another window/server. */
-export type ComposerFreezeRequest = { token: string; epoch: number; ttlMs: number };
-export type ComposerDraftReceipt = {
-  routeKey: string; revision: number; generation: number; fileCount: number; queuedIntentCount: number;
-};
-export type ComposerFreezeReceipt = Readonly<{
-  token: string; epoch: number; expiresAt: number; scope: 'page'; installerAuthority: false;
-  drafts: readonly Readonly<ComposerDraftReceipt>[];
-}>;
+export type ComposerFreezeRequest = DesktopDraftFreezeRequest;
+export type ComposerDraftReceipt = DesktopDraftReceipt;
+export type ComposerFreezeReceipt = DesktopDraftFreezeReceipt;
 type Participant = { flushAndVerify(isCurrent: () => boolean): Promise<ComposerDraftReceipt[]>; dispose?(): void };
 export class ComposerFreezeError extends Error {
   constructor(public readonly reason: 'busy' | 'changed' | 'cancelled' | 'timeout' | 'stale' | 'invalid') {
@@ -20,6 +16,7 @@ export class ComposerFreezeError extends Error {
 }
 type Lease = {
   request: ComposerFreezeRequest; expiresAt: number; deadline: number; timer: ReturnType<typeof setTimeout>;
+  source: ComposerFreezeRequest;
   reject(error: unknown): void; cleanup?(): void; receipt?: ComposerFreezeReceipt;
   projections?: ReturnType<typeof captureComposerProjections>;
 };
@@ -47,8 +44,11 @@ function thaw(reason: ComposerFreezeError['reason']) {
 }
 /** Input is never discarded to preserve an ACK. An edit revokes the lease first. */
 export function invalidateComposerFreeze() { thaw('changed'); }
-export function cancelComposerFreeze(request: Pick<ComposerFreezeRequest, 'token' | 'epoch'>): boolean {
+/** A registration may additionally bind cleanup to its exact preparation object,
+ * so a rejected/stale attempt cannot cancel another caller's matching keys. */
+export function cancelComposerFreeze(request: Pick<ComposerFreezeRequest, 'token' | 'epoch'>, source?: ComposerFreezeRequest): boolean {
   if (!lease || lease.request.token !== request.token || lease.request.epoch !== request.epoch) return false;
+  if (source && lease.source !== source) return false;
   thaw('cancelled');
   return true;
 }
@@ -92,6 +92,7 @@ export function prepareComposerFreeze(request: ComposerFreezeRequest): Promise<C
   // Set admission synchronously, before any persistence await or notification.
   return new Promise((resolve, reject) => {
     const current: Lease = {
+      source: request,
       request: { ...request }, expiresAt: Date.now() + request.ttlMs, deadline: performance.now() + request.ttlMs, reject,
       timer: setTimeout(() => { if (lease === current) thaw('timeout'); }, request.ttlMs),
     };

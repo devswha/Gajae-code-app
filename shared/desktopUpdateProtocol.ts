@@ -53,10 +53,29 @@ export function isDesktopUpdateSnapshot(value: unknown): value is DesktopUpdateS
   return value.downloadedBytes === null || value.totalBytes === null || (value.downloadedBytes as number) <= (value.totalBytes as number);
 }
 
+/** Pure page-local draft evidence; none of these fields authorize installation. */
+export type DesktopDraftFreezeRequest = { token: string; epoch: number; ttlMs: number };
+export type DesktopDraftReceipt = {
+  routeKey: string; revision: number; generation: number; fileCount: number; queuedIntentCount: number;
+};
+export type DesktopDraftFreezeReceipt = Readonly<{
+  token: string; epoch: number; expiresAt: number; scope: 'page'; installerAuthority: false;
+  drafts: readonly Readonly<DesktopDraftReceipt>[];
+}>;
+
+/** The injected provider calls these methods in the owning page. isCurrent
+ * receives the actual prepare result object, never a browser-posted copy. */
+export type DesktopDraftOwner = {
+  prepare(request: DesktopDraftFreezeRequest): Promise<DesktopDraftFreezeReceipt>;
+  isCurrent(receipt: DesktopDraftFreezeReceipt): boolean;
+  cancel(request: Pick<DesktopDraftFreezeRequest, 'token' | 'epoch'>): boolean;
+};
+
 /** Supplied only to the current native-owned main document. Presence is not authentication. */
 export type DesktopUpdateBridge = {
   protocolVersion: typeof DESKTOP_UPDATE_PROTOCOL;
   request(command: DesktopUpdateCommand): Promise<DesktopUpdateSnapshot>;
+  registerDraftOwner?(owner: DesktopDraftOwner): () => void;
 };
 
 export type DesktopOwnerActivity = {

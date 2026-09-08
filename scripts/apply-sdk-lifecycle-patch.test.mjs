@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -99,4 +100,21 @@ test('a partially applied known inventory can finish without rewriting verified 
   assert.equal(after.ino, first.ino);
   assert.equal(after.mtimeMs, first.mtimeMs);
   await applySdkLifecyclePatch(f.root, f.manifest, { checkOnly: true });
+});
+
+test('absolute symlink-alias CLI paths execute apply/check instead of silently succeeding', { skip: process.platform === 'win32' }, async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(path.join(f.root, 'scripts'));
+  await fs.mkdir(path.join(f.root, 'patches/gjc-sdk-lifecycle'), { recursive: true });
+  await fs.copyFile(new URL('./apply-sdk-lifecycle-patch.mjs', import.meta.url), path.join(f.root, 'scripts/apply-sdk-lifecycle-patch.mjs'));
+  await fs.writeFile(path.join(f.root, 'patches/gjc-sdk-lifecycle/manifest.json'), JSON.stringify(f.manifest));
+  const alias = path.join(f.root, 'alias'); await fs.symlink(f.root, alias);
+  const entry = path.join(alias, 'scripts/apply-sdk-lifecycle-patch.mjs');
+  const checked = spawnSync(process.execPath, [entry, '--check'], { encoding: 'utf8' });
+  assert.equal(checked.status, 1, checked.stdout + checked.stderr);
+  assert.match(checked.stderr, /not been applied/u);
+  const applied = spawnSync(process.execPath, [entry], { encoding: 'utf8' });
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.match(applied.stdout, /1 applied/u);
+  assert.equal(hash(await fs.readFile(f.source())), f.manifest.files[0].afterSha256);
 });

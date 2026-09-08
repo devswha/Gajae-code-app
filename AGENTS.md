@@ -26,6 +26,11 @@ job projection protocol). `scripts/` holds build/release/verify tooling.
 - Bun **exactly 1.4.0** for `*.bun.test.ts` and `*.dom.bun.test.tsx` files (pinned in
   `scripts/fetch-bun.mjs`): `dist-native/bun` or PATH; fetch with
   `node scripts/fetch-bun.mjs`.
+- `npm ci` applies the app-owned SDK lifecycle patch from
+  `patches/gjc-sdk-lifecycle/manifest.json` through postinstall. Exact SDK/core/AI
+  versions and complete before/after hashes are mandatory. Use
+  `npm run apply:sdk-patch` / `npm run check:sdk-patch`; never hand-edit installed
+  dependency files. Unknown local modifications must fail rather than be replaced.
 - Server binds loopback by default (fail-closed; it can run shell commands).
   `SERVER_PORT` defaults to 3001, Vite dev on 5173. Do not export `SERVER_PORT=0`.
 - Tauri builds choke on `CI=1`: use `env -u CI npm run tauri -- build`.
@@ -156,6 +161,10 @@ is `.ts`/`.tsx`. Routing is react-router-dom 7.
   touching UI styling; do not hardcode palette values.
 - **Bundled runtime manifest**: `server/gjc-runtime-manifest.json` is filled by
   `npm run fill:runtime-manifest` (runs automatically before dev/build:server).
+  Schema 2 includes the native closure and the canonical SDK patch's post-hashes.
+  Worker startup checks both and refuses mismatched/nested dependency instances.
+  A verified SDK patch is source-integrity evidence, not proof of complete SDK
+  quiescence; unrepresented streaming/extension work must still block restart.
 - **Chat tool cards follow the runtime, not Claude**: `src/components/chat/tools/configs/toolConfigs.ts`
   is keyed by the tool's own lowercase name (`bash`, `read`, `edit`, `todo_write`), and
   its accessors read the runtime's parameter schema. `server/gjc-tool-configs.bun.test.ts`

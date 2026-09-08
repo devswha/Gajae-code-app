@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PATCH_ID = 'gjc-sdk-lifecycle-v1';
-const PACKAGES = new Set(['@gajae-code/coding-agent', '@gajae-code/agent-core']);
+const PACKAGES = new Set(['@gajae-code/coding-agent', '@gajae-code/agent-core', '@gajae-code/ai']);
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -128,6 +128,10 @@ async function main() {
   console.log(`Verified ${result.verified} SDK lifecycle patch files (${result.applied} applied).`);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Node canonicalizes import.meta.url while argv can still use /tmp or another
+// symlink alias. A direct --check must never silently become an inert import.
+const invokedFile = process.argv[1]
+  ? await fs.realpath(path.resolve(process.argv[1])).catch(() => null) : null;
+if (invokedFile !== null && invokedFile === await fs.realpath(fileURLToPath(import.meta.url))) {
   main().catch((error) => { console.error(error.message); process.exitCode = 1; });
 }

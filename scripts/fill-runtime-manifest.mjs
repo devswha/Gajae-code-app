@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { applySdkLifecyclePatch } from './apply-sdk-lifecycle-patch.mjs';
+
 const execFile = promisify(execFileCallback);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -117,6 +119,13 @@ async function platformClosure(nativesRoot, platform, foreignRoot) {
 
 const manifestText = await fs.readFile(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
+const sdkPatch = JSON.parse(await fs.readFile(path.join(rootDir, 'patches/gjc-sdk-lifecycle/manifest.json'), 'utf8'));
+await applySdkLifecyclePatch(rootDir, sdkPatch, { checkOnly: true });
+const sdkLifecycle = {
+  id: sdkPatch.id,
+  packages: sdkPatch.packages,
+  files: sdkPatch.files.map(({ package: name, path: filename, afterSha256 }) => ({ package: name, path: filename, sha256: afterSha256 })),
+};
 const nativesRoot = await packageRoot(await nativesEntrypoint(), '@gajae-code/natives');
 const currentPlatform = `${process.platform}-${process.arch}`;
 if (!SUPPORTED_PLATFORMS.has(currentPlatform)) {
@@ -125,13 +134,16 @@ if (!SUPPORTED_PLATFORMS.has(currentPlatform)) {
 const actualCurrentClosure = await platformClosure(nativesRoot, currentPlatform);
 
 if (!update) {
-  if (JSON.stringify(manifest.platforms?.[currentPlatform]) !== JSON.stringify(actualCurrentClosure)) {
+  if (manifest.schemaVersion !== 2 || JSON.stringify(manifest.sdkLifecycle) !== JSON.stringify(sdkLifecycle)
+    || JSON.stringify(manifest.platforms?.[currentPlatform]) !== JSON.stringify(actualCurrentClosure)) {
     console.error(`GJC runtime manifest closure does not match ${currentPlatform}; run npm run fill:runtime-manifest -- --update.`);
     process.exitCode = 1;
   } else {
     console.log(`Verified GJC runtime manifest closure: ${currentPlatform}`);
   }
 } else {
+  manifest.schemaVersion = 2;
+  manifest.sdkLifecycle = sdkLifecycle;
   manifest.platforms ??= {};
   manifest.platforms[currentPlatform] = actualCurrentClosure;
 
