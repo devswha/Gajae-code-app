@@ -9,6 +9,9 @@ import { after, test } from 'node:test';
 
 import type { DesktopOwnerActivity } from '../shared/desktopUpdateProtocol.js';
 
+import { DesktopRestartAuthority, type DesktopRestartAuthorityOptions } from './services/desktop-restart-authority.js';
+import { createDesktopRestartRuntime, DESKTOP_RESTART_REQUIRED_OWNERS } from './services/desktop-restart-runtime.js';
+import { GjcWorkerHost, type GjcWorkerRuntime } from './gjc-worker.js';
 import {
   DEFAULT_INITIALIZE_TIMEOUT_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
@@ -1334,7 +1337,453 @@ function assertDesktopIdle(activity: DesktopOwnerActivity): void {
   }
 }
 
-test('desktop reader is inert, detached from returned snapshots, and bound to the production singleton by default', () => {
+async function restartObservationFixture() {
+  const child = new FakeChild();
+  const peer = new FakePeer(child);
+  let spawns = 0;
+  let reaps = 0;
+  let fenceId: string | null = null;
+  const remote = { generation: 'sdk-1', complete: true, starting: 0, queued: 0, running: 0,
+    settling: 0, approvals: 0, retained: 0, unknown: [] as string[] };
+  let delayed = false;
+  peer.handle((request) => {
+    if (request.method === 'worker.admission') {
+      fenceId = request.payload.closed ? request.payload.fenceId : null;
+      peer.respond(request, { ok: true, result: { fenceId } });
+    } else if (request.method === 'worker.activity') {
+      if (!delayed) peer.respond(request, { ok: true, result: { ...remote, unknown: [...remote.unknown], fenceId } });
+    } else if (request.method === 'worker.initialize' || request.method === 'models.catalog') peer.respond(request);
+  });
+  const supervisor = new GjcWorkerSupervisor({ ...runtime(child),
+    spawn: () => { spawns++; return child; }, killTree: () => { reaps++; } });
+  await supervisor.modelCatalog();
+  return { child, peer, supervisor, remote,
+    delay() { delayed = true; }, counts: () => ({ spawns, reaps }),
+    reply(request: GjcWorkerRequestFrame, observedFence = fenceId) {
+      peer.respond(request, { ok: true, result: { ...remote, unknown: [...remote.unknown], fenceId: observedFence } });
+    },
+  };
+}
+
+/** Real authority + production reader + protocol host; only the SDK/process are fake. */
+async function composedRestartWorkerFixture(options: {
+  holdClose?: boolean;
+  holdRelease?: boolean;
+  clock?: Pick<DesktopRestartAuthorityOptions, 'now' | 'schedule' | 'tokenTtlMs'>;
+} = {}) {
+  const child = new FakeChild(); const peer = new FakePeer(child);
+  const trace: string[] = [];
+  const roots = new Map<string, ReturnType<typeof deferredEnrichment<void>>>();
+  const errors: unknown[] = [];
+  const replies: GjcWorkerResponseFrame[] = [];
+  let sdkRevision = 0;
+  let aborted = 0;
+  let spawned = 0;
+  let reaped = 0;
+  let holdClose = options.holdClose ?? false;
+  let holdRelease = options.holdRelease ?? false;
+  const sdk: GjcWorkerRuntime = {
+    observeActivity: () => ({ generation: `sdk-${sdkRevision}`, complete: true,
+      starting: 0, queued: 0, running: roots.size, settling: 0, approvals: 0, retained: 0, unknown: [] }),
+    setAdmissionFence: (closed) => {
+      trace.push(closed ? 'sdk:close' : 'sdk:release');
+      if (closed) assert.equal(authority.state, 'preparing', 'top-level admission closes before the worker');
+      sdkRevision++;
+    },
+    modelCatalog: async () => ({}),
+    spawnGjc: (_message, input) => {
+      const runId = String(input.runHandle);
+      const done = deferredEnrichment<void>(); roots.set(runId, done); sdkRevision++;
+      return Object.assign(done.promise.finally(() => { roots.delete(runId); sdkRevision++; }), { abortHandle: runId });
+    },
+    abortGjcSession: async () => { aborted++; return false; },
+    resolveGjcToolApproval: () => false,
+  };
+  const host = new GjcWorkerHost({ runtime: async () => sdk, emit(frame) {
+    if (frame.kind === 'response' && frame.method === 'worker.admission' && frame.payload.ok) {
+      const closing = frame.payload.result.fenceId !== null;
+      if (closing ? holdClose : holdRelease) { replies.push(frame); return; }
+    }
+    child.stdout.write(serializeGjcWorkerFrame(frame));
+  } });
+  peer.handle((request) => {
+    trace.push(request.method === 'worker.admission'
+      ? `wire:${request.payload.closed ? 'close' : 'release'}` : `wire:${request.method}`);
+    void host.handle(request).catch((error) => { errors.push(error); });
+  });
+  const supervisor = new GjcWorkerSupervisor({ ...runtime(child),
+    spawn: () => { spawned++; return child; }, killTree: () => { reaped++; } });
+  const reader = createGjcWorkerDesktopRestartReader(supervisor);
+  const ownerReaders = Object.fromEntries(DESKTOP_RESTART_REQUIRED_OWNERS.map((owner) => [owner, {
+    getGeneration: () => 'fixture-idle',
+    read: () => ({ owner, generation: 'fixture-idle', complete: true,
+      starting: 0, queued: 0, running: 0, settling: 0, approvals: 0, retained: 0, unknown: [] }),
+  }]));
+  const readers = { ...ownerReaders, 'gjc-worker': {
+    getGeneration: reader.getGeneration,
+    read: () => { trace.push('owner:read'); return reader.read(); },
+  } };
+  const preparationFence = { owner: 'gjc-worker',
+    close: (id: string) => supervisor.fenceForDesktopRestart(id),
+    release: (id: string) => supervisor.releaseDesktopRestartFence(id),
+  };
+  // Exercise the exact production factory by default. Expiry/deadline tests
+  // inject only authority time; worker transport and its timers remain real.
+  const authority: DesktopRestartAuthority = options.clock
+    ? new DesktopRestartAuthority({ requiredOwners: DESKTOP_RESTART_REQUIRED_OWNERS,
+        ownerReaders: readers, preparationFence, ...options.clock })
+    : createDesktopRestartRuntime(readers, preparationFence);
+  supervisor.configureDesktopRestartAdmission({ acquire: (source) => ({ release: authority.enter(source) }) });
+  await supervisor.modelCatalog();
+  trace.length = 0;
+  const acknowledge = (closed: boolean) => {
+    const index = replies.findIndex((frame) => frame.method === 'worker.admission' && frame.payload.ok
+      && (frame.payload.result.fenceId !== null) === closed);
+    assert.notEqual(index, -1, 'the delayed acknowledgement must exist');
+    child.stdout.write(serializeGjcWorkerFrame(replies.splice(index, 1)[0]!));
+  };
+  return { authority, supervisor, peer, reader, trace, errors, roots,
+    counts: () => ({ spawned, reaped, aborted }),
+    acknowledgeClose: () => acknowledge(true), acknowledgeRelease: () => acknowledge(false),
+    releaseAcknowledgements() { holdClose = false; holdRelease = false; },
+    async close() { for (const root of roots.values()) root.resolve(); await host.close(); },
+  };
+}
+
+function restartCompositionClock() {
+  let now = 0;
+  const timers = new Set<{ at: number; callback: () => void }>();
+  return {
+    options: { now: () => now, tokenTtlMs: 20,
+      schedule(callback: () => void, delay: number) {
+        const timer = { at: now + delay, callback }; timers.add(timer); return () => { timers.delete(timer); };
+      },
+    },
+    advance(milliseconds: number) {
+      now += milliseconds;
+      for (const timer of [...timers]) if (timer.at <= now && timers.delete(timer)) timer.callback();
+    },
+  };
+}
+
+test('production restart composition closes before its first observation and owns cancellation release', async () => {
+  const f = await composedRestartWorkerFixture({ holdClose: true, holdRelease: true });
+  try {
+    const preparedTask = f.authority.prepare({ attemptId: 'composed-1', epoch: 'desktop-1' });
+    assert.equal(f.authority.state, 'preparing');
+    await assert.rejects(f.supervisor.modelCatalog(), { code: 'DESKTOP_RESTART_FENCED' });
+    const close = await f.peer.waitFor('worker.admission');
+    assert.equal(close.payload.closed, true);
+    assert.equal(f.trace.includes('owner:read'), false, 'owner generation is captured only after close settles');
+    f.acknowledgeClose();
+    const prepared = await preparedTask;
+    assert.ok(prepared.ok, JSON.stringify(prepared));
+    const owner = prepared.snapshot.owners.find((value) => value.owner === 'gjc-worker')!;
+    assertDesktopIdle(owner);
+    assert.equal(owner.generation, f.reader.getGeneration(), 'close/observation did not invalidate the first snapshot');
+    assert.ok(f.trace.indexOf('sdk:close') < f.trace.indexOf('owner:read'));
+    const stable = f.reader.getGeneration();
+    assertDesktopIdle(await f.reader.read());
+    assert.equal(f.reader.getGeneration(), stable);
+    f.authority.cancel(prepared.token);
+    await flushEnrichment();
+    const release = f.peer.requests.filter((r) => r.method === 'worker.admission').at(-1)!;
+    assert.equal(release.payload.closed, false);
+    assert.equal(release.payload.fenceId, close.payload.fenceId);
+    const releasing = await f.authority.snapshot();
+    assert.equal(releasing.ingress, 1, 'release acknowledgement retains cleanup ownership');
+    assert.equal((await f.authority.prepare({ attemptId: 'cannot-overtake', epoch: 'desktop-1' })).ok, false);
+    await assert.rejects(f.supervisor.modelCatalog(), { code: 'DESKTOP_RESTART_FENCED' });
+    f.acknowledgeRelease();
+    await flushEnrichment();
+    assert.equal((await f.authority.snapshot()).ingress, 0);
+    await f.supervisor.modelCatalog();
+    assert.deepEqual(f.errors, []);
+    assert.deepEqual(f.counts(), { spawned: 1, reaped: 0, aborted: 0 });
+  } finally { await f.close(); }
+});
+
+test('composed restart expiry releases the same fake-worker fence while cleanup blocks another prepare', async () => {
+  const clock = restartCompositionClock();
+  const f = await composedRestartWorkerFixture({ holdRelease: true, clock: clock.options });
+  try {
+    const prepared = await f.authority.prepare({ attemptId: 'expires', epoch: 'desktop-1' });
+    assert.ok(prepared.ok, JSON.stringify(prepared));
+    clock.advance(20);
+    await flushEnrichment();
+    assert.equal(f.authority.state, 'open');
+    const admissions = f.peer.requests.filter((r) => r.method === 'worker.admission');
+    assert.equal(admissions.length, 2);
+    assert.equal(admissions[0]!.payload.fenceId, admissions[1]!.payload.fenceId);
+    assert.equal(admissions[1]!.payload.closed, false);
+    assert.equal((await f.authority.snapshot()).ingress, 1);
+    const blocked = await f.authority.prepare({ attemptId: 'too-early', epoch: 'desktop-1' });
+    assert.equal(blocked.ok, false);
+    if (!blocked.ok) assert.equal(blocked.code, 'busy');
+    f.acknowledgeRelease(); await flushEnrichment();
+    assert.equal((await f.authority.snapshot()).ingress, 0);
+    f.releaseAcknowledgements();
+    const next = await f.authority.prepare({ attemptId: 'after-expiry', epoch: 'desktop-1' });
+    assert.ok(next.ok, JSON.stringify(next));
+    f.authority.cancel(next.token); await flushEnrichment();
+    await f.supervisor.modelCatalog();
+    assert.deepEqual(f.errors, []);
+    assert.deepEqual(f.counts(), { spawned: 1, reaped: 0, aborted: 0 });
+  } finally { await f.close(); }
+});
+
+for (const reason of ['controller-loss', 'prepare-deadline'] as const) {
+  test(`composed restart ${reason} joins a delayed close before exact release without observing`, async () => {
+    const clock = restartCompositionClock();
+    const f = await composedRestartWorkerFixture({ holdClose: true, holdRelease: true, clock: clock.options });
+    try {
+      const preparedTask = f.authority.prepare({ attemptId: 'interrupted', epoch: 'desktop-1' });
+      const close = await f.peer.waitFor('worker.admission');
+      if (reason === 'controller-loss') f.authority.controllerLost('desktop-1');
+      else clock.advance(5_000);
+      const prepared = await preparedTask;
+      assert.equal(prepared.ok, false);
+      assert.equal(f.trace.includes('owner:read'), false);
+      assert.equal(f.peer.requests.filter((r) => r.method === 'worker.admission').length, 1,
+        'release cannot overtake the unsettled close');
+      const blocked = await f.authority.prepare({ attemptId: 'cannot-overtake', epoch: 'desktop-2' });
+      assert.equal(blocked.ok, false);
+      if (!blocked.ok) assert.equal(blocked.code, 'busy');
+      f.acknowledgeClose(); await flushEnrichment();
+      const release = f.peer.requests.filter((r) => r.method === 'worker.admission').at(-1)!;
+      assert.equal(release.payload.closed, false);
+      assert.equal(release.payload.fenceId, close.payload.fenceId);
+      f.acknowledgeRelease(); await flushEnrichment();
+      assert.equal((await f.authority.snapshot()).ingress, 0);
+      await f.supervisor.modelCatalog();
+      assert.deepEqual(f.errors, []);
+      assert.deepEqual(f.counts(), { spawned: 1, reaped: 0, aborted: 0 });
+    } finally { await f.close(); }
+  });
+}
+
+test('production restart composition refuses an accepted root without sending abort or a remote fence', async () => {
+  const f = await composedRestartWorkerFixture();
+  try {
+    const root = f.supervisor.spawnRun({ runId: 'accepted-root', appSessionId: 'scope', message: 'owned work', writer: { send() {} } });
+    await root.started;
+    const prepared = await f.authority.prepare({ attemptId: 'while-busy', epoch: 'desktop-1' });
+    assert.equal(prepared.ok, false);
+    if (!prepared.ok) assert.equal(prepared.code, 'busy');
+    assert.equal(f.peer.requests.some((r) => r.method === 'worker.admission' || r.method === 'turn.abort'), false);
+    assert.equal(f.supervisor.isActive('accepted-root'), true);
+    f.roots.get('accepted-root')!.resolve(); await root.completion; await flushEnrichment();
+    const next = await f.authority.prepare({ attemptId: 'after-root', epoch: 'desktop-1' });
+    assert.ok(next.ok, JSON.stringify(next));
+    f.authority.cancel(next.token); await flushEnrichment();
+    assert.deepEqual(f.errors, []);
+    assert.deepEqual(f.counts(), { spawned: 1, reaped: 0, aborted: 0 });
+  } finally { await f.close(); }
+});
+
+test('fenced healthy worker certifies idle through the production reader without self-invalidating', async () => {
+  const f = await restartObservationFixture();
+  const reader = createGjcWorkerDesktopRestartReader(f.supervisor);
+  assert.equal((await reader.read()).complete, false, 'an unfenced remote snapshot cannot certify idle');
+  assert.equal(f.peer.requests.filter((r) => r.method === 'worker.activity').length, 1);
+  await f.supervisor.fenceForDesktopRestart('update-1');
+  const generation = reader.getGeneration();
+  assertDesktopIdle(await reader.read());
+  assertDesktopIdle(await reader.read());
+  assert.equal(reader.getGeneration(), generation);
+  assert.equal(f.supervisor.snapshotActivity().retained, 1, 'observation never discards OS ownership');
+  const authority = new DesktopRestartAuthority({ requiredOwners: ['gjc-worker'], ownerReaders: { 'gjc-worker': reader } });
+  const prepared = await authority.prepare({ attemptId: 'update-1', epoch: 'desktop-1' });
+  assert.equal(prepared.ok, true);
+  if (prepared.ok) {
+    const committed = await authority.commit(prepared.token, prepared.epoch);
+    assert.equal(committed.ok, true);
+  }
+  await assert.rejects(f.supervisor.modelCatalog(), { code: 'DESKTOP_RESTART_FENCED' });
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+  await f.supervisor.modelCatalog();
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+});
+
+test('SDK-only idle-busy-idle invalidates the prepared owner even without host events', async () => {
+  const f = await restartObservationFixture();
+  const reader = createGjcWorkerDesktopRestartReader(f.supervisor);
+  await f.supervisor.fenceForDesktopRestart('update-1');
+  const authority = new DesktopRestartAuthority({ requiredOwners: ['gjc-worker'], ownerReaders: { 'gjc-worker': reader } });
+  const prepared = await authority.prepare({ attemptId: 'update-1', epoch: 'desktop-1' });
+  assert.equal(prepared.ok, true);
+  assert.ok(prepared.ok);
+  const generation = reader.getGeneration();
+  // The SDK accepts and settles internal work without emitting a run/OAuth
+  // frame. Zero endpoint counts do not erase the intervening mutations.
+  f.remote.generation = 'sdk-3';
+  assert.equal(reader.getGeneration(), generation, 'no host event announced this remote change');
+  const committed = await authority.commit(prepared.token, prepared.epoch);
+  assert.equal(committed.ok, false, 'a different remote revision must not reuse the prepared proof');
+  assert.notEqual(reader.getGeneration(), generation);
+  const invalidated = reader.getGeneration();
+  assert.ok((await reader.read()).unknown.includes('worker_observation_stale'));
+  assert.equal(reader.getGeneration(), invalidated, 'unchanged observation does not create another mutation');
+  // Do not silently adopt a new baseline (or accept a reverted one) under
+  // the same lease after it was invalidated.
+  f.remote.generation = 'sdk-1';
+  assert.equal((await reader.read()).complete, false);
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+  await f.supervisor.fenceForDesktopRestart('update-2');
+  assertDesktopIdle(await reader.read());
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+  await f.supervisor.releaseDesktopRestartFence('update-2');
+});
+
+test('an SDK revision change while the commit observation is pending cannot certify an idle reply', async () => {
+  const f = await restartObservationFixture();
+  const reader = createGjcWorkerDesktopRestartReader(f.supervisor);
+  await f.supervisor.fenceForDesktopRestart('update-1');
+  const authority = new DesktopRestartAuthority({ requiredOwners: ['gjc-worker'], ownerReaders: { 'gjc-worker': reader } });
+  const prepared = await authority.prepare({ attemptId: 'update-1', epoch: 'desktop-1' });
+  assert.ok(prepared.ok);
+  f.delay();
+  const committed = authority.commit(prepared.token, prepared.epoch);
+  const request = f.peer.requests.filter((r) => r.method === 'worker.activity').at(-1)!;
+  f.remote.generation = 'sdk-3';
+  f.reply(request);
+  assert.equal((await committed).ok, false);
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+});
+
+test('observation timeouts coalesce into one bounded slot and never poison or reap a healthy worker', async () => {
+  const f = await restartObservationFixture();
+  await f.supervisor.fenceForDesktopRestart('update-1');
+  f.delay();
+  const reader = createGjcWorkerDesktopRestartReader(f.supervisor);
+  const generation = reader.getGeneration();
+  const results = await Promise.all(Array.from({ length: 20 }, () => reader.read()));
+  assert.equal(f.peer.requests.filter((r) => r.method === 'worker.activity').length, 1);
+  assert.equal(f.supervisor.snapshotActivity().queued, 0);
+  assert.equal(reader.getGeneration(), generation);
+  for (const result of results) {
+    assert.equal(result.complete, false);
+    assert.ok(result.unknown.includes('worker_observation_unavailable'));
+    assert.equal(result.unknown.includes('worker_request_timeout_unconfirmed'), false);
+  }
+  await reader.read();
+  assert.equal(f.peer.requests.filter((r) => r.method === 'worker.activity').length, 1, 'unanswered reads cannot grow a late-ID cache');
+  f.reply(f.peer.requests.find((r) => r.method === 'worker.activity')!);
+  const fresh = reader.read();
+  f.reply(f.peer.requests.filter((r) => r.method === 'worker.activity')[1]!);
+  assertDesktopIdle(await fresh);
+  assert.equal(reader.getGeneration(), generation);
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+});
+
+test('timed-out admission stays fenced until ordered release without permanently poisoning SDK activity', async () => {
+  const f = await restartObservationFixture();
+  let closeRequest: GjcWorkerRequestFrame | undefined;
+  f.peer.handle((request) => {
+    if (request.method !== 'worker.admission') return;
+    if (request.payload.closed) closeRequest = request;
+    else f.peer.respond(request, { ok: true, result: { fenceId: null } });
+  });
+  await assert.rejects(f.supervisor.fenceForDesktopRestart('update-1'));
+  assert.ok(closeRequest);
+  await assert.rejects(f.supervisor.modelCatalog(), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.equal((await createGjcWorkerDesktopRestartReader(f.supervisor).read()).complete, false);
+  assert.equal(f.supervisor.snapshotActivity().unknown.includes('worker_request_timeout_unconfirmed'), false);
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+  f.peer.respond(closeRequest, { ok: true, result: { fenceId: 'update-1' } });
+  f.peer.handle((request) => f.peer.respond(request));
+  await f.supervisor.modelCatalog();
+  assert.equal(f.supervisor.snapshotActivity().unknown.includes('worker_request_timeout_unconfirmed'), false);
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+});
+
+test('worker-side titles, OAuth unwind and SDK unknowns are not replaced by empty parent maps', async () => {
+  const f = await restartObservationFixture();
+  await f.supervisor.fenceForDesktopRestart('update-1');
+  f.remote.settling = 2;
+  f.remote.complete = false;
+  f.remote.unknown = ['sdk_background_ownership_unproven'];
+  const result = await createGjcWorkerDesktopRestartReader(f.supervisor).read();
+  assert.equal(result.complete, false);
+  assert.equal(result.settling, 2);
+  assert.deepEqual(result.unknown, ['sdk_background_ownership_unproven']);
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+});
+
+test('a released or mismatched fence cannot reuse an in-flight worker idle snapshot', async () => {
+  const f = await restartObservationFixture();
+  await f.supervisor.fenceForDesktopRestart('update-1');
+  f.delay();
+  const reader = createGjcWorkerDesktopRestartReader(f.supervisor);
+  const pending = reader.read();
+  const observation = f.peer.requests.find((r) => r.method === 'worker.activity')!;
+  await assert.rejects(f.supervisor.releaseDesktopRestartFence('other-update'));
+  await f.supervisor.releaseDesktopRestartFence('update-1');
+  f.reply(observation, 'update-1');
+  const result = await pending;
+  assert.equal(result.complete, false);
+  assert.ok(result.unknown.includes('worker_observation_stale'));
+  assert.notEqual(result.generation, reader.getGeneration());
+  assert.deepEqual(f.counts(), { spawns: 1, reaps: 0 });
+});
+
+test('cold worker fencing and observation never spawn and optional root admission is releasable', async () => {
+  let spawns = 0;
+  const child = new FakeChild();
+  const peer = new FakePeer(child);
+  peer.handle((request) => peer.respond(request));
+  const supervisor = new GjcWorkerSupervisor({ ...runtime(child), spawn: () => { spawns++; return child; } });
+  const reader = createGjcWorkerDesktopRestartReader(supervisor);
+  await supervisor.fenceForDesktopRestart('cold-fence');
+  assertDesktopIdle(await reader.read());
+  await assert.rejects(supervisor.oauthStart('openai-codex'), { code: 'DESKTOP_RESTART_FENCED' });
+  await assert.rejects(supervisor.oauthSubmit('not-owned', 'input'));
+  assert.equal(spawns, 0);
+  assert.equal(peer.requests.length, 0);
+  await supervisor.releaseDesktopRestartFence('cold-fence');
+  let leases = 0;
+  let open = false;
+  supervisor.configureDesktopRestartAdmission({ acquire(source) {
+    assert.equal(source, 'gjc-worker:models.catalog');
+    if (!open) throw Object.assign(new Error('fenced'), { code: 'DESKTOP_RESTART_FENCED' });
+    leases++;
+    return { release() { leases--; } };
+  } });
+  await assert.rejects(supervisor.modelCatalog(), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.equal(spawns, 0);
+  open = true;
+  await supervisor.modelCatalog();
+  assert.equal(spawns, 1);
+  assert.equal(leases, 0);
+});
+
+test('fencing during accepted enrichment leaves that root owned and rejects new roots without abort', async () => {
+  const child = new FakeChild(); const peer = new FakePeer(child);
+  const enriched = deferredEnrichment<Record<string, unknown>>();
+  let entered = false;
+  const supervisor = new GjcWorkerSupervisor({ ...runtime(child), enrichOptions: async () => { entered = true; return enriched.promise; } });
+  const accepted = supervisor.spawnRun({ runId: 'accepted', appSessionId: 'scope', message: 'existing', writer: { send() {} } });
+  peer.respond(await peer.waitFor('worker.initialize'));
+  await flushEnrichment();
+  assert.equal(entered, true);
+  await assert.rejects(supervisor.fenceForDesktopRestart('update-1'), /accepted work/);
+  const blocked = supervisor.spawnRun({ runId: 'blocked', appSessionId: 'scope', message: 'new', writer: { send() {} } });
+  await assert.rejects(blocked.started, { code: 'DESKTOP_RESTART_FENCED' });
+  assert.equal(await blocked.outcome, 'not_started');
+  assert.equal(peer.requests.some((r) => r.method === 'worker.admission' || r.method === 'turn.abort'), false);
+  enriched.resolve({});
+  const start = await peer.waitFor('session.start');
+  assert.equal(start.id, 'accepted');
+  peer.respond(start);
+  await accepted.completion;
+  await supervisor.releaseDesktopRestartFence('update-1');
+  assert.equal(child.killed, false);
+});
+
+test('desktop reader is inert, detached from returned snapshots, and bound to the production singleton by default', async () => {
   let spawns = 0;
   let reaps = 0;
   const child = new FakeChild();
@@ -1345,15 +1794,15 @@ test('desktop reader is inert, detached from returned snapshots, and bound to th
   });
   const reader = createGjcWorkerDesktopRestartReader(supervisor);
   const generation = reader.getGeneration();
-  const first = reader.read();
+  const first = await reader.read();
   assertDesktopIdle(first);
   assert.equal(first.generation, generation);
   (first.unknown as string[]).push('caller_mutation');
   first.queued = 100;
-  assertDesktopIdle(reader.read());
+  assertDesktopIdle(await reader.read());
   assert.equal(reader.getGeneration(), generation);
   assert.notEqual(new GjcWorkerSupervisor().getGeneration(), generation);
-  assert.deepEqual(createGjcWorkerDesktopRestartReader().read(), getGjcWorkerSupervisor().snapshotActivity());
+  assert.deepEqual(await createGjcWorkerDesktopRestartReader().read(), getGjcWorkerSupervisor().snapshotActivity());
   assert.equal(spawns, 0);
   assert.equal(reaps, 0);
   assert.equal(child.killed, false);
@@ -1372,22 +1821,22 @@ test('desktop startup is owned inside spawn and request settlement retains its a
   assert.ok(insideSpawn.starting > 0);
   assert.ok(insideSpawn.settling > 0);
   assert.notEqual(insideSpawn.generation, cold);
-  const initializing = reader.read();
+  const initializing = supervisor.snapshotActivity();
   assert.equal(initializing.complete, false);
   assert.deepEqual(initializing.unknown, ['worker_runtime_unaccounted']);
   peer.respond(await peer.waitFor('worker.initialize'));
   const request = await peer.waitFor('models.catalog');
-  const pending = reader.read();
+  const pending = supervisor.snapshotActivity();
   assert.equal(pending.queued, 1);
   assert.equal(pending.starting, 0);
   assert.notEqual(pending.generation, initializing.generation);
   peer.respond(request);
-  const acknowledged = reader.read();
+  const acknowledged = supervisor.snapshotActivity();
   assert.equal(acknowledged.queued, 0);
   assert.ok(acknowledged.settling > 0, 'response acknowledgement cannot drop its continuation');
   assert.notEqual(acknowledged.generation, pending.generation);
   await catalog;
-  const retained = reader.read();
+  const retained = supervisor.snapshotActivity();
   assert.equal(retained.settling, 0);
   assert.equal(retained.retained, 1);
   assert.equal(retained.complete, false, 'an empty parent request map is not SDK idle proof');
@@ -1416,26 +1865,26 @@ test('desktop reader tracks registered, issued and terminal run mutations withou
   const reader = createGjcWorkerDesktopRestartReader(supervisor);
   const cold = reader.getGeneration();
   const run = spawn(supervisor, 'private-prompt-never-in-snapshot', {}, { send() {} });
-  const registered = reader.read();
+  const registered = supervisor.snapshotActivity();
   assert.ok(registered.starting >= 2, 'registered run plus worker startup');
   assert.notEqual(registered.generation, cold);
   peer.respond(await peer.waitFor('worker.initialize'));
   const start = await peer.waitFor('session.start');
-  const issued = reader.read();
+  const issued = supervisor.snapshotActivity();
   assert.equal(issued.starting, 0);
   assert.equal(issued.running, 1);
   assert.equal(issued.queued, 1);
   assert.notEqual(issued.generation, registered.generation);
   peer.event('app-session-1', start.id, 'turn.completed', { message: { kind: 'complete' } });
-  const terminalEvent = reader.read();
+  const terminalEvent = supervisor.snapshotActivity();
   assert.equal(terminalEvent.running, 1, 'UI terminal does not retire the request/run owner');
   assert.notEqual(terminalEvent.generation, issued.generation);
   peer.respond(start);
-  assert.equal(reader.read().queued, 0);
-  assert.equal(reader.read().running, 1, 'run finalization is still queued after acknowledgement');
+  assert.equal(supervisor.snapshotActivity().queued, 0);
+  assert.equal(supervisor.snapshotActivity().running, 1, 'run finalization is still queued after acknowledgement');
   await run;
   await new Promise((resolve) => setImmediate(resolve));
-  const finished = reader.read();
+  const finished = supervisor.snapshotActivity();
   assert.equal(finished.running, 0);
   assert.equal(finished.settling, 0);
   assert.deepEqual(finished.unknown, ['worker_runtime_unaccounted']);
@@ -1667,8 +2116,8 @@ test('successful option enrichment from a cancelled run cannot seize its reused 
     assert.equal(supervisor.isActive(replacement.abortHandle), true);
     nextOptions.resolve({ modelId: 'current-model' });
     const start = await peer.waitFor('session.start');
-    assert.equal(start.payload.message, 'replacement message');
-    assert.equal((start.payload.options as Record<string, unknown>).modelId, 'current-model');
+    assert.equal((start.payload as JsonObject).message, 'replacement message');
+    assert.equal(((start.payload as JsonObject).options as Record<string, unknown>).modelId, 'current-model');
     await replacement.started;
     peer.respond(start);
     await replacement.completion;

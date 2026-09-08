@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { ChangeEvent, ClipboardEvent, Dispatch, FormEvent, KeyboardEvent, MouseEvent, MutableRefObject, RefObject, SetStateAction, TouchEvent } from 'react';
 import { useDropzone } from 'react-dropzone';
+import type { DropEvent } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
 
 import { useAppShellStore } from '../../../stores/useAppShellStore';
 import { usePaletteOps } from '../../../stores/usePaletteOpsStore';
+import { beginComposerOperation, finishComposerOperation, invalidateComposerFreeze, isComposerFrozen, subscribeComposerFreeze } from '../../../shared/composerFreeze';
 import type { MarkSessionProcessing } from '../../../hooks/useSessionProtection';
 import type { ChatMessage, PendingPermissionRequest, PermissionDecision, SessionEstablishedContext  } from '../types/types';
 import type { LLMProvider, Project, ProjectSession, ProviderModelsCacheInfo } from '../../../types/app';
@@ -16,11 +18,12 @@ import { permissionResponseMessage } from '../utils/chatPermissions';
 import { draftKeysToClear, readQueuedMessages, reorderQueue, safeLocalStorage, type QueuedSendOptions } from '../utils/chatStorage';
 import type { ComposerDraftRepository, ComposerRoute, DurableQueuedDraft } from '../utils/composerDraftStorage';
 import { decideQueueFlush } from '../utils/queueFlush';
+import { chooseComposerAttachments, composerFilesFromEvent } from '../utils/composerAttachmentIntake';
 
 import { useFileMentions } from './useFileMentions';
 import { useSlashCommands } from './useSlashCommands';
 import { useWorkspaceTarget, type WorkspaceCandidate } from './useWorkspaceTarget';
-import { newQueuedDraftId, useDurableComposerDraft } from './useDurableComposerDraft';
+import { newQueuedDraftId, settleRetainedComposerSteer, useDurableComposerDraft } from './useDurableComposerDraft';
 
 interface UseChatComposerStateArgs { draftRepository?: ComposerDraftRepository; executionCwd?: string | null; selectedProject: Project | null; selectedSession: ProjectSession | null; currentSessionId: string | null; gjcModel: string; reasoningEffort?: string; isLoading: boolean; canAbortSession: boolean; tokenBudget: Record<string, unknown> | null; sendMessage: (message: unknown) => boolean | void; sendByCtrlEnter?: boolean; onSessionProcessing?: MarkSessionProcessing; onSessionEstablished?: (sessionId: string, context: SessionEstablishedContext) => void; onInputFocusChange?: (focused: boolean) => void; onCommandGateChange?: (gate: PendingCommandGate | null) => void; onShowSettings?: () => void; onLogin?: (providerId?: string) => void; scrollToBottom: () => void; addMessage: (msg: ChatMessage) => void; setIsUserScrolledUp: (isScrolledUp: boolean) => void; setPendingPermissionRequests: Dispatch<SetStateAction<PendingPermissionRequest[]>>; }
 interface MentionableFile { name: string; path: string; }
@@ -46,6 +49,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   const projectId = selectedProject?.projectId;
   const conversation = selectedSession?.id || currentSessionId || null;
   const drafts = useDurableComposerDraft(projectId, conversation, args.draftRepository);
+  const composerFrozen = useSyncExternalStore(subscribeComposerFreeze, isComposerFrozen, () => false);
   const { input, setInput, images: attachedImages, setImages: setAttachedImages, queue: queuedDrafts, setQueue: setQueuedDrafts, getQueue: restoreQueue, updateQueue, persistence: draftPersistence, ready: draftReady, retryPersistence: retryDraftPersistence } = drafts;
   const [uploadingImages, setUploadingImages] = useState<Map<string, number>>(new Map());
   const [imageErrors, setImageErrors] = useState<Map<string, string>>(new Map());
@@ -108,6 +112,11 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
 
   const eraseDraft = useCallback((settled?: string | null) => { if (projectId) draftKeysToClear(projectId, conversation, settled).forEach((key) => safeLocalStorage.removeItem(key)); }, [conversation, projectId]);
   const announceGate = useCallback((gate: PendingCommandGate | null) => { gateRef.current = gate; setGateState(gate); onCommandGateChange?.(gate); }, [onCommandGateChange]);
+  // The pending command stays in the durable input. Editing it revokes the old
+  // confirmation instead of retaining a second, volatile send intent.
+  useEffect(() => {
+    if (gateRef.current && input.trimEnd() !== gateRef.current.text) announceGate(null);
+  }, [announceGate, input]);
   useEffect(() => {
     setUploadingImages(new Map());
     setImageErrors(new Map());
@@ -155,6 +164,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
 
   const handleSubmit = useCallback(async (event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>, queued?: QueuedDraft) => {
     event.preventDefault(); const text = queued?.content ?? inputRef.current; if (!text.trim() || !selectedProject) return;
+    if (isComposerFrozen()) return;
     if (!draftReady) {
       if (draftPersistence.phase === 'error') {
         const owner = submissionOwner.current;
@@ -168,9 +178,11 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     const signIn = /^\/login(?:\s+(.*))?$/.exec(text.trim()); if (signIn) { login(signIn[1]?.trim() || undefined); resetCommandMenuState(); return; }
     if (isLoading) { queueOwner.current = composerOwner; setQueuedDrafts((q) => [...q, { id: newQueuedDraftId(), content: text, images: files, options: sendOptions }]); clearComposer(); eraseDraft(); return; }
     const candidate = text.trimEnd(); const help = candidate.trim().toLowerCase() === 'help';
-    if (candidate.startsWith('/') || help) { const gap = candidate.indexOf(' '); const name = help ? '/help' : gap > 0 ? candidate.slice(0, gap) : candidate; const commandArgs = gap > 0 ? candidate.slice(gap).trim() : ''; const app = findAppUiCommand(resolveCommandAlias(name)); if (app && (app.interceptWithArgs !== false || !commandArgs)) { clearComposer(); applyAppCommand(app); return; } const notice = getLocalCommandNotice(name, commandArgs); if (notice) { clearComposer(); addMessage({ type: 'assistant', content: notice, timestamp: Date.now() }); return; } if (!bypassGate.current) { const gate = gateForCommand(resolveCommandAlias(name), commandArgs); if (gate) { clearComposer(); announceGate({ ...gate, text: candidate }); return; } } bypassGate.current = false; }
+    if (candidate.startsWith('/') || help) { const gap = candidate.indexOf(' '); const name = help ? '/help' : gap > 0 ? candidate.slice(0, gap) : candidate; const commandArgs = gap > 0 ? candidate.slice(gap).trim() : ''; const app = findAppUiCommand(resolveCommandAlias(name)); if (app && (app.interceptWithArgs !== false || !commandArgs)) { clearComposer(); applyAppCommand(app); return; } const notice = getLocalCommandNotice(name, commandArgs); if (notice) { clearComposer(); addMessage({ type: 'assistant', content: notice, timestamp: Date.now() }); return; } if (!bypassGate.current) { const gate = gateForCommand(resolveCommandAlias(name), commandArgs); if (gate) { announceGate({ ...gate, text: candidate }); return; } } bypassGate.current = false; }
     const owner = submissionOwner.current;
     if (!owner || submissionInFlight.current === owner) return;
+    const finishOperation = beginComposerOperation('send');
+    if (!finishOperation) return;
     submissionInFlight.current = owner;
     const isCurrent = () => submissionOwner.current === owner;
     try {
@@ -205,6 +217,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
       if (inputRef.current === text && liveImages.current === files) { clearComposer(); eraseDraft(id); }
     } finally {
       if (submissionInFlight.current === owner) submissionInFlight.current = null;
+      finishOperation();
     }
   }, [addMessage, allocate, announceGate, applyAppCommand, attachedImages, clearComposer, composerOwner, draftPersistence.phase, draftReady, eraseDraft, isLoading, login, onSessionEstablished, onSessionProcessing, optionsFor, resetCommandMenuState, retryDraftPersistence, scrollToBottom, selectedProject, selectedSession, sendMessage, setIsUserScrolledUp, setQueuedDrafts, t, upload]);
   useEffect(() => { submitRef.current = handleSubmit; }, [handleSubmit]);
@@ -214,11 +227,16 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     const text = inputRef.current;
     const id = selectedSession?.id || currentSessionId || null;
     if (!draftReady || !isLoading || !text.trim() || !selectedProject || !id || attachedImages.length || !isAutoSendable(classifyCommandInput(text))) return;
-    if (sendMessage({ type: 'chat.steer', sessionId: id, content: text }) === false) {
+    const draft: QueuedDraft = { id: `steer_${crypto.randomUUID()}`, content: text, images: [], options: optionsFor(text), pendingSteer: true };
+    const finishOperation = beginComposerOperation('steer', draft.id);
+    if (!finishOperation) return;
+    let sent: boolean | void;
+    try { sent = sendMessage({ type: 'chat.steer', sessionId: id, content: text }); } catch (error) { finishOperation(); throw error; }
+    if (sent === false) {
+      finishOperation();
       addMessage({ type: 'error', content: 'Connection lost. Your draft has been kept; retry when connected.', timestamp: new Date() });
       return;
     }
-    const draft: QueuedDraft = { id: `steer_${Date.now()}_${Math.random().toString(36).slice(2)}`, content: text, images: [], options: optionsFor(text), pendingSteer: true };
     // A missing reply does not mean rejection. Persist the unresolved claim so
     // neither a later turn nor a remount can send the same instruction again.
     const key = steerKey(id, text);
@@ -237,7 +255,12 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     const route = { projectId: projectId ?? '', conversation: sessionId };
     const restored = sessionId === conversation ? restoreQueue(route).find((draft) => draft.pendingSteer && draft.content === content) : undefined;
     const pending = list?.shift() ?? (restored ? { draft: restored, route } : undefined);
-    if (!pending) return;
+    if (!pending) {
+      const orphan = settleRetainedComposerSteer(sessionId, content, accepted);
+      if (orphan?.id) finishComposerOperation(orphan.id);
+      if (orphan && accepted) onSessionProcessing?.(sessionId, { statusText: null, canInterrupt: true });
+      return;
+    }
     if (!list?.length) steerWaiting.current.delete(key);
     const settle = (queue: QueuedDraft[]) => accepted
       ? queue.filter((item) => item.id !== pending.draft.id)
@@ -251,6 +274,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     } else {
       updateQueue(pending.route, settle);
     }
+    if (pending.draft.id) finishComposerOperation(pending.draft.id);
     if (accepted) onSessionProcessing?.(sessionId, { statusText: null, canInterrupt: true });
   }, [addMessage, conversation, onSessionProcessing, projectId, restoreQueue, scrollToBottom, setQueuedDrafts, updateQueue]);
 
@@ -263,8 +287,9 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     if (isLoading || switched) { queueInFlight.current = false; if (dispatchTimer.current) clearTimeout(dispatchTimer.current); }
     const head = queuedDrafts[0];
     const verdict = decideQueueFlush({ sessionSwitched: switched, isLoading, wasLoading: wasBusy, queueLength: queuedDrafts.length, awaitingDispatchedTurn: queueInFlight.current, composerHasInput: Boolean(input.trim()) || attachedImages.length > 0, headAwaitingSteer: Boolean(head?.pendingSteer || head?.requiresReview) });
-    if (!draftReady || draftPersistence.phase === 'error' || verdict.action !== 'flush' || !head) return;
+    if (composerFrozen || !draftReady || draftPersistence.phase === 'error' || verdict.action !== 'flush' || !head) return;
     const timer = setTimeout(() => {
+      if (isComposerFrozen()) return;
       // Only legacy text-only queues can be consumed by the offscreen sender.
       // Never hydrate a File-bearing intent from that lossy projection.
       const disk = conversation ? readQueuedMessages(conversation) : [];
@@ -272,6 +297,8 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
         setQueuedDrafts(disk.map((item) => ({ ...item, images: [] })));
         return;
       }
+      const finishOperation = beginComposerOperation('queue-dispatch');
+      if (!finishOperation) return;
       queueInFlight.current = true;
       if (dispatchTimer.current) clearTimeout(dispatchTimer.current);
       dispatchTimer.current = setTimeout(() => { queueInFlight.current = false; setQueuePulse((n) => n + 1); }, TURN_START_GRACE);
@@ -279,22 +306,55 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
       setInput(head.content);
       inputRef.current = head.content;
       setAttachedImages(head.images);
-      setTimeout(() => { if (queueOwner.current === composerOwner) void submitRef.current?.(syntheticSubmit(), head); }, 0);
+      setTimeout(() => {
+        try { if (queueOwner.current === composerOwner) void submitRef.current?.(syntheticSubmit(), head); }
+        finally { finishOperation(); }
+      }, 0);
     }, verdict.delayMs);
     return () => clearTimeout(timer);
-  }, [attachedImages.length, composerOwner, conversation, draftPersistence.phase, draftReady, input, isLoading, queuePulse, queuedDrafts, setAttachedImages, setInput, setQueuedDrafts]);
+  }, [attachedImages.length, composerFrozen, composerOwner, conversation, draftPersistence.phase, draftReady, input, isLoading, queuePulse, queuedDrafts, setAttachedImages, setInput, setQueuedDrafts]);
   useEffect(() => () => { queueOwner.current = ''; submitRef.current = null; if (dispatchTimer.current) clearTimeout(dispatchTimer.current); }, []);
 
   const resize = useCallback((target: HTMLTextAreaElement) => { target.style.height = 'auto'; const height = Math.max(22, target.scrollHeight); target.style.height = `${height}px`; if (!lineHeight.current) { const parsed = parseInt(window.getComputedStyle(target).lineHeight); lineHeight.current = Number.isFinite(parsed) ? parsed : 24; } setExpanded(height > lineHeight.current * 2); resized.current = target.value; }, []);
   useEffect(() => { if (textareaRef.current && resized.current !== input) resize(textareaRef.current); }, [input, resize]);
   const handleImageFiles = useCallback((files: File[]) => { const accepted = files.filter((file) => { try { if (!file || typeof file !== 'object') { console.warn('Invalid file object:', file); return false; } if (!file.type?.startsWith('image/')) return false; if (!file.size || file.size > 5 * 1024 * 1024) { setImageErrors((old) => new Map(old).set(file.name || 'Unknown file', 'File too large (max 5MB)')); return false; } return true; } catch (error) { console.error('Error validating file:', error, file); return false; } }); if (accepted.length) setAttachedImages((old) => [...old, ...accepted].slice(0, 5)); }, [setAttachedImages]);
-  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({ accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'] }, maxSize: 5 * 1024 * 1024, maxFiles: 5, onDrop: handleImageFiles, noClick: true, noKeyboard: true });
+  const attachmentError = (error: Error) => {
+    if (queueOwner.current === composerOwner && submissionOwner.current) setImageErrors((old) => new Map(old).set('attachment', error.message));
+  };
+  const acceptSelectedImages = (files: File[]) => {
+    const accepted = files.filter((file) => file.type.startsWith('image/') && file.size > 0 && file.size <= 5 * 1024 * 1024);
+    if (accepted.length > 5) { attachmentError(new Error('At most 5 images can be attached at once.')); return; }
+    handleImageFiles(accepted);
+  };
+  const getFilesFromEvent = async (event: DropEvent) => {
+    if (!Array.isArray(event) && event.type !== 'drop' && event.type !== 'change') return composerFilesFromEvent(event);
+    // Dropped/pasted input revokes a freeze rather than discarding the Files.
+    invalidateComposerFreeze();
+    const finish = beginComposerOperation('attachment');
+    if (!finish) return [];
+    try {
+      const files = (await composerFilesFromEvent(event)).filter((file): file is File => file instanceof File);
+      acceptSelectedImages(files);
+      return files;
+    } finally { finish(); }
+  };
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({ accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'] }, maxSize: 5 * 1024 * 1024, maxFiles: 5, getFilesFromEvent, onError: attachmentError, noClick: true, noKeyboard: true });
+  const open = () => chooseComposerAttachments(acceptSelectedImages, attachmentError);
   const handleInputChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => { const value = event.target.value; const position = event.target.selectionStart; setInput(value); inputRef.current = value; setCursorPosition(position); if (!value.trim()) { event.target.style.height = 'auto'; setExpanded(false); resetCommandMenuState(); } else handleCommandInputChange(value, position); }, [handleCommandInputChange, resetCommandMenuState, setCursorPosition, setInput]);
   const handlePaste = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => { const items = Array.from(event.clipboardData.items); items.forEach((item) => { if (item.type.startsWith('image/')) { const file = item.getAsFile(); if (file) handleImageFiles([file]); } }); if (!items.length && event.clipboardData.files.length) handleImageFiles(Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/'))); }, [handleImageFiles]);
   const syncInputOverlayScroll = useCallback((target: HTMLTextAreaElement) => { if (inputHighlightRef.current) { inputHighlightRef.current.scrollTop = target.scrollTop; inputHighlightRef.current.scrollLeft = target.scrollLeft; } }, []);
   const handleTextareaInput = useCallback((event: FormEvent<HTMLTextAreaElement>) => { resize(event.currentTarget); setCursorPosition(event.currentTarget.selectionStart); syncInputOverlayScroll(event.currentTarget); }, [resize, setCursorPosition, syncInputOverlayScroll]);
   const handleKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => { if (handleCommandMenuKeyDown(event) || handleFileMentionsKeyDown(event) || event.key !== 'Enter' || event.nativeEvent.isComposing) return; if ((event.ctrlKey || event.metaKey) && !event.shiftKey || (!event.shiftKey && !event.ctrlKey && !event.metaKey && !sendByCtrlEnter)) { event.preventDefault(); void handleSubmit(event); } }, [handleCommandMenuKeyDown, handleFileMentionsKeyDown, handleSubmit, sendByCtrlEnter]);
-  const handleVoiceTranscript = useCallback((text: string, send?: boolean) => { const next = inputRef.current.trim() ? `${inputRef.current.trim()} ${text}` : text; setInput(next); inputRef.current = next; if (send) void submitRef.current?.(syntheticSubmit()); }, [setInput]);
+  const handleVoiceTranscript = useCallback((text: string, send?: boolean) => {
+    const isCurrent = queueOwner.current === composerOwner && submissionOwner.current !== null;
+    const shouldSend = send && isCurrent && !isComposerFrozen();
+    setInput((previous) => {
+      const next = previous.trim() ? `${previous.trim()} ${text}` : text;
+      if (isCurrent) inputRef.current = next;
+      return next;
+    });
+    if (shouldSend) void submitRef.current?.(syntheticSubmit());
+  }, [composerOwner, setInput]);
   const editQueuedDraft = useCallback((index: number) => {
     if (!draftReady) return;
     const item = queuedDrafts[index];
@@ -305,7 +365,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   }, [attachedImages, draftReady, queuedDrafts, setAttachedImages, setInput, setQueuedDrafts]);
   const deleteQueuedDraft = useCallback((index: number) => { if (draftReady) setQueuedDrafts((q) => q.filter((_, position) => position !== index)); }, [draftReady, setQueuedDrafts]);
   const moveQueuedDraft = useCallback((from: number, to: number) => { if (draftReady) setQueuedDrafts((q) => reorderQueue(q, from, to)); }, [draftReady, setQueuedDrafts]);
-  const confirmCommandGate = useCallback(() => { const gate = gateRef.current; if (!gate) return; announceGate(null); bypassGate.current = true;
+  const confirmCommandGate = useCallback(() => { const gate = gateRef.current; if (!gate || isComposerFrozen() || inputRef.current.trimEnd() !== gate.text) return; announceGate(null); bypassGate.current = true;
     // A confirmed handoff moves the runtime to a fresh session; the next
     // session_upserted for a new id in this project is it, and the app should
     // follow instead of staying on the old session (issue #6).
@@ -317,7 +377,15 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   // reference and the quote, focus moved to the composer, ready to send.
   const insertAtEnd = useCallback((text: string) => { if (!text.trim()) return; const next = inputRef.current.trim() ? `${inputRef.current.trimEnd()}\n\n${text}` : text; setInput(next); inputRef.current = next; textareaRef.current?.focus(); }, [setInput]);
   const handleAbortSession = useCallback(() => { if (!canAbortSession) return; const id = selectedSession?.id || currentSessionId; if (!id) { console.warn('Abort requested but no session ID is available.'); return; } sendMessage({ type: 'chat.abort', sessionId: id }); }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
-  const handlePermissionDecision = useCallback((requestIds: string | string[], decision: PermissionDecision) => { const ids = (Array.isArray(requestIds) ? requestIds : [requestIds]).filter(Boolean); const sent = ids.filter((requestId) => sendMessage(permissionResponseMessage(requestId, decision)) !== false); if (sent.length) setPendingPermissionRequests((requests) => requests.filter((request) => !sent.includes(request.requestId))); }, [sendMessage, setPendingPermissionRequests]);
+  const handlePermissionDecision = useCallback((requestIds: string | string[], decision: PermissionDecision) => {
+    const finishOperation = beginComposerOperation('send');
+    if (!finishOperation) return;
+    try {
+      const ids = (Array.isArray(requestIds) ? requestIds : [requestIds]).filter(Boolean);
+      const sent = ids.filter((requestId) => sendMessage(permissionResponseMessage(requestId, decision)) !== false);
+      if (sent.length) setPendingPermissionRequests((requests) => requests.filter((request) => !sent.includes(request.requestId)));
+    } finally { finishOperation(); }
+  }, [sendMessage, setPendingPermissionRequests]);
   const handleInputFocusChange = useCallback((focused: boolean) => { setFocused(focused); onInputFocusChange?.(focused); }, [onInputFocusChange]);
-  return { draftPersistence, draftReady, retryDraftPersistence, input, setInput, textareaRef, inputHighlightRef, isTextareaExpanded, slashCommandsCount, skillCommands: slashCommands.filter((command) => command.type === 'skill'), filteredCommands, frequentCommands, commandQuery, showCommandMenu, selectedCommandIndex, resetCommandMenuState, handleCommandSelect, handleToggleCommandMenu, showFileDropdown, filteredFiles: filteredFiles as MentionableFile[], selectedFileIndex, renderInputWithMentions, selectFile, attachedImages, setAttachedImages, uploadingImages, imageErrors, getRootProps, getInputProps, isDragActive, openImagePicker: open, handleSubmit, handleSteer, modelPickerTrigger, queuedDrafts, editQueuedDraft, deleteQueuedDraft, moveQueuedDraft, resolveSteerResult, pendingCommandGate, confirmCommandGate, cancelCommandGate, handleVoiceTranscript, insertAtEnd, handleInputChange, handleKeyDown, handlePaste, handleTextareaClick: (event: MouseEvent<HTMLTextAreaElement>) => setCursorPosition(event.currentTarget.selectionStart), handleTextareaInput, syncInputOverlayScroll, handleClearInput, handleAbortSession, handlePermissionDecision, handleInputFocusChange, isInputFocused, commandModalPayload, closeCommandModal: () => setModal(null), showCostModal, isWorkspace: workspaceTarget.isWorkspace, workspaceCandidates: workspaceTarget.candidates, workspaceTargetValue: workspaceTarget.target, pickWorkspaceTarget: workspaceTarget.pickTarget };
+  return { composerFrozen, draftPersistence, draftReady, retryDraftPersistence, input, setInput, textareaRef, inputHighlightRef, isTextareaExpanded, slashCommandsCount, skillCommands: slashCommands.filter((command) => command.type === 'skill'), filteredCommands, frequentCommands, commandQuery, showCommandMenu, selectedCommandIndex, resetCommandMenuState, handleCommandSelect, handleToggleCommandMenu, showFileDropdown, filteredFiles: filteredFiles as MentionableFile[], selectedFileIndex, renderInputWithMentions, selectFile, attachedImages, setAttachedImages, uploadingImages, imageErrors, getRootProps, getInputProps, isDragActive, openImagePicker: open, handleSubmit, handleSteer, modelPickerTrigger, queuedDrafts, editQueuedDraft, deleteQueuedDraft, moveQueuedDraft, resolveSteerResult, pendingCommandGate, confirmCommandGate, cancelCommandGate, handleVoiceTranscript, insertAtEnd, handleInputChange, handleKeyDown, handlePaste, handleTextareaClick: (event: MouseEvent<HTMLTextAreaElement>) => setCursorPosition(event.currentTarget.selectionStart), handleTextareaInput, syncInputOverlayScroll, handleClearInput, handleAbortSession, handlePermissionDecision, handleInputFocusChange, isInputFocused, commandModalPayload, closeCommandModal: () => setModal(null), showCostModal, isWorkspace: workspaceTarget.isWorkspace, workspaceCandidates: workspaceTarget.candidates, workspaceTargetValue: workspaceTarget.target, pickWorkspaceTarget: workspaceTarget.pickTarget };
 }

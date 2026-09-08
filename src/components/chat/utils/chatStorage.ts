@@ -1,3 +1,5 @@
+import { invalidateComposerFreeze } from '../../../shared/composerFreeze';
+
 const DRAFT_KEY_PREFIX = 'draft_input_';
 const QUEUE_KEY_PREFIX = 'queued_message_';
 const queuedMessageListeners = new Set<(sessionId: string) => void>();
@@ -74,6 +76,7 @@ export function readQueuedMessages(sessionId: string): StoredQueuedMessage[] {
 }
 
 export function writeQueuedMessages(sessionId: string, messages: StoredQueuedMessage[]): boolean {
+  invalidateComposerFreeze();
   const queue = messages.filter((message) => message.content.trim() || message.attachmentCount);
   try {
     if (!queue.length) localStorage.removeItem(queuedMessageKey(sessionId));

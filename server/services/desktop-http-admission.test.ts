@@ -6,7 +6,7 @@ import test from 'node:test';
 import express from 'express';
 
 import { createGjcAppFactory } from '../app-factory.js';
-import { asyncHandler } from '../shared/utils.js';
+import { asyncHandler, getHttpActivityGeneration, snapshotHttpActivity } from '../shared/utils.js';
 
 import { DesktopRestartAuthority } from './desktop-restart-authority.js';
 
@@ -88,6 +88,7 @@ test('GET producers and later mounted routes share the production composition fe
 
 test('sync throws and async rejection release once and reach Express error handling', async (t) => {
   const admission = authority();
+  const initialActivity = snapshotHttpActivity();
   const app = express(); app.locals.desktopRestartAdmission = admission;
   app.get('/sync', asyncHandler(() => { throw new Error('sync'); }));
   app.get('/async', asyncHandler(async () => { throw new Error('async'); }));
@@ -96,8 +97,11 @@ test('sync throws and async rejection release once and reach Express error handl
   t.after(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); });
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   for (const route of ['sync', 'async']) {
+    const generation = getHttpActivityGeneration();
     assert.equal((await fetch(`http://127.0.0.1:${address.port}/${route}`)).status, 500);
     assert.equal((await admission.snapshot()).ingress, 0);
+    assert.equal(snapshotHttpActivity().running, initialActivity.running);
+    assert.notEqual(getHttpActivityGeneration(), generation);
   }
 });
 

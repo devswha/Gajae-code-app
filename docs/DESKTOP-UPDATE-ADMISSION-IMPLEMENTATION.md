@@ -1,5 +1,48 @@
 # Desktop updater: partial runtime admission and draft durability
 
+## 2026-09-08 current integration delta
+
+The earlier three-reader checkpoint below is historical. Production composition
+now connects fourteen of the fifteen fixed readers. Native-bound `ui-drafts`
+remains missing; page receipts do not grant installer authority. The current
+handoff is `docs/MACOS-UPDATER-HANDOFF.md`. Public installation remains disabled.
+
+- Worktrees/orchestrator/native jobs, automation/browser/computer, all native
+  clients, watchers/notifications, HTTP callbacks and audited auxiliary
+  Git/clone/startup producers join the existing chat/worker/shell owners.
+- Native `job.activity` is a complete read-only aggregate over jobs AND runs,
+  including archived jobs. Exact schema version 1 has `reserved`, `queued`,
+  `running`, `aborting`, `unknown`; counters overlap, and unknown durable states
+  block admission. It never performs reconciliation or starts a process.
+- The common fence closes before the worker's reversible fence. The exact
+  fence ID survives through cancellation/timeout/expiry cleanup. Worker close
+  and owner snapshots share the original five-second budget; cleanup remains
+  counted through the actual late acknowledgement/release. Failed releases stay
+  unknown and a committed fence is never reopened. Remote activity binds the
+  actual SDK revision and cannot silently adopt another idle baseline.
+- Browser child request queues, popup/callback tails, retained pages, evaluations
+  and graceful final closure report epoch/revision/request-sequence evidence.
+  Successful use then explicit close can become idle; failed launch/download
+  ownership is still unknown. No snapshot forcibly closes a browser.
+- Project file delivery/upload waits for source/writer close and request-private
+  cleanup. Git/clone errors wait for real process close before publishing or
+  cleaning staging; shutdown marking cannot become an idle proof. Native client
+  failures retain unresolved work instead of treating leader exit as sufficient.
+- Notification transport callbacks and dispatch ledger settlement are retained;
+  enqueue success is not a claim that a notification was shown in the UI.
+- Global page freeze covers durable drafts, exact File bytes, queued intents,
+  offscreen/unmounted continuations, upload/allocation, voice recording and
+  transcription. Duplicate/stale operation IDs cannot retire another lifetime.
+
+Pinned SDK 0.16.4 still has a reproduced detached prewarm task outside every
+public disposal join and forced-recovery physical ownership gaps. Published
+0.16.6 retains the relevant implementation. A narrowly version/hash-bound
+app-owned dependency patch is being prepared; it is not yet installed or part
+of release packaging, and SDK uncertainty remains a blocker. The native/UI
+transaction and final signed qualification remain required, not optional scope.
+
+## Earlier checkpoint and evidence
+
 Date: 2026-09-08. Branch: `codex/macos-updater-completion`, based on `49c1010`.
 This is implementation progress, **not G0/G3 acceptance or an updater release**.
 Native `installation_available` remains false; native `restart` still rejects.

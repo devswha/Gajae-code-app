@@ -168,7 +168,7 @@ test('fails closed when distinct queued paths exceed the fixed bound', async () 
   release();
 });
 
-test('close cancels queued callbacks at its deadline and reaps a non-exiting child', async () => {
+test('close cancellation and kill requests do not claim unsettled callbacks or process exit', async () => {
   let release!: () => void;
   const hold = new Promise<void>((resolve) => { release = resolve; });
   const callbacks: string[] = [];
@@ -186,22 +186,49 @@ test('close cancels queued callbacks at its deadline and reaps a non-exiting chi
   child.output('{"protocolVersion":1,"kind":"event","event":"add","path":"warmup"}\n');
   await new Promise((resolve) => setImmediate(resolve));
   child.output('{"protocolVersion":1,"kind":"event","event":"add","path":"accepted"}\n');
-  await watcher.close();
+  await assert.rejects(watcher.close(), /shutdown is unconfirmed/);
 
   assert.deepEqual(child.kills, ['SIGKILL']);
   assert.deepEqual(callbacks, ['warmup']);
   assert.equal(callbackSignal?.aborted, true);
+  assert.equal(watcher.snapshotActivity().running, 1);
+  assert.equal(watcher.snapshotActivity().settling, 1);
   release();
+  child.emit('close');
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(callbacks, ['warmup']);
+  assert.equal(watcher.snapshotActivity().running, 0);
+  assert.equal(watcher.snapshotActivity().settling, 0);
 });
 
 test('close before readiness rejects the pending start without reporting a runtime failure', async () => {
-  const { watcher, failures } = setup();
+  const { watcher, child, failures } = setup();
   const started = watcher.start();
   const rejected = assert.rejects(started, /GJC session watcher failed\./u);
+  child.stdin.end = () => child.emit('close');
   await watcher.close();
 
   await rejected;
   assert.equal(failures.length, 0);
+});
+
+test('fenced watcher dispatch retains the path and resumes without duplicating it', async () => {
+  let fenced = true; let calls = 0; let active = 0; let revision = 0;
+  const { watcher, child } = setup({
+    desktopAdmission: {
+      enter() { if (fenced) throw Object.assign(new Error('fenced'), { code: 'DESKTOP_RESTART_FENCED' }); active++; return () => { active--; }; },
+      enterCompletion() { throw new Error('not a completion'); },
+    },
+    onActivityChange() { revision++; },
+    onEvent() { assert.equal(active, 1); calls++; },
+  });
+  await ready(watcher, child);
+  child.output('{"protocolVersion":1,"kind":"event","event":"change","path":"fixture.jsonl"}\n');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 0); assert.equal(watcher.snapshotActivity().queued, 1);
+  const before = revision; fenced = false;
+  for (let attempt = 0; attempt < 100 && !calls; attempt++) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(calls, 1); assert.equal(active, 0); assert.ok(revision > before);
+  assert.equal(watcher.snapshotActivity().queued, 0);
+  child.stdin.end = () => child.emit('close'); await watcher.close();
 });

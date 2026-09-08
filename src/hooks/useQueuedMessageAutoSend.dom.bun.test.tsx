@@ -5,12 +5,13 @@ import { act, cleanup, renderHook } from '@testing-library/react';
 
 import { readQueuedMessages, writeQueuedMessages } from '../components/chat/utils/chatStorage';
 import { useChatComposerState } from '../components/chat/hooks/useChatComposerState';
+import { resetComposerFreezeForTests } from '../shared/composerFreeze';
 
 import { useQueuedMessageAutoSend } from './useQueuedMessageAutoSend';
 import type { SessionActivityMap } from './useSessionProtection';
 
 const originalFetch = globalThis.fetch;
-afterEach(() => { cleanup(); localStorage.clear(); globalThis.fetch = originalFetch; });
+afterEach(() => { cleanup(); resetComposerFreezeForTests(); localStorage.clear(); globalThis.fetch = originalFetch; });
 
 const busy = (): SessionActivityMap => new Map([['a', { startedAt: Date.now(), statusText: null, canInterrupt: true, awaitingInput: false }]]);
 

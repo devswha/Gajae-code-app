@@ -68,6 +68,9 @@ export type GjcWorkerOptions = Record<string, unknown> & {
   notificationOwner?: 'terminal-adapter';
 };
 type GjcOptionsEnricher = (options: GjcWorkerOptions) => Promise<GjcWorkerOptions>;
+/** Optional application-owned ingress accounting; the engine owns no app authority. */
+export type GjcWorkerDesktopAdmission = { acquire(source: string): { release(): void } };
+type WorkerActivityObservation = Extract<Extract<GjcWorkerResponseFrame, { method: 'worker.activity' }>['payload'], { ok: true }>['result'];
 export type GjcWorkerWriter = { send(value: unknown): void; setSessionId?(id: string): void; getAppSessionId?(): string | undefined; userId?: string | number | null };
 type Child = {
   pid?: number;
@@ -433,6 +436,17 @@ export class GjcWorkerSupervisor {
   private readonly reapingWorkers = new Set<Child>();
   private runProcessProofMissing = false;
   private readonly hasRunProcessReaper: boolean;
+  private desktopAdmission?: GjcWorkerDesktopAdmission;
+  private restartFence?: {
+    id: string; child?: Child; acknowledged: boolean; pending?: Promise<void>;
+    /** Immutable first correlated observation for this exact acknowledged fence. */
+    remoteGeneration?: string;
+    invalidated?: boolean;
+  };
+  private observation?: {
+    id: string; child: Child; promise: Promise<WorkerActivityObservation | undefined>;
+    settle(value?: WorkerActivityObservation): void;
+  };
 
   constructor(runtime: GjcWorkerSupervisorRuntime = {}) {
     this.hasRunProcessReaper = runtime.killProcessTree !== undefined;
@@ -463,11 +477,136 @@ export class GjcWorkerSupervisor {
     return `${this.activityEpoch}:${this.activityRevision}`;
   }
 
+  configureDesktopRestartAdmission(admission?: GjcWorkerDesktopAdmission): void {
+    this.desktopAdmission = admission;
+  }
+
+  private acquireRoot(source: string): () => void {
+    if (this.restartFence) throw Object.assign(new Error('Worker admission is fenced.'), { code: 'DESKTOP_RESTART_FENCED' });
+    const lease = this.desktopAdmission?.acquire(`gjc-worker:${source}`);
+    return () => lease?.release();
+  }
+
+  /** Close locally before any await. Busy accepted roots keep running; never abort to fence. */
+  async fenceForDesktopRestart(fenceId: string): Promise<void> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(fenceId)) throw new TypeError('Invalid worker fence.');
+    if (this.restartFence && this.restartFence.id !== fenceId) throw new Error('Worker fence conflicts.');
+    if (!this.restartFence) {
+      this.restartFence = { id: fenceId, acknowledged: false };
+      this.activityChanged();
+    }
+    const fence = this.restartFence;
+    if (fence.pending) return fence.pending;
+    if (fence.acknowledged && fence.child === this.child) return;
+    // These operations were accepted before close. They can still deliver
+    // their original request, so do not place a remote fence in their path.
+    if (this.starting || this.runs.size || this.tracker.size || this.activityTasks.starting || this.activityTasks.settling) {
+      throw new Error('Worker has accepted work.');
+    }
+    const child = this.child;
+    if (!child) {
+      if (this.unreapedWorkers.size || this.terminating || this.terminationFailure) throw new Error('Worker ownership is unconfirmed.');
+      fence.acknowledged = true;
+      return;
+    }
+    if (!this.ready) throw new Error('Worker is not ready.');
+    fence.child = child;
+    const pending = this.request('worker.admission', undefined, { fenceId, closed: true }, 1_000).then((response) => {
+      if (!response.ok || object(response.result)?.fenceId !== fenceId || this.child !== child || this.restartFence !== fence) {
+        throw new Error('Worker fence was not acknowledged.');
+      }
+      fence.acknowledged = true;
+      this.activityChanged();
+    }).finally(() => { if (fence.pending === pending) fence.pending = undefined; });
+    fence.pending = pending;
+    return pending;
+  }
+
+  /** Exact-ID release; failed/late acknowledgement leaves local admission closed. */
+  async releaseDesktopRestartFence(fenceId: string): Promise<void> {
+    const fence = this.restartFence;
+    if (!fence) return;
+    if (fence.id !== fenceId) throw new Error('Worker fence conflicts.');
+    try { await fence.pending; } catch { /* Still send ordered release to the same child. */ }
+    if (fence.child && fence.child === this.child) {
+      const response = await this.request('worker.admission', undefined, { fenceId, closed: false }, 1_000);
+      if (!response.ok || object(response.result)?.fenceId !== null) throw new Error('Worker fence release was not acknowledged.');
+    }
+    if (this.restartFence === fence) {
+      this.restartFence = undefined;
+      this.activityChanged();
+    }
+  }
+
+  /** Observes the existing child only. Never calls ensureWorker, cancellation or reaping. */
+  async readDesktopRestartActivity(): Promise<DesktopOwnerActivity> {
+    const initial = this.snapshotActivity();
+    const child = this.child;
+    if (!child || !this.ready || this.terminating || this.terminationFailure) return initial;
+    const fence = this.restartFence;
+    const remote = await this.observeWorker(child);
+    const changed = this.getGeneration() !== initial.generation || this.child !== child || this.restartFence !== fence;
+    if (!remote || changed || remote.fenceId !== (fence?.id ?? null)) {
+      return { ...initial, complete: false, unknown: [...new Set([...initial.unknown,
+        !remote ? 'worker_observation_unavailable' : 'worker_observation_stale'])] };
+    }
+    if (fence?.acknowledged && fence.child === child) {
+      if (fence.remoteGeneration === undefined) {
+        // Establishing evidence is not new activity: the first observation
+        // must still match the synchronous generation captured by authority.
+        fence.remoteGeneration = remote.generation;
+      } else if (fence.remoteGeneration !== remote.generation && !fence.invalidated) {
+        // An actual remote mutation invalidates every prepared proof under
+        // this fence. Never silently rebase it to a newer (or reverted) idle
+        // revision. Release + a new fence is the only way to establish proof.
+        fence.invalidated = true;
+        this.activityChanged();
+      }
+    }
+    // Account for this child through evidence without forgetting its OS owner.
+    // Other unreaped generations, escaped PIDs and timeout latches stay unknown.
+    const unknown = [...new Set([
+      ...initial.unknown.filter((reason) => reason !== 'worker_runtime_unaccounted'
+        || this.unreapedWorkers.size !== 1 || this.runProcessProofMissing || this.runtime.platform === 'win32'),
+      ...remote.unknown,
+      ...(!fence?.acknowledged || fence.child !== child ? ['worker_admission_open'] : []),
+      ...(fence?.invalidated ? ['worker_observation_stale'] : []),
+    ])].slice(0, 32);
+    return {
+      ...initial, complete: remote.complete && unknown.length === 0,
+      starting: initial.starting + remote.starting,
+      queued: initial.queued + remote.queued,
+      running: initial.running + remote.running,
+      settling: initial.settling + remote.settling,
+      approvals: initial.approvals + remote.approvals,
+      retained: initial.retained - Number(this.runtime.platform !== 'win32') + remote.retained,
+      unknown,
+    };
+  }
+
+  private observeWorker(child: Child): Promise<WorkerActivityObservation | undefined> {
+    // One slot per child, including a timed-out request awaiting its late reply.
+    // Repeated reads cannot accumulate requests, timers or expired-ID entries.
+    if (this.observation?.child === child) return this.observation.promise;
+    const id = `observe-${randomUUID()}`;
+    let settle!: (value?: WorkerActivityObservation) => void;
+    const promise = new Promise<WorkerActivityObservation | undefined>((resolve) => { settle = resolve; });
+    const timer = setTimeout(() => settle(), 250);
+    timer.unref?.();
+    const observation = { id, child, promise, settle: (value?: WorkerActivityObservation) => { clearTimeout(timer); settle(value); } };
+    this.observation = observation;
+    try {
+      child.stdin.write(serializeGjcWorkerFrame({ protocolVersion: GJC_WORKER_PROTOCOL_VERSION,
+        kind: 'request', id, method: 'worker.activity', payload: {} }));
+    } catch { observation.settle(); }
+    return promise;
+  }
+
   /**
-   * Read-only restart evidence, NOT an idle-worker probe. Protocol v1 does not
-   * account for SDK continuations, title tasks, background bash or OAuth unwind.
-   * Keep that uncertainty until the existing process-tree reap barrier succeeds.
-   * Counts overlap and include app continuations after a request/run is removed.
+   * Pure parent-side accounting. A retained live child is unaccounted here;
+   * readDesktopRestartActivity can compose fenced worker evidence without
+   * forgetting that OS owner. Counts overlap and include app continuations
+   * after a request/run is removed.
    */
   snapshotActivity(): DesktopOwnerActivity {
     let registered = 0;
@@ -524,26 +663,32 @@ export class GjcWorkerSupervisor {
     method: GjcWorkerOAuthRequestMethod,
     payload: JsonObject,
   ): Promise<GjcWorkerResponsePayload> {
+    const releaseAdmission = method === 'oauth.submit' || method === 'oauth.cancel' ? () => {} : this.acquireRoot(method);
     const release = this.beginActivity('settling');
     try {
+      if (this.restartFence && (!this.child || !this.ready)) throw new Error('No accepted OAuth attempt is available.');
       await this.ensureWorker();
       return await this.request(method, undefined, payload);
     } finally {
       release();
+      releaseAdmission();
     }
   }
 
   async modelCatalog(): Promise<GjcWorkerResponsePayload> {
+    const releaseAdmission = this.acquireRoot('models.catalog');
     const release = this.beginActivity('settling');
     try {
       await this.ensureWorker();
       return await this.request('models.catalog', undefined, {});
     } finally {
       release();
+      releaseAdmission();
     }
   }
 
   async inspectGoal(scope: GjcGoalScope, providerSessionId: string): Promise<GjcGoalSnapshot> {
+    const releaseAdmission = this.acquireRoot('goal.inspect');
     const release = this.beginActivity('settling');
     try {
       const liveRoot = getGjcLiveSessionRoot();
@@ -554,6 +699,7 @@ export class GjcWorkerSupervisor {
       return response.result as GjcGoalSnapshot;
     } finally {
       release();
+      releaseAdmission();
     }
   }
 
@@ -670,7 +816,15 @@ export class GjcWorkerSupervisor {
     };
     this.runs.set(runId, run);
     this.activityChanged();
-    void this.startRun(run, message);
+    let releaseAdmission: () => void;
+    try { releaseAdmission = this.acquireRoot('session.start'); }
+    catch (error) {
+      this.runs.delete(runId);
+      this.activityChanged();
+      rejectStarted(error as Error); reject(error as Error); resolveOutcome('not_started');
+      return { started, completion, outcome, abortHandle: runId };
+    }
+    void this.startRun(run, message).finally(releaseAdmission);
     return { started, completion, outcome, phase: () => run.phase, abortHandle: runId };
   }
 
@@ -956,7 +1110,10 @@ export class GjcWorkerSupervisor {
         )) {
           // The bounded late-response correlation cache is not a lifetime proof.
           // Even a late OAuth/goal reply cannot account for its SDK continuations.
-          this.requestTimeoutUncertainty = true;
+          // Admission cannot launch SDK work. A timed-out close remains fenced
+          // locally until an ordered exact-ID release is acknowledged; it must
+          // not manufacture permanent SDK uncertainty after successful release.
+          if (method !== 'worker.admission') this.requestTimeoutUncertainty = true;
           this.expiredRequests.set(request.id, {
             method: request.method,
             ...('sessionId' in request ? { sessionId: request.sessionId } : {}),
@@ -997,6 +1154,15 @@ export class GjcWorkerSupervisor {
   }
 
   private handleResponse(response: GjcWorkerResponseFrame): void {
+    if (response.method === 'worker.activity') {
+      const observation = this.observation;
+      if (!observation || observation.id !== response.id || observation.child !== this.child) {
+        throw new GjcWorkerProtocolError('unknown_response_id', 'Activity response does not match its request.');
+      }
+      this.observation = undefined;
+      observation.settle(response.payload.ok ? response.payload.result : undefined);
+      return;
+    }
     if (!response.payload.ok && response.payload.error.code === GJC_CLEANUP_UNCONFIRMED_CODE) {
       const child = this.child;
       if (child) {
@@ -1343,6 +1509,10 @@ export class GjcWorkerSupervisor {
     // callbacks may read the owner synchronously inside killTree().
     const release = this.beginActivity('settling');
     this.reapingWorkers.add(child);
+    if (this.observation?.child === child) {
+      this.observation.settle();
+      this.observation = undefined;
+    }
     this.child = undefined;
     this.ready = false;
     this.starting = undefined;
@@ -1506,14 +1676,14 @@ function reportWorkerDiagnostic(message: string): void {
 const supervisor = new GjcWorkerSupervisor({ enrichOptions: enrichGjcSdkRunOptions, diagnostic: reportWorkerDiagnostic });
 registerGjcRuntimeModelCatalogLoader(() => supervisor.modelCatalog());
 
-/** No lazy spawn, shutdown, admission mutation or SDK idle claim. */
+/** No lazy spawn, shutdown or admission mutation. A live idle proof needs an explicit fence. */
 export function createGjcWorkerDesktopRestartReader(worker: GjcWorkerSupervisor = supervisor): {
   getGeneration(): string;
-  read(): DesktopOwnerActivity;
+  read(): Promise<DesktopOwnerActivity>;
 } {
   return Object.freeze({
     getGeneration: () => worker.getGeneration(),
-    read: () => worker.snapshotActivity(),
+    read: () => worker.readDesktopRestartActivity(),
   });
 }
 

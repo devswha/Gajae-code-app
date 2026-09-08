@@ -1,3 +1,5 @@
+import type { DesktopOwnerActivity } from '../../shared/desktopUpdateProtocol.js';
+
 import { GjcNativeClient, GjcNativeRequestError, type GjcNativeClientOptions } from './gjc-git-client.js';
 
 type GjcArchivedFilter = 'exclude' | 'include' | 'only';
@@ -71,4 +73,24 @@ export class GjcJobsClient extends GjcNativeClient {
   bindingResolve(params: Record<string, unknown>): Promise<unknown> { return this.request('binding.resolve', params); }
   bindingRelease(params: Record<string, unknown>): Promise<unknown> { return this.request('binding.release', params); }
   interruptForShutdown(): Promise<unknown> { return this.request('job.interruptForShutdown'); }
+
+  async snapshotDesktopActivity(): Promise<DesktopOwnerActivity> {
+    const generation = this.getActivityGeneration();
+    const value = await this.observeActivity();
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid native jobs activity.');
+    const result = value as Record<string, unknown>;
+    const fields = ['reserved', 'queued', 'running', 'aborting', 'unknown'] as const;
+    if (Object.keys(result).length !== 6 || result.schemaVersion !== 1
+      || fields.some((key) => !Number.isSafeInteger(result[key]) || Number(result[key]) < 0)) throw new Error('Invalid native jobs activity.');
+    const own = this.activity();
+    const unknown = [...own.unknown, ...(result.unknown !== 0 ? ['native_jobs_state_unknown'] : []),
+      ...(generation !== this.getActivityGeneration() ? ['native_jobs_changed'] : [])];
+    return { owner: 'native-jobs', generation, complete: unknown.length === 0,
+      starting: Number(result.reserved), queued: Number(result.queued), running: Number(result.running), settling: Number(result.aborting),
+      approvals: 0, retained: 0, unknown };
+  }
+}
+
+export function createNativeJobsDesktopRestartReader(jobs: GjcJobsClient) {
+  return { getGeneration: () => jobs.getActivityGeneration(), read: () => jobs.snapshotDesktopActivity() };
 }

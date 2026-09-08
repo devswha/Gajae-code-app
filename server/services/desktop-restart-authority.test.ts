@@ -101,6 +101,147 @@ test('known ingress returns busy immediately without waiting for any owner reade
   release();
 });
 
+test('runtime admission closes only after top-level admission and before owner reads', async () => {
+  const closed = deferred<void>();
+  const released = deferred<void>();
+  const calls: string[] = [];
+  let fenceId = '';
+  const { authority, owner } = fixture({ preparationFence: {
+    owner: 'worker',
+    close: async (id) => { fenced(authority); fenceId = id; calls.push('close'); await closed.promise; },
+    release: async (id) => { assert.equal(id, fenceId); calls.push('release'); await released.promise; },
+  } });
+  owner.read = () => { calls.push('read'); return idle(); };
+  const pending = authority.prepare(attempt);
+  fenced(authority);
+  await tick();
+  assert.deepEqual(calls, ['close']);
+  closed.resolve();
+  const result = await pending; prepared(result);
+  assert.deepEqual(calls, ['close', 'read']);
+  authority.cancel(result.token);
+  await tick();
+  assert.deepEqual(calls, ['close', 'read', 'release']);
+  assert.equal((await authority.snapshot()).ingress, 1);
+  assert.equal((await authority.prepare({ attemptId: 'next', epoch: 'native-next' })).ok, false);
+  released.resolve(); await tick();
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('known ingress never closes a worker admission fence', async () => {
+  let closes = 0;
+  const { authority } = fixture({ preparationFence: {
+    owner: 'worker', close: () => { closes++; }, release: () => {},
+  } });
+  const release = authority.enter('chat:accepted');
+  const result = await authority.prepare(attempt);
+  assert.equal(result.ok, false);
+  assert.equal(closes, 0);
+  release();
+});
+
+test('completion during worker fence setup invalidates preparation even if idle again', async () => {
+  const closed = deferred<void>();
+  let releases = 0;
+  const { authority, owner } = fixture({ preparationFence: {
+    owner: 'worker', close: () => closed.promise, release: () => { releases++; },
+  } });
+  const pending = authority.prepare(attempt);
+  await tick();
+  const release = authority.enterCompletion('existing:completion'); release();
+  closed.resolve();
+  const result = await pending;
+  assert.equal(result.ok, false);
+  assert.equal(owner.reads, 0);
+  if (!result.ok) assert.ok(result.blockers.some((blocker) => blocker.code === 'activity_changed'));
+  await tick(); assert.equal(releases, 1);
+});
+
+test('worker fencing and owner observation share one preparation deadline', async () => {
+  const clock = new Clock();
+  const observed = deferred<unknown>();
+  let releases = 0;
+  const { authority, owner } = fixture({ now: clock.now, schedule: clock.schedule, readTimeoutMs: 10,
+    preparationFence: { owner: 'worker', close: () => { clock.time += 6; }, release: () => { releases++; } },
+  });
+  owner.read = () => observed.promise;
+  const pending = authority.prepare(attempt);
+  await tick(); assert.equal(owner.reads, 1);
+  clock.advance(4);
+  const result = await pending;
+  assert.equal(result.ok, false);
+  assert.equal(clock.time, 1_010);
+  observed.resolve(idle()); await tick();
+  assert.equal(releases, 1);
+  assert.equal(authority.state, 'open');
+});
+
+test('controller loss retains a late worker close until exact-ID release settles', async () => {
+  const closed = deferred<void>();
+  const released = deferred<void>();
+  const calls: string[] = [];
+  let fenceId = '';
+  const { authority, owner } = fixture({ preparationFence: {
+    owner: 'worker', close: async (id) => { fenceId = id; calls.push('close'); await closed.promise; },
+    release: async (id) => { assert.equal(id, fenceId); calls.push('release'); await released.promise; },
+  } });
+  const pending = authority.prepare(attempt);
+  await tick(); authority.controllerLost(attempt.epoch);
+  assert.equal((await pending).ok, false);
+  assert.deepEqual(calls, ['close']);
+  assert.equal(owner.reads, 0);
+  assert.equal((await authority.prepare({ attemptId: 'next', epoch: 'native-next' })).ok, false);
+  closed.resolve(); await tick();
+  assert.deepEqual(calls, ['close', 'release']);
+  assert.equal(owner.reads, 0, 'late setup cannot revive the lost attempt');
+  assert.equal((await authority.snapshot()).ingress, 1);
+  released.resolve(); await tick();
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('fence setup timeout does not release before the actual close request settles', async () => {
+  const closed = deferred<void>();
+  let released = false;
+  const { authority, clock } = fixture({ preparationFence: {
+    owner: 'worker', close: () => closed.promise, release: () => { released = true; },
+  } });
+  const pending = authority.prepare(attempt);
+  await tick(); clock.advance(5_000);
+  assert.equal((await pending).ok, false);
+  assert.equal(released, false);
+  assert.equal((await authority.snapshot()).ingress, 1);
+  closed.resolve(); await tick();
+  assert.equal(released, true);
+});
+
+test('failed worker release remains unknown rather than pretending all admission reopened', async () => {
+  const { authority } = fixture({ preparationFence: {
+    owner: 'worker', close: () => {}, release: () => { throw new Error('release not acknowledged'); },
+  } });
+  const result = await authority.prepare(attempt); prepared(result);
+  authority.cancel(result.token); await tick();
+  const snapshot = await authority.snapshot();
+  assert.equal(snapshot.ingress, 0);
+  assert.equal(snapshot.complete, false);
+  assert.ok(snapshot.blockers.some((blocker) => blocker.owner === 'worker' && blocker.code === 'owner_failed'));
+  assert.equal((await authority.prepare({ attemptId: 'next', epoch: 'native-next' })).ok, false);
+});
+
+test('expiry releases the runtime fence but committed shutdown never does', async () => {
+  for (const commit of [false, true]) {
+    let releases = 0;
+    const { authority, clock } = fixture({ preparationFence: {
+      owner: 'worker', close: () => {}, release: () => { releases++; },
+    } });
+    const result = await authority.prepare(attempt); prepared(result);
+    if (commit) assert.equal((await authority.commit(result.token, attempt.epoch)).ok, true);
+    clock.advance(10_000); authority.controllerLost(attempt.epoch); authority.cancel(result.token);
+    await tick();
+    assert.equal(releases, commit ? 0 : 1);
+    assert.equal(authority.state, commit ? 'committed' : 'open');
+  }
+});
+
 test('owned completion may finish under a reversible fence but invalidates its prepared proof', async () => {
   const { authority } = fixture();
   const result = await authority.prepare(attempt);

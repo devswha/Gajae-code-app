@@ -1,5 +1,54 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 2026-09-08: 작업 소유권·페이지 초안 동결·worker fence 통합
+
+이 절은 `c64d8aa` 이후 소유권 통합 작업의 진행 기록이다.
+자동업데이트는 배포 목표에 포함된다. 수동 설치 검증과 구버전 → 신버전 자동
+교체 검증의 차이는 목표를 분리하거나 완료 범위를 줄인다는 뜻이 아니다.
+
+- `server/index.js`는 필수 15개 owner 중 14개 reader를 연결하고, startup
+  catch-up 이전에 같은 admission을 worktree/orchestrator/native clients,
+  worker/automation/browser/computer/watcher/notification에 주입한다.
+  Git/clone 및 server startup/listen callback을 `internal-producers`에
+  연결했다. native-bound `ui-drafts`는 아직 누락 blocker다.
+- native `job.activity`는 archived job과 미완료 run을 포함하는 읽기 전용
+  aggregate다. 관측은 프로세스를 새로 시작하거나 reconcile하지 않는다.
+- project 파일 스트림과 업로드는 실제 descriptor/pipeline/cleanup 완료까지
+  HTTP 소유권을 유지한다. watcher의 잘못된 조기 close를 실제 종료 경로로
+  옮겼으며 kill/abort 요청만으로 종료를 확인했다고 처리하지 않는다.
+- worker activity/admission 프로토콜, 브라우저 child queue/popup/close 증명,
+  알림 전송 callback과 페이지 초안·첨부·녹음 freeze를 구현했다.
+  페이지 receipt는 `scope: page`, `installerAuthority: false`이며 아직
+  native restart 허가가 아니다.
+- 공통 ingress fence가 먼저 닫힌 뒤 worker fence를 닫고 관측한다. setup과
+  read는 원래의 5초 예산을 공유하며, 취소/timeout/expiry는 늦은 close와
+  정확한 ID의 release 완료까지 소유권을 유지한다. commit 뒤에는 열지 않는다.
+  원격 SDK generation 변화도 기존 준비를 무효화한다.
+- SDK 0.16.4에서 공개 dispose join 뒤에도 prewarm credential 작업이 남는
+  반례를 재현했다. `sdk_background_ownership_unproven`을 유지한다.
+  공식 배포 0.16.6의 해당 코드도 동일함을 별도 임시 경로에서 확인했다.
+  앱 전용 SDK 패치를 준비 중이며 dependency pin이나 node_modules는 아직
+  변경하지 않았다. `scripts/apply-sdk-lifecycle-patch.mjs`는 정확한 버전과
+  수정 전후 해시 검증·일치하는 변경의 1회 적용·멱등 재검증 도구이며 아직
+  postinstall/배포 경로에 연결하지 않았다. 실제 SDK patch가 검증되기 전
+  `sdk_background_ownership_unproven`을 없애지 않는다.
+
+증거 경로: `/private/tmp/gajae-updater-ownership.6r2PfB/`.
+부모의 HTTP/file-transfer 8개, native client/watcher/runtime/route-coverage
+31개, authority 경합 106개, SDK patch 도구 7개 테스트와 `check:core`가
+통과했다. 전체 `verify-union.log`도 통과했으나 최종 추가 통합 뒤의 promotion
+검증과는 구분한다. `verify-working.log`의 TS2322는 수정된 이전 실패 기록이다.
+최종 `verify-promotion.log`도 통과했고 검증 전후 78개 소스/테스트/문서 입력의
+SHA256이 동일했다. 이후 이 검증 결과 문단만 갱신했다. worker의 실제
+supervisor/host/protocol을 사용한 통합 경합을 포함해 worker-client 77개가
+통과했다(`worker-integrated.log`). desktop shell fmt/locked test도 통과했다
+(`native-shell.log`). Apple 서명 identity와 기존 notary profile의 read-only
+인증 확인도 통과했지만 서명키 생성·반출·공증 제출·공개 배포는 하지 않았다.
+GJC wire/browser E2E 8개와 browser E2E 3개가 통과했다. wire fixture는 종료된
+orchestrator를 재사용하지 않고 새 HTTP/projection/orchestrator로 재개하도록
+수정했다. 첫 실패 로그도 보존하며, 이 결과는 설치 앱 handoff 검증이 아니다.
+제품 버전과 production updater 활성화/공개 배포는 변경하지 않았다.
+
 ## 2026-09-08: 다음 시작 설치·후속 앱 건강 확인 연결
 
 `DESKTOP-UPDATER-LAUNCH-QA.md`가 최신 네이티브 진행 기록이다. 격리된 debug QA에서
@@ -13,8 +62,9 @@ A(0.2.4) → B(0.2.5)의 실제 교체·자동 재실행·서버 건강 확인·
 목표는 준비 경로 구현으로 축소하지 않는다. 현재 이어지는 네이티브 설치 작업과
 검증 근거, 다음 시작/건강 상태/복구 연결의 순서는
 `DESKTOP-UPDATER-INSTALL-PROGRESS.md`에 있다. 공식 installer 호출, durable
-attempt writer, 전체 설치 트리 검증 코드를 작성했지만 **앱 시작·재시작 경로는
-아직 이 코드를 호출하지 않는다.** 원격 CI에서 드러난 엔진 테스트 SSOT 누락은
+attempt writer, 전체 설치 트리 검증과 **격리된 QA 시작·재시작 경로를 연결했다.**
+일반 배포용 활성화와 native-bound 안전 재시작은 아직 남아 있다.
+원격 CI에서 드러난 엔진 테스트 SSOT 누락은
 `7ef7cda`로 수정했다. 자동 설치/배포 완료를 선언하거나 목표를 닫지 않았다.
 
 ## 2026-09-08 재개: 실제 admission 연결과 초안 보존

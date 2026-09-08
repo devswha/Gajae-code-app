@@ -10,14 +10,31 @@ import express from 'express';
 import mime from 'mime-types';
 import Database from 'better-sqlite3';
 
-import { AppError, WORKSPACES_ROOT, asyncHandler, getOpenCodeDatabasePath, validateWorkspacePath } from '@/shared/utils.js';
+import {
+    AppError, WORKSPACES_ROOT, asyncHandler, getHttpActivityGeneration,
+    getOpenCodeDatabasePath, snapshotHttpActivity, validateWorkspacePath,
+} from '@/shared/utils.js';
+import {
+    configureInternalDesktopAdmission,
+    enterInternalActivity,
+    getInternalActivityGeneration,
+    markInternalActivityUncertain,
+    snapshotInternalActivity,
+} from '@/shared/desktop-internal-activity.js';
 import {
     openProjectFileForWrite,
     resolveProjectEntryForMutation,
     resolveProjectFileForRead,
     resolveProjectFileForWrite
 } from '@/shared/project-file-containment.js';
-import { closeSessionsWatcher, configureSessionWorktrees, initializeSessionsWatcher } from '@/modules/providers/index.js';
+import {
+    closeSessionsWatcher,
+    configureSessionWorktrees,
+    configureSessionsWatcherDesktopAdmission,
+    getSessionsWatcherActivityGeneration,
+    initializeSessionsWatcher,
+    snapshotSessionsWatcherActivity,
+} from '@/modules/providers/index.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
@@ -37,9 +54,23 @@ import {
     shutdownGjcWorker,
     spawnGjcRun,
 } from './gjc-worker-client.js';
-import { getProductionJobAuthority, getProductionJobOrchestrator } from './services/gjc-job-orchestrator.js';
+import {
+    configureGjcJobOrchestratorDesktopAdmission,
+    createGjcJobOrchestratorDesktopRestartReader,
+    getProductionJobAuthority,
+    getProductionJobOrchestrator,
+    getProductionNativeJobsDesktopRestartReader,
+} from './services/gjc-job-orchestrator.js';
 import { readSessionLocation, resolveSessionWorkspacePath, validateSessionRepository } from './services/session-worktree-paths.js';
-import { abortSessionWorktreeRun, prepareSessionWorktreeRun, sessionWorktreeWorkerHandle } from './services/session-worktree-runtime.js';
+import {
+    abortSessionWorktreeRun,
+    configureSessionWorktreeDesktopAdmission,
+    createSessionWorktreeDesktopRestartReader,
+    prepareSessionWorktreeRun,
+    sessionWorktreeWorkerHandle,
+} from './services/session-worktree-runtime.js';
+import { configureNativeDesktopRestartAdmission, createNativeDesktopRestartReader } from './services/gjc-git-client.js';
+import { createProjectUploadStorage, streamProjectFile } from './services/project-file-transfer.js';
 import { getProductionGjcJobGitService } from './services/gjc-job-git.service.js';
 import {
     stripAnsiSequences,
@@ -57,6 +88,11 @@ import { getShellActivityGeneration, snapshotShellActivity } from './modules/web
 import { isWorkspaceRoot } from './modules/projects/index.js';
 import projectModuleRoutes from './modules/projects/projects.routes.js';
 import notificationRoutes from './modules/notifications/notifications.routes.js';
+import {
+    configureNotificationDesktopAdmission,
+    getNotificationActivityGeneration,
+    snapshotNotificationActivity,
+} from './modules/notifications/index.js';
 import userRoutes from './routes/user.js';
 import systemRoutes from './routes/system.js';
 import providerRoutes from './modules/providers/provider.routes.js';
@@ -66,7 +102,11 @@ import { initializeDatabase, projectsDb, sessionsDb } from './modules/database/i
 import {
     automationRoutes,
     automationService,
+    configureDesktopRestartAdmission as configureAutomationDesktopAdmission,
+    createAutomationDesktopRestartReader,
     createBrowserAutomationRouter,
+    createBrowserDesktopRestartReader,
+    createComputerDesktopRestartReader,
     handleBrowserConnection,
 } from './modules/automation/index.js';
 import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
@@ -118,8 +158,35 @@ const gjcTerminalNotificationAdapter = createGjcTerminalNotificationAdapter({
 // ownership readers remain explicit blockers; native install stays disabled.
 const desktopRestartAdmission = createDesktopRestartRuntime({
     chat: { getGeneration: chatRunRegistry.getGeneration, read: chatRunRegistry.snapshotActivity },
+    worktrees: createSessionWorktreeDesktopRestartReader(),
+    orchestrator: createGjcJobOrchestratorDesktopRestartReader(gjcJobOrchestrator),
+    'native-jobs': getProductionNativeJobsDesktopRestartReader(),
     'gjc-worker': createGjcWorkerDesktopRestartReader(),
+    automation: createAutomationDesktopRestartReader(),
+    browser: createBrowserDesktopRestartReader(),
+    computer: createComputerDesktopRestartReader(),
     shell: { getGeneration: getShellActivityGeneration, read: snapshotShellActivity },
+    'native-clients': createNativeDesktopRestartReader(),
+    watchers: { getGeneration: getSessionsWatcherActivityGeneration, read: snapshotSessionsWatcherActivity },
+    notifications: { getGeneration: getNotificationActivityGeneration, read: snapshotNotificationActivity },
+    'http-callbacks': { getGeneration: getHttpActivityGeneration, read: snapshotHttpActivity },
+    'internal-producers': { getGeneration: getInternalActivityGeneration, read: snapshotInternalActivity },
+}, {
+    owner: 'gjc-worker',
+    close: (fenceId) => getGjcWorkerSupervisor().fenceForDesktopRestart(fenceId),
+    release: (fenceId) => getGjcWorkerSupervisor().releaseDesktopRestartFence(fenceId),
+});
+// Install the same admission authority before startup catch-up, listeners, or
+// watcher initialization can accept work. Readers never perform configuration.
+configureGjcJobOrchestratorDesktopAdmission(desktopRestartAdmission);
+configureSessionWorktreeDesktopAdmission(desktopRestartAdmission);
+configureNativeDesktopRestartAdmission(desktopRestartAdmission);
+configureAutomationDesktopAdmission(desktopRestartAdmission);
+configureSessionsWatcherDesktopAdmission(desktopRestartAdmission);
+configureNotificationDesktopAdmission(desktopRestartAdmission);
+configureInternalDesktopAdmission(desktopRestartAdmission);
+getGjcWorkerSupervisor().configureDesktopRestartAdmission({
+    acquire: (source) => ({ release: desktopRestartAdmission.enter(source) }),
 });
 function gjcSpawn(message, options, writer) {
     return spawnGjcRun(message, {
@@ -484,16 +551,9 @@ app.get('/api/projects/:projectId/files/content', authenticateToken, asyncHandle
         const mimeType = mime.lookup(readablePath) || 'application/octet-stream';
         res.setHeader('Content-Type', mimeType);
 
-        // Stream the file
-        const fileStream = fs.createReadStream(readablePath);
-        fileStream.pipe(res);
-
-        fileStream.on('error', (error) => {
-            console.error('Error streaming file:', error);
-            if (!res.headersSent) {
-                res.status(500).json({ error: 'Error reading file' });
-            }
-        });
+        // Keep the admission lease until the source descriptor actually closes,
+        // including a disconnected viewer or a source read error.
+        await streamProjectFile(fs.createReadStream(readablePath), res);
 
     } catch (error) {
         console.error('Error serving binary file:', error);
@@ -896,19 +956,9 @@ const uploadFilesHandler = async (req, res) => {
     const stagingDir = await fsPromises.mkdtemp(path.join(uploadStagingRoot, 'request-'));
     await fsPromises.chmod(stagingDir, 0o700);
 
+    const ownedStorage = createProjectUploadStorage(stagingDir);
     const uploadMiddleware = multer({
-        storage: multer.diskStorage({
-            destination: (req, file, cb) => {
-                cb(null, stagingDir);
-            },
-            filename: (req, file, cb) => {
-                // Use a unique temp name, but preserve original name in file.originalname
-                // Note: file.originalname may contain path separators for folder uploads
-                const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-                // For temp file, just use a safe unique name without the path
-                cb(null, `upload-${uniqueSuffix}`);
-            }
-        }),
+        storage: ownedStorage.storage,
         limits: {
             fileSize: MAX_FILE_UPLOAD_SIZE_BYTES,
             files: MAX_FILE_UPLOAD_COUNT
@@ -920,6 +970,7 @@ const uploadFilesHandler = async (req, res) => {
     await new Promise((resolve) => {
         uploadMiddleware.array('files', MAX_FILE_UPLOAD_COUNT)(req, res, async (err) => {
         try {
+            await ownedStorage.settle();
             if (err) {
                 console.error('Multer error:', err);
                 if (err.code === 'LIMIT_FILE_SIZE') {
@@ -930,6 +981,7 @@ const uploadFilesHandler = async (req, res) => {
                 }
                 return res.status(500).json({ error: err.message });
             }
+            if (req.aborted) return;
             const { projectId } = req.params;
             const { targetPath, relativePaths, requestedFileCount: requestedFileCountRaw } = req.body;
 
@@ -1061,6 +1113,7 @@ const uploadFilesHandler = async (req, res) => {
             }
         } finally {
             try {
+                await ownedStorage.settle();
                 await fsPromises.rm(stagingDir, { recursive: true, force: true });
             } catch (cleanupError) {
                 console.error('Failed to clean upload staging directory:', cleanupError);
@@ -1590,6 +1643,7 @@ async function removeLocalServerMarker() {
 
 // Initialize database and start server
 async function startServer() {
+    const releaseStartup = enterInternalActivity('server:startup');
     try {
         // Initialize authentication database
         await initializeDatabase();
@@ -1627,7 +1681,17 @@ async function startServer() {
 
         console.log(`${c.info('[INFO]')} To run in development mode with hot-module replacement, go to http://${DISPLAY_HOST}:${VITE_PORT}`);
    
+        // Reserve the asynchronous listen callback before releasing startup.
+        // Native readiness can be observed before marker/watcher setup finishes.
+        const releaseReady = enterInternalActivity('server:listen-ready', true);
+        let readyStarted = false;
+        const onListenError = () => { if (!readyStarted) releaseReady(); };
+        server.once('error', onListenError);
+        try {
         server.listen(SERVER_PORT, HOST, async () => {
+            readyStarted = true;
+            server.off('error', onListenError);
+            try {
             const address = server.address();
             const port = typeof address === 'object' && address ? address.port : Number.parseInt(String(SERVER_PORT), 10);
             const appRoot = APP_ROOT;
@@ -1658,17 +1722,37 @@ async function startServer() {
 
             // Start watching the projects folder for changes
             await initializeSessionsWatcher();
-
-
+            } catch (error) {
+                markInternalActivityUncertain('server_ready_failed');
+                console.error('[ERROR] Server readiness setup failed:', error);
+            } finally { releaseReady(); }
         });
+        } catch (error) {
+            server.off('error', onListenError);
+            releaseReady();
+            throw error;
+        }
 
-        await closeSessionsWatcher();
         let shutdownStarted = false;
         const shutdownRuntimeServices = async () => {
             if (shutdownStarted) {
                 return;
             }
             shutdownStarted = true;
+            // Normal quit is not a restart-idle observation. Once this path
+            // starts, no reversible preparation may certify an idle runtime.
+            markInternalActivityUncertain('runtime_shutdown_started');
+
+            // Join the actual watcher startup/synchronization/exit lifetime.
+            // The old eager close ran before the asynchronous listen callback,
+            // and never closed the watcher that callback subsequently started.
+            try {
+                await closeSessionsWatcher();
+            } catch (err) {
+                console.error('[Watcher] Shutdown is unconfirmed; refusing normal process exit:', err?.message || err);
+                process.exitCode = 1;
+                return;
+            }
 
             let gjcShutdownFenced = false;
             try {
@@ -1717,6 +1801,8 @@ async function startServer() {
     } catch (error) {
         console.error('[ERROR] Failed to start server:', error);
         process.exit(1);
+    } finally {
+        releaseStartup();
     }
 }
 

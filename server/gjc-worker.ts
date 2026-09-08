@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Readable, Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 
@@ -11,6 +11,8 @@ import {
   GjcWorkerNdjsonDecoder,
   GjcWorkerProtocolError,
   serializeGjcWorkerFrame,
+  isGjcWorkerActivity,
+  type GjcWorkerActivity,
   type GjcWorkerEventFrame,
   type GjcWorkerGlobalEventMethod,
   type GjcWorkerRequestFrame,
@@ -44,6 +46,10 @@ export type GjcWorkerOAuthRuntime = {
   close(): void;
 };
 export type GjcWorkerRuntime = {
+  /** Pure, synchronous and complete only for accounted ownership. */
+  observeActivity?(): GjcWorkerActivity;
+  /** Reject new roots without aborting or suppressing accepted continuations. */
+  setAdmissionFence?(closed: boolean): void;
   inspectGjcGoal?(scope: GjcGoalScope, providerSessionId: string, sessionRoot: string): Promise<GjcGoalSnapshot>;
   controlGjcGoal?(runId: string, scope: GjcGoalScope, command?: GjcGoalCommand, stopAfterMutation?: boolean): Promise<GjcGoalSnapshot>;
   spawnGjc(message: string, options: JsonObject, writer: GjcWorkerWriter): SpawnedRun;
@@ -171,6 +177,10 @@ export class GjcWorkerHost {
   #initializationAttempted = false;
   #initialized = false;
   #closed = false;
+  #fenceId: string | null = null;
+  #operations = 0;
+  #revision = 0;
+  readonly #generation = randomUUID();
   #runs = new Map<string, Run>();
   #closePromise: Promise<void> | undefined;
   #oauthUnsubscribe: (() => void) | undefined;
@@ -200,6 +210,20 @@ export class GjcWorkerHost {
   async handle(request: GjcWorkerRequestFrame): Promise<void> {
     if (this.#cleanupUnconfirmed) return this.#response(request, failure(GJC_CLEANUP_UNCONFIRMED_CODE, GJC_CLEANUP_UNCONFIRMED_MESSAGE));
     if (this.#closed) return this.#response(request, failure('worker_closed', 'Worker is no longer accepting requests.'));
+    // Observation and admission controls are not work and must not invalidate
+    // their own snapshot or enter the host's operation counter.
+    if (request.method === 'worker.activity') return this.#observe(request);
+    if (request.method === 'worker.admission') return this.#admission(request);
+    if (this.#fenceId && ['worker.initialize', 'session.start', 'session.resume', 'turn.start', 'models.catalog', 'goal.inspect', 'oauth.start', 'oauth.providers', 'oauth.status'].includes(request.method)) {
+      return this.#response(request, failure('worker_admission_fenced', 'Worker admission is fenced.'));
+    }
+    this.#operations += 1;
+    this.#revision += 1;
+    try { await this.#dispatch(request); }
+    finally { this.#operations -= 1; this.#revision += 1; }
+  }
+
+  async #dispatch(request: GjcWorkerRequestFrame): Promise<void> {
     if (request.method === 'worker.initialize') return this.#initialize(request);
     if (!this.#initialized) return this.#response(request, failure('not_initialized', 'Worker must be initialized before use.'));
     switch (request.method) {
@@ -216,6 +240,57 @@ export class GjcWorkerHost {
       case 'oauth.cancel': return this.#oauthCancel(request);
       case 'worker.shutdown': return this.#shutdown(request);
     }
+  }
+
+  #admission(request: Extract<GjcWorkerRequestFrame, { method: 'worker.admission' }>): void {
+    const input = payload(request, ['fenceId', 'closed']);
+    if (!input || typeof input.fenceId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(input.fenceId)
+      || typeof input.closed !== 'boolean') return this.#response(request, failure('invalid_payload', 'Admission request is invalid.'));
+    if (!this.#initialized || !this.#runtime?.setAdmissionFence) {
+      return this.#response(request, failure('worker_admission_unavailable', 'Worker admission is unavailable.'));
+    }
+    if (this.#fenceId !== null && this.#fenceId !== input.fenceId) {
+      return this.#response(request, failure('worker_admission_conflict', 'Worker admission belongs to another fence.'));
+    }
+    const next = input.closed ? input.fenceId : null;
+    if (next !== this.#fenceId) {
+      try { this.#runtime.setAdmissionFence(input.closed); }
+      catch { return this.#response(request, failure('worker_admission_unavailable', 'Worker admission is unavailable.')); }
+      this.#fenceId = next;
+      this.#revision += 1;
+    }
+    this.#response(request, success({ fenceId: this.#fenceId }));
+  }
+
+  #observe(request: Extract<GjcWorkerRequestFrame, { method: 'worker.activity' }>): void {
+    if (!payload(request, [])) return this.#response(request, failure('invalid_payload', 'Activity request is invalid.'));
+    let runtime: GjcWorkerActivity | undefined;
+    try {
+      const observed = this.#runtime?.observeActivity?.();
+      if (isGjcWorkerActivity(observed)) runtime = observed;
+    } catch { /* Missing or invalid runtime evidence remains unknown. */ }
+    const unknown = [...new Set([
+      ...(!this.#initialized ? ['worker_not_initialized'] : []),
+      ...(!runtime ? ['worker_runtime_unaccounted'] : runtime.unknown),
+      ...(!this.#fenceId ? ['worker_admission_open'] : []),
+    ])].slice(0, 32);
+    this.#response(request, success({
+      // Bind BOTH ownership layers, including SDK-internal idle/busy/idle
+      // cycles that emit no worker events. Hashing the tuple is pure and
+      // bounded; taking an observation never increments either revision.
+      generation: createHash('sha256').update(JSON.stringify([
+        this.#generation, this.#revision, runtime?.generation ?? null,
+      ])).digest('hex'),
+      fenceId: this.#fenceId,
+      complete: Boolean(runtime?.complete) && unknown.length === 0,
+      starting: Number(this.#initializing) + (runtime?.starting ?? 0),
+      queued: runtime?.queued ?? 0,
+      running: this.#runs.size + (runtime?.running ?? 0),
+      settling: this.#operations + (runtime?.settling ?? 0),
+      approvals: runtime?.approvals ?? 0,
+      retained: runtime?.retained ?? 0,
+      unknown,
+    }));
   }
 
   /** Idempotently rejects new work, aborts every run, and allows their children to settle. */

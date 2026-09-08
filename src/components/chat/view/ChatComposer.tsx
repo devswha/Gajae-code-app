@@ -65,6 +65,9 @@ interface SlashCommand {
 }
 
 interface ChatComposerProps {
+  /** Page freeze is reversible; typing revokes its receipt instead of losing input. */
+  composerFrozen?: boolean;
+  voiceOwnerKey?: string;
   draftPersistence?: DraftPersistenceStatus;
   onRetryDraftPersistence?: () => Promise<boolean>;
   pendingPermissionRequests: PendingPermissionRequest[];
@@ -148,6 +151,8 @@ interface ChatComposerProps {
 }
 
 export default function ChatComposer({
+  composerFrozen = false,
+  voiceOwnerKey,
   draftPersistence,
   onRetryDraftPersistence,
   pendingPermissionRequests,
@@ -248,9 +253,10 @@ export default function ChatComposer({
   const { state: voiceState, toggle: voiceToggle, stop: voiceStop } = useVoiceInput(
     onVoiceTranscript ?? noopTranscript,
     handleVoiceError,
+    voiceOwnerKey,
   );
   const isRecording = voiceState === 'recording';
-  const isTranscribing = voiceState === 'transcribing';
+  const isVoiceBusy = voiceState !== 'idle' && !isRecording;
 
   // Detect if the AskUserQuestion interactive panel is active
   const hasQuestionPanel = pendingPermissionRequests.some(
@@ -459,13 +465,15 @@ export default function ChatComposer({
             <PromptInputButton
               tooltip={{ content: t('input.attachImages') }}
               onClick={openImagePicker}
+              disabled={composerFrozen}
+              aria-label={t('input.attachImages')}
               className="shrink-0"
             >
               <PlusIcon />
             </PromptInputButton>
 
             {onVoiceTranscript && voiceAvailable && (
-              <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} />
+              <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} disabled={composerFrozen} />
             )}
 
             <ModelAndReasoningPicker
@@ -511,6 +519,7 @@ export default function ChatComposer({
             {canSteer && (
               <PromptInputButton
                 onClick={onSteer}
+                disabled={composerFrozen}
                 tooltip={{ content: t('input.queue.steerNow') }}
                 aria-label={t('input.queue.steerNow')}
                 className="shrink-0 rounded-full border border-border/70 bg-background/70 text-muted-foreground hover:border-primary/30 hover:text-foreground"
@@ -521,6 +530,7 @@ export default function ChatComposer({
             {canQueueDraft && (
               <PromptInputButton
                 onClick={queueDraft}
+                disabled={composerFrozen}
                 tooltip={{ content: t('input.queue.sendNext') }}
                 aria-label={t('input.queue.sendNext')}
                 data-run-control="queue"
@@ -559,13 +569,13 @@ export default function ChatComposer({
                       }
                     : undefined
                 }
-                disabled={isRecording ? false : isTranscribing ? true : !input.trim()}
+                disabled={composerFrozen || (isRecording ? false : isVoiceBusy ? true : !input.trim())}
                 aria-label={t('input.send')}
                 title={t('input.send')}
                 data-run-control="send"
                 className="h-10 w-10 sm:h-10 sm:w-10"
               >
-                {isTranscribing ? (
+                {isVoiceBusy ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : (
                   <ArrowUpIcon className="h-4 w-4" />

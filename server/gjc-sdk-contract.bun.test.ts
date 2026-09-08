@@ -11,6 +11,7 @@ import { createAgentSession, discoverAuthStorage, type AutomationTools } from '@
 import { ModelRegistry } from '@gajae-code/coding-agent/config/model-registry';
 import { Settings } from '@gajae-code/coding-agent/config/settings';
 import { SessionManager } from '@gajae-code/coding-agent/session/session-manager';
+import { SessionDisposalIncompleteError } from '@gajae-code/coding-agent/session/agent-session';
 import { AsyncJobManager } from '@gajae-code/coding-agent/async/job-manager';
 import { registerCustomApi, unregisterCustomApis } from '@gajae-code/ai/api-registry';
 import { AssistantMessageEventStream } from '@gajae-code/ai/utils/event-stream';
@@ -59,6 +60,8 @@ type OAuthLogin = (provider: string, callbacks: OAuthCallbacks) => Promise<void>
 
 const globalMethods = new Set([
   'worker.initialize',
+  'worker.activity',
+  'worker.admission',
   'worker.shutdown',
   'models.catalog',
   'oauth.providers',
@@ -1301,7 +1304,10 @@ test('resume opens the sole exact session file and never re-emits session.create
 });
 
 /** Real SDK construction; prompts are intercepted before any model transport can run. */
-async function identityFixture() {
+async function identityFixture(behavior: {
+  realPrompts?: boolean;
+  onCreated?: (session: Awaited<ReturnType<typeof createAgentSession>>['session']) => void;
+} = {}) {
   const root = await mkdtemp(join(tmpdir(), 'gjc-sdk-identity-'));
   const cwd = join(root, 'project');
   const agentDir = join(root, 'agent');
@@ -1346,12 +1352,15 @@ async function identityFixture() {
       try {
         const result = await createAgentSession(sdkOptions);
         sessions.push(result.session);
-        const inspect = inspections.shift();
-        assert.ok(inspect, 'each SDK session needs an explicit offline prompt handler');
-        result.session.prompt = async () => {
-          try { await inspect(result.session); }
-          catch (error) { failures.push(error); throw error; }
-        };
+        behavior.onCreated?.(result.session);
+        if (!behavior.realPrompts) {
+          const inspect = inspections.shift();
+          assert.ok(inspect, 'each SDK session needs an explicit offline prompt handler');
+          result.session.prompt = async () => {
+            try { await inspect(result.session); }
+            catch (error) { failures.push(error); throw error; }
+          };
+        }
         return result;
       } catch (error) { failures.push(error); throw error; }
     },
@@ -1366,7 +1375,7 @@ async function identityFixture() {
     toolNames: ['bash', 'skill'], spawns: 'deny', bashPolicy: { allowedPrefixes: [] },
   };
   return {
-    root, options, factoryOptions, host, frames,
+    root, options, factoryOptions, host, frames, adapter, sessions,
     enqueueInspection(inspect: (session: Session) => Promise<void>) { inspections.push(inspect); },
     async run(id: string, inspect: (session: Session) => Promise<void>, providerSessionId?: string) {
       inspections.push(inspect);
@@ -2925,6 +2934,168 @@ test('SDK activity composes OAuth cancellation settlement and revisions without 
   }
 });
 
+test('adapter admission fences new roots but preserves accepted session startup and late title ownership', async () => {
+  const settingsReady = deferred<Settings>();
+  const titleDone = deferred<string | null>();
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, {
+    loadSettings: () => settingsReady.promise,
+    sessionTitleGraceMs: 0,
+    generateSessionTitle: () => titleDone.promise,
+  });
+  try {
+    const run = f.adapter.spawnGjc('accepted', { ...f.options, runHandle: 'accepted-before-fence' }, { send() {} });
+    assert.equal(f.adapter.snapshotActivity().starting, 1);
+    f.adapter.setAdmissionFence(true);
+    assert.throws(() => f.adapter.spawnGjc('blocked', { ...f.options, runHandle: 'blocked' }, { send() {} }), { code: 'worker_admission_fenced' });
+    assert.throws(() => f.adapter.oauth.start('openai-codex'), { code: 'worker_admission_fenced' });
+    await assert.rejects(f.adapter.modelCatalog(), { code: 'worker_admission_fenced' });
+    settingsReady.resolve({ cloneForCwd: async () => ({ override() {}, get() {}, getModelRole() {} }) } as unknown as Settings);
+    const session = await firstSession(f.sessions);
+    await session.promptStarted.promise;
+    assert.equal(session.aborted, false, 'fencing does not abort an accepted root during startup');
+    assert.equal(await f.adapter.steerGjcSession('accepted-before-fence', 'continue owned work'), true);
+    session.complete();
+    await run;
+    assert.equal(f.adapter.observeActivity().settling, 1, 'the accepted title remains owned after terminal UI completion');
+    titleDone.resolve(null);
+    await waitFor(() => f.adapter.observeActivity().settling === 0 ? true : undefined);
+    assert.deepEqual(f.adapter.observeActivity().unknown, ['sdk_background_ownership_unproven']);
+    f.adapter.setAdmissionFence(false);
+    assert.ok(Array.isArray((await f.adapter.modelCatalog()).models));
+  } finally {
+    titleDone.resolve(null);
+    for (const session of f.sessions) session.complete();
+    await f.close();
+  }
+});
+
+test('worker observation certifies an unused SDK adapter and preserves OAuth unwind behind the fence', async () => {
+  const loginDone = deferred<void>();
+  const loginStarted = deferred<void>();
+  const f = await fixture(undefined, undefined, undefined, undefined, async () => {
+    loginStarted.resolve(); await loginDone.promise;
+  });
+  const observe = async (id: string) => {
+    await f.host.handle(request('worker.activity', id));
+    return (response(f.frames, id).payload as { result: { complete: boolean; settling: number; generation: string; unknown: string[] } }).result;
+  };
+  try {
+    await f.host.handle(request('worker.admission', 'first-fence', { fenceId: 'f1', closed: true }));
+    const first = await observe('first-idle');
+    assert.equal(first.complete, true);
+    assert.equal(first.settling, 0);
+    assert.deepEqual(await observe('second-idle'), first);
+    await f.host.handle(request('worker.admission', 'release', { fenceId: 'f1', closed: false }));
+    const attempt = f.adapter.oauth.start('openai-codex');
+    await loginStarted.promise;
+    await f.host.handle(request('worker.admission', 'second-fence', { fenceId: 'f2', closed: true }));
+    f.adapter.oauth.cancel(attempt.attemptId as string);
+    assert.equal((await observe('unwind')).settling, 1);
+    assert.equal(f.sessions.length, 0);
+    loginDone.resolve();
+    await waitFor(() => f.adapter.snapshotActivity().oauth.settling === 0 ? true : undefined);
+    const settled = await observe('oauth-settled');
+    assert.equal(settled.complete, true);
+    assert.equal(settled.settling, 0);
+    assert.deepEqual(settled.unknown, []);
+  } finally {
+    loginDone.resolve();
+    await waitFor(() => f.adapter.snapshotActivity().oauth.settling === 0 ? true : undefined);
+    await f.close();
+  }
+});
+
+test('real SDK disposal completion is not broadened into an escaped-background ownership proof', async () => {
+  const f = await identityFixture();
+  try {
+    await f.run('actual-sdk-disposal', async (session) => {
+      assert.equal(typeof session.awaitDisposeCompletion, 'function');
+      assert.equal(f.adapter.observeActivity().complete, false);
+    });
+    await f.sessions[0]!.awaitDisposeCompletion();
+    const actual = f.adapter.observeActivity();
+    assert.equal(actual.starting + actual.running + actual.settling, 0);
+    assert.deepEqual(actual.unknown, ['sdk_background_ownership_unproven']);
+    assert.equal(actual.complete, false);
+  } finally { await f.close(); }
+});
+
+test('normal adapter cleanup joins real SDK retained cleanup past its public deadline', async () => {
+  const held = deferred<void>();
+  const cleaning = deferred<void>();
+  const f = await identityFixture({ realPrompts: true, onCreated(session) {
+    session.setDisposeTimeoutForTests(30);
+    session.registerToolSessionCleanup(async () => { cleaning.resolve(); await held.promise; });
+  } });
+  registerCustomApi('identity-contract', () => {
+    const stream = new AssistantMessageEventStream();
+    const message = identityAnswer('Normal cleanup contract.');
+    stream.push({ type: 'done', reason: 'stop', message }); stream.end(message); return stream;
+  }, f.root);
+  let completed = false;
+  const run = f.host.handle(request('session.start', 'actual-sdk-timeout', { message: 'offline held cleanup', options: f.options }))
+    .then(() => { completed = true; });
+  try {
+    await cleaning.promise;
+    await assert.rejects(f.sessions[0]!.dispose(), (error) => error instanceof SessionDisposalIncompleteError);
+    assert.equal(completed, false);
+    assert.equal(f.adapter.observeActivity().settling, 1);
+    assert.equal(f.adapter.observeActivity().unknown.includes('sdk_cleanup_unconfirmed'), false,
+      'a public deadline is not a teardown failure while the exact retained owner remains joinable');
+    held.resolve();
+    await run;
+    assert.equal((response(f.frames, 'actual-sdk-timeout').payload as { ok: boolean }).ok, true);
+    assert.equal(f.adapter.observeActivity().settling, 0);
+    assert.equal(f.adapter.observeActivity().unknown.includes('sdk_cleanup_unconfirmed'), false);
+  } finally {
+    held.resolve();
+    await run;
+    unregisterCustomApis(f.root);
+    await f.close();
+  }
+});
+
+test('real SDK post-prompt continuation remains owned across the adapter admission fence', async () => {
+  const held = deferred<void>();
+  const entered = deferred<void>();
+  const f = await identityFixture({ realPrompts: true, onCreated(session) {
+    let registered = false;
+    session.subscribe((event: { type: string }) => {
+      if (event.type !== 'agent_end' || registered) return;
+      registered = true;
+      // Public SDK test seam reserves the same owner used by its retry,
+      // compaction and delivery continuations. No timers or commands replaced.
+      session.trackPostPromptTaskForTests(held.promise);
+      entered.resolve();
+    });
+  } });
+  registerCustomApi('identity-contract', () => {
+    const stream = new AssistantMessageEventStream();
+    const message = identityAnswer('Post-prompt lifecycle.');
+    stream.push({ type: 'done', reason: 'stop', message }); stream.end(message); return stream;
+  }, f.root);
+  let completed = false;
+  const run = f.host.handle(request('session.start', 'owned-post-prompt', { message: 'offline continuation', options: f.options }))
+    .then(() => { completed = true; });
+  try {
+    await entered.promise;
+    f.adapter.setAdmissionFence(true);
+    const pending = f.adapter.observeActivity();
+    assert.equal(completed, false);
+    assert.ok(pending.running + pending.starting + pending.settling > 0);
+    held.resolve();
+    await run;
+    assert.equal((response(f.frames, 'owned-post-prompt').payload as { ok: boolean }).ok, true);
+    const settled = f.adapter.observeActivity();
+    assert.equal(settled.running + settled.starting + settled.settling, 0);
+    assert.equal(settled.unknown.includes('sdk_cleanup_unconfirmed'), false);
+  } finally {
+    held.resolve(); await run;
+    unregisterCustomApis(f.root);
+    await f.close();
+  }
+});
+
 test('SDK activity never treats empty diagnostics after background cleanup as proof of idle', async () => {
   const runnerDone = deferred<string>();
   const runnerStarted = deferred<void>();
@@ -2977,6 +3148,123 @@ test('SDK activity never treats empty diagnostics after background cleanup as pr
     await manager.dispose();
     await manager.awaitRetainedDisposalCompletion();
     await f.close();
+  }
+});
+
+test('normal adapter cleanup retains the real SDK owner while an async-job runner ignores cancellation', { timeout: 10_000 }, async () => {
+  const runnerDone = deferred<string>();
+  const cancelled = deferred<void>();
+  const managerDisposed = deferred<void>();
+  let manager!: AsyncJobManager;
+  let runnerSettled = false;
+  const f = await identityFixture({ realPrompts: true, onCreated(session) {
+    manager = AsyncJobManager.forEndpoint(session.sessionManager.getSessionId())!;
+    assert.ok(manager, 'use this actual SDK session owner, never the process-global fallback');
+    manager.register('bash', 'owned-cleanup-contract', async ({ signal }) => {
+      signal.addEventListener('abort', () => cancelled.resolve(), { once: true });
+      try { return await runnerDone.promise; }
+      finally { runnerSettled = true; }
+    }, { ownerId: session.getAgentId() });
+    manager.onChange(() => { if (manager.getAllJobs().length === 0) managerDisposed.resolve(); });
+    session.setDisposeTimeoutForTests(30);
+  } });
+  registerCustomApi('identity-contract', () => {
+    const stream = new AssistantMessageEventStream();
+    const message = identityAnswer('Normal async-job cleanup.');
+    stream.push({ type: 'done', reason: 'stop', message }); stream.end(message); return stream;
+  }, f.root);
+  let completed = false;
+  const run = f.host.handle(request('session.start', 'actual-owned-job', { message: 'offline owned job', options: f.options }))
+    .then(() => { completed = true; });
+  try {
+    await cancelled.promise;
+    await assert.rejects(f.sessions[0]!.dispose(), (error) => error instanceof SessionDisposalIncompleteError);
+    // Wait for the SDK's REAL 3-second manager deadline. Its visible rows are
+    // now gone, but awaitRetainedDisposalCompletion still owns the runner.
+    await managerDisposed.promise;
+    assert.deepEqual(manager.getAllJobs(), []);
+    let retainedJoined = false;
+    const retained = manager.awaitRetainedDisposalCompletion().then(() => { retainedJoined = true; });
+    await Promise.resolve();
+    assert.equal(retainedJoined, false);
+    assert.equal(completed, false);
+    assert.equal(runnerSettled, false);
+    assert.equal(f.adapter.observeActivity().settling, 1);
+    // No manager.dispose() call from the app/updater: the SDK's existing
+    // normal session cleanup owns cancellation, disposal and retained joins.
+    runnerDone.resolve('normal runner settled');
+    await retained;
+    await run;
+    assert.equal(runnerSettled, true);
+    assert.equal((response(f.frames, 'actual-owned-job').payload as { ok: boolean }).ok, true);
+    assert.equal(f.adapter.observeActivity().settling, 0);
+    assert.throws(() => manager.register('bash', 'after-close', async () => 'not admitted'), /disposed|shutting down/);
+  } finally {
+    runnerDone.resolve('finished');
+    await run;
+    unregisterCustomApis(f.root);
+    await f.close();
+  }
+});
+
+test('pinned SDK Codex prewarm credential task outlives every public session disposal join', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gjc-sdk-prewarm-lifetime-'));
+  const cwd = join(root, 'project');
+  const agentDir = join(root, 'agent');
+  await mkdir(cwd);
+  const authStorage = await discoverAuthStorage(agentDir);
+  const settings = await Settings.loadForScope({ cwd, agentDir });
+  settings.override('memory.enabled', false);
+  settings.override('skills.enabled', false);
+  settings.override('startup.networkPrewarm', false);
+  settings.override('providers.openaiWebsockets', 'on');
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const settled = deferred<void>();
+  let credentialPending = false;
+  // Public injected dependency, not patched SDK commands/lifecycle or timers.
+  // No token is returned, so this fixture cannot start a real WebSocket.
+  class HeldCredentialRegistry extends ModelRegistry {
+    override async getApiKey(..._args: Parameters<ModelRegistry['getApiKey']>): Promise<string | undefined> {
+      credentialPending = true; entered.resolve();
+      try { await release.promise; return undefined; }
+      finally { credentialPending = false; settled.resolve(); }
+    }
+  }
+  const registry = new HeldCredentialRegistry(authStorage, join(agentDir, 'models.yml'), settings, { agentDir });
+  registry.registerProvider('prewarm-contract', {
+    api: 'openai-codex-responses', apiKey: 'offline-unusable-key', baseUrl: 'http://127.0.0.1:1',
+    models: [{ id: 'astra', name: 'Offline lifecycle contract', reasoning: false,
+      input: ['text'], contextWindow: 100000, maxTokens: 1000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+  });
+  let session: Awaited<ReturnType<typeof createAgentSession>>['session'] | undefined;
+  try {
+    ({ session } = await createAgentSession({
+      cwd, agentDir, settings, authStorage, modelRegistry: registry,
+      model: registry.find('prewarm-contract', 'astra'),
+      sessionManager: SessionManager.create(cwd, join(root, 'sessions')),
+      toolNames: [], spawns: 'deny', enableMcpAutoload: false, enableLsp: false,
+      skipPythonPreflight: true, disableExtensionDiscovery: true,
+      skills: [], rules: [], contextFiles: [], promptTemplates: [], slashCommands: [],
+    }));
+    await entered.promise;
+    await session.waitForIdle();
+    await session.awaitSessionSettlement();
+    await session.dispose();
+    await session.awaitDisposeCompletion();
+    assert.equal(session.isDisposed, true);
+    assert.equal(credentialPending, true,
+      'sdk/session.ts launches prewarm without registering its promise with session cleanup');
+    release.resolve();
+    await settled.promise;
+    assert.equal(credentialPending, false);
+  } finally {
+    release.resolve();
+    if (credentialPending) await settled.promise;
+    await session?.dispose();
+    await registry.dispose(); authStorage.close(); await settings.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

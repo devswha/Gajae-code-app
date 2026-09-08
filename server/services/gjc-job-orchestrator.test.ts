@@ -3,7 +3,8 @@ import test from 'node:test';
 
 import type { GjcWorkerOutcome } from '../gjc-worker-client.js';
 
-import { GjcCapacityExhaustedError, JobOrchestrator, type JobAuthority, type GitWorktrees, type JobSupervisor } from './gjc-job-orchestrator.js';
+import { DesktopRestartAuthority } from './desktop-restart-authority.js';
+import { createGjcJobOrchestratorDesktopRestartReader, GjcCapacityExhaustedError, JobOrchestrator, withOwnedJobDesktopContinuation, type JobAuthority, type GitWorktrees, type JobSupervisor } from './gjc-job-orchestrator.js';
 
 type Snap = { jobId: string; state: string; lease: { owner: string; generation: number }; worktreeId?: string; repositoryRoot?: string; branch?: string; currentRun?: { runId: string; appSessionId: string }; dispatchCheckpoint?: { runId: string }; lastSequence?: number };
 class Jobs implements JobAuthority {
@@ -368,4 +369,231 @@ test('admin events broadcast only after a committed authority event is returned'
   const orchestrator = new JobOrchestrator({ jobs, git: new Git(), supervisor: new Supervisor(), broadcast: (_jobId, event) => events.push(event) });
   await orchestrator.appendAdminEvent('job-admin', 'publish.started', { branch: 'job-admin' });
   assert.deepEqual(events.map(({ eventId, sequence }) => ({ eventId, sequence })), [{ eventId: 'publish.started', sequence: 1 }]);
+});
+
+function desktopDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => { resolve = yes; });
+  return { resolve, promise };
+}
+const desktopTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+function desktopFixture() {
+  const jobs = new Jobs(); const git = new Git(); const supervisor = new Supervisor();
+  const completed = desktopDeferred<void>();
+  supervisor.spawnRun = (input) => {
+    supervisor.input = input;
+    return { started: Promise.resolve(), completion: completed.promise, abortHandle: input.runId };
+  };
+  const orchestrator = new JobOrchestrator({ jobs, git, supervisor, owner: 'desktop-test', createId: () => 'abc' });
+  const reader = createGjcJobOrchestratorDesktopRestartReader(orchestrator);
+  const authority = new DesktopRestartAuthority({ requiredOwners: ['orchestrator'], ownerReaders: { orchestrator: reader } });
+  orchestrator.configureDesktopAdmission(authority);
+  return { jobs, git, supervisor, completed, orchestrator, reader, authority };
+}
+
+test('desktop reader is pure and its revision advances through an idle/busy/idle cycle', async () => {
+  const f = desktopFixture();
+  const before = f.reader.read();
+  assert.deepEqual(f.reader.read(), before);
+  assert.equal(f.reader.getGeneration(), before.generation);
+  assert.equal(before.owner, 'orchestrator');
+  assert.deepEqual(f.jobs.calls, []);
+  assert.deepEqual(f.git.calls, []);
+  const write = desktopDeferred<void>();
+  f.jobs.state.state = 'ready';
+  f.jobs.appendAdminEvent = async (params) => { await write.promise; return Jobs.prototype.appendAdminEvent.call(f.jobs, params); };
+  const pending = f.orchestrator.appendAdminEvent('job-abc', 'admin', {});
+  const busy = f.reader.read();
+  assert.ok(busy.queued > 0 && busy.settling > 0);
+  assert.equal(f.reader.getGeneration(), busy.generation);
+  write.resolve();
+  await pending;
+  await desktopTick();
+  const after = f.reader.read();
+  assert.deepEqual({ ...after, generation: before.generation }, before);
+  assert.ok(BigInt(after.generation.split(':').at(-1)!) > BigInt(busy.generation.split(':').at(-1)!));
+  assert.ok(BigInt(busy.generation.split(':').at(-1)!) > BigInt(before.generation.split(':').at(-1)!));
+});
+
+test('desktop admission fences every public job root before any authority or Git await', async () => {
+  const f = desktopFixture();
+  const prepared = await f.authority.prepare({ attemptId: 'job-fence', epoch: 'desktop-1' });
+  assert.equal(prepared.ok, true);
+  for (const action of [
+    () => f.orchestrator.start('gjc', 'app-1', '/project', 'start', options),
+    () => f.orchestrator.turnStart('gjc', 'app-1', 'turn', options),
+    () => f.orchestrator.resume('job-abc', 'app-1', 'resume', options),
+    () => f.orchestrator.resolveBinding('gjc', 'app-1'),
+    () => f.orchestrator.reconcile(),
+    () => f.orchestrator.appendAdminEvent('job-abc', 'event', {}),
+  ]) await assert.rejects(action(), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.deepEqual(f.jobs.calls, []);
+  assert.deepEqual(f.git.calls, []);
+  assert.equal(f.supervisor.input, undefined);
+  if (prepared.ok) f.authority.cancel(prepared.token);
+});
+
+test('paused turn binding lookup owns ingress before there is a queue and transfers without an idle gap', async () => {
+  const f = desktopFixture();
+  f.jobs.state = { ...f.jobs.state, jobId: 'job-abc', state: 'ready', worktreeId: '/project/.gjc-worktrees/job-abc', repositoryRoot: '/project', branch: 'job/job-abc' };
+  const lookup = desktopDeferred<unknown>();
+  f.jobs.bindingResolve = () => lookup.promise as ReturnType<Jobs['bindingResolve']>;
+  const pending = f.orchestrator.turnStart('gjc', 'app-1', 'continue', options);
+  assert.equal(f.reader.read().starting, 1);
+  assert.equal(f.reader.read().queued, 0);
+  assert.equal((await f.authority.snapshot()).ingress, 1);
+  assert.equal((await f.authority.prepare({ attemptId: 'binding-race', epoch: 'desktop-1' })).ok, false);
+  assert.equal(f.supervisor.aborted, undefined);
+  lookup.resolve({ jobId: 'job-abc', state: 'ready', providerSessionId: 'provider-1' });
+  const handle = await pending;
+  assert.equal((await f.authority.snapshot()).idle, false);
+  assert.equal(f.reader.read().running, 1);
+  f.completed.resolve();
+  await handle.completion;
+  await desktopTick();
+  assert.equal((await f.authority.snapshot()).idle, true);
+});
+
+test('owned continuation capability is checked at entry and is not inherited by new callback roots', async () => {
+  const f = desktopFixture();
+  const prepared = await f.authority.prepare({ attemptId: 'continuation-scope', epoch: 'desktop-1' });
+  assert.equal(prepared.ok, true);
+  assert.throws(() => withOwnedJobDesktopContinuation(() => false, () => assert.fail('expired owner dispatched')), /live owner/);
+  let callbackChecked = false;
+  const handle = await withOwnedJobDesktopContinuation(() => true, () => f.orchestrator.start('gjc', 'app-1', '/project', 'owned turn', {
+    ...options,
+    onPrepared: async () => {
+      await assert.rejects(f.orchestrator.start('gjc', 'other-app', '/project', 'new callback root', options), { code: 'DESKTOP_RESTART_FENCED' });
+      callbackChecked = true;
+    },
+  }));
+  assert.equal(callbackChecked, true);
+  f.completed.resolve();
+  await handle.completion;
+  await desktopTick();
+  if (prepared.ok) assert.equal((await f.authority.commit(prepared.token, 'desktop-1')).ok, false);
+});
+
+test('paused worktree creation and resume validation retain root ingress until dispatch', async () => {
+  for (const mode of ['start', 'resume'] as const) {
+    const f = desktopFixture();
+    const gate = desktopDeferred<void>();
+    const reached = desktopDeferred<void>();
+    if (mode === 'start') {
+      f.git.create = async () => { reached.resolve(); await gate.promise; return Git.prototype.create.call(f.git); };
+    } else {
+      f.jobs.state = { ...f.jobs.state, jobId: 'job-abc', state: 'interrupted', worktreeId: '/project/.gjc-worktrees/job-abc', repositoryRoot: '/project', branch: 'job/job-abc' };
+      f.git.status = async () => { reached.resolve(); await gate.promise; return Git.prototype.status.call(f.git); };
+    }
+    const pending = mode === 'start'
+      ? f.orchestrator.start('gjc', 'app-1', '/project', 'start', options)
+      : f.orchestrator.resume('job-abc', 'app-1', 'resume', options);
+    await reached.promise;
+    assert.ok(f.reader.read().starting > 0 && f.reader.read().queued > 0);
+    assert.equal((await f.authority.snapshot()).ingress, 1);
+    assert.equal((await f.authority.prepare({ attemptId: `paused-${mode}`, epoch: 'desktop-1' })).ok, false);
+    assert.equal(f.supervisor.aborted, undefined);
+    gate.resolve();
+    const handle = await pending;
+    f.completed.resolve();
+    await handle.completion;
+    await desktopTick();
+    assert.equal((await f.authority.snapshot()).idle, true);
+  }
+});
+
+test('UI completion, worker completion, and registry clearing do not hide pending event persistence or finalization', async () => {
+  const f = desktopFixture();
+  const write = desktopDeferred<void>(); const writing = desktopDeferred<void>();
+  const finalize = desktopDeferred<void>(); const finalizing = desktopDeferred<void>();
+  f.jobs.appendEvent = async (params) => { writing.resolve(); await write.promise; return Jobs.prototype.appendEvent.call(f.jobs, params); };
+  f.jobs.runFinalize = async (params) => { finalizing.resolve(); await finalize.promise; return Jobs.prototype.runFinalize.call(f.jobs, params); };
+  const handle = await f.orchestrator.start('gjc', 'app-1', '/project', 'run', options);
+  f.supervisor.input!.writer.send({ kind: 'complete', exitCode: 0 });
+  await writing.promise;
+  f.completed.resolve();
+  await f.orchestrator.interruptForShutdown();
+  assert.equal(f.reader.read().running, 0);
+  assert.ok(f.reader.read().settling > 0 && f.reader.read().queued > 0);
+  assert.equal((await f.authority.snapshot()).idle, false);
+  write.resolve();
+  await finalizing.promise;
+  assert.ok(f.reader.read().settling > 0);
+  assert.equal((await f.authority.prepare({ attemptId: 'finalize-race', epoch: 'desktop-1' })).ok, false);
+  assert.equal(f.supervisor.aborted, undefined);
+  finalize.resolve();
+  await handle.completion;
+  await desktopTick();
+  assert.equal(f.reader.read().settling, 0);
+  assert.ok(f.reader.read().unknown.includes('orchestrator_closed'));
+});
+
+test('registry clearing does not release the actual worker and completion promise lifetime', async () => {
+  const f = desktopFixture();
+  const handle = await f.orchestrator.start('gjc', 'app-1', '/project', 'run', options);
+  await f.orchestrator.interruptForShutdown();
+  assert.equal(f.reader.read().running, 0);
+  assert.ok(f.reader.read().settling > 0);
+  assert.equal((await f.authority.prepare({ attemptId: 'cleared-map', epoch: 'desktop-1' })).ok, false);
+  f.completed.resolve();
+  await handle.completion;
+  await desktopTick();
+  assert.equal(f.reader.read().settling, 0);
+  assert.ok(f.reader.read().unknown.includes('orchestrator_closed'));
+});
+
+test('late unowned writer callbacks cannot persist through a prepared restart fence', async () => {
+  const f = desktopFixture();
+  const handle = await f.orchestrator.start('gjc', 'app-1', '/project', 'run', options);
+  f.completed.resolve();
+  await handle.completion;
+  await desktopTick();
+  const prepared = await f.authority.prepare({ attemptId: 'late-writer', epoch: 'desktop-1' });
+  assert.equal(prepared.ok, true);
+  const calls = f.jobs.calls.length;
+  f.supervisor.input!.writer.send({ kind: 'delta', text: 'late' });
+  await desktopTick();
+  assert.equal(f.jobs.calls.length, calls);
+  if (prepared.ok) f.authority.cancel(prepared.token);
+});
+
+test('unconfirmed termination stays unknown even after an abort completion acknowledgement', async () => {
+  const f = desktopFixture();
+  f.supervisor.spawnRun = (input) => ({ started: Promise.resolve(), completion: f.completed.promise, outcome: Promise.resolve('unconfirmed'), abortHandle: input.runId });
+  const handle = await f.orchestrator.start('gjc', 'app-1', '/project', 'run', options);
+  f.completed.resolve();
+  await assert.rejects(handle.completion, /unconfirmed/);
+  assert.equal(await f.orchestrator.abort(handle.jobId), false);
+  const activity = f.reader.read();
+  assert.equal(activity.running, 1);
+  assert.equal(activity.complete, false);
+  assert.ok(activity.unknown.includes('orchestrator_settlement_unconfirmed'));
+});
+
+test('initialization and health recovery remain owned and update cancellation cannot reset health', async () => {
+  const initializing = desktopDeferred<void>();
+  const jobs = new Jobs();
+  const orchestrator = new JobOrchestrator({ jobs, git: new Git(), supervisor: new Supervisor(), initialize: () => initializing.promise });
+  const reader = createGjcJobOrchestratorDesktopRestartReader(orchestrator);
+  assert.equal(reader.read().starting, 1);
+  initializing.resolve();
+  await desktopTick();
+  assert.equal(reader.read().starting, 0);
+  const authority = new DesktopRestartAuthority({ requiredOwners: ['orchestrator'], ownerReaders: { orchestrator: reader } });
+  orchestrator.configureDesktopAdmission(authority);
+  await orchestrator.authorityHealth(false);
+  const before = reader.read();
+  assert.equal(before.complete, false);
+  assert.equal((await authority.prepare({ attemptId: 'unhealthy', epoch: 'desktop-1' })).ok, false);
+  await assert.rejects(orchestrator.start('gjc', 'app-1', '/project', 'run', options), { code: 'authority_unavailable' });
+  const recovery = desktopDeferred<void>();
+  jobs.reconcile = async (params) => { await recovery.promise; return Jobs.prototype.reconcile.call(jobs, params); };
+  const healthy = orchestrator.authorityHealth(true);
+  assert.ok(reader.read().settling > 0);
+  recovery.resolve();
+  await healthy;
+  await desktopTick();
+  assert.equal((await authority.snapshot()).idle, true);
+  orchestrator.markClosed();
+  assert.ok(reader.read().unknown.includes('orchestrator_closed'));
 });

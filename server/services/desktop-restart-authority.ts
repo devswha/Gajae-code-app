@@ -64,6 +64,12 @@ export type DesktopRestartAuthorityOptions = {
   schedule?: (callback: () => void, delayMs: number) => () => void;
   readTimeoutMs?: number;
   tokenTtlMs?: number;
+  /** Trusted runtime admission, not an owner read or browser-selected callback. */
+  preparationFence?: {
+    owner: string;
+    close(fenceId: string): void | Promise<void>;
+    release(fenceId: string): void | Promise<void>;
+  };
 };
 
 type Owner = { owner: string; reader?: DesktopRestartOwnerReader };
@@ -83,6 +89,8 @@ type Attempt = {
   preparedRevision?: number;
   committing?: Promise<DesktopRestartCommitResult>;
   resolveCommit?: (result: DesktopRestartCommitResult) => void;
+  fenceId?: string;
+  fenceClosing?: Promise<void>;
 };
 
 const failure = (code: DesktopRestartFailure['code'], blockers: readonly DesktopRestartBlocker[] = []): DesktopRestartFailure => ({ ok: false, code, blockers });
@@ -127,6 +135,9 @@ export class DesktopRestartAuthority {
   private readonly schedule: NonNullable<DesktopRestartAuthorityOptions['schedule']>;
   private readonly readTimeoutMs: number;
   private readonly tokenTtlMs: number;
+  private readonly preparationFence: DesktopRestartAuthorityOptions['preparationFence'];
+  private readonly fenceEpoch = randomUUID();
+  private fenceReleaseFailed = false;
   private readonly lostEpochs = new Set<string>();
   private ingress = 0;
   private revision = 0;
@@ -153,6 +164,15 @@ export class DesktopRestartAuthority {
     });
     this.readTimeoutMs = duration(options.readTimeoutMs, 5_000);
     this.tokenTtlMs = duration(options.tokenTtlMs, 10_000);
+    if (options.preparationFence && (!options.requiredOwners.includes(options.preparationFence.owner)
+      || typeof options.preparationFence.close !== 'function' || typeof options.preparationFence.release !== 'function')) {
+      throw new TypeError('Preparation fence must belong to a required runtime owner.');
+    }
+    this.preparationFence = options.preparationFence ? Object.freeze({
+      owner: options.preparationFence.owner,
+      close: options.preparationFence.close.bind(options.preparationFence),
+      release: options.preparationFence.release.bind(options.preparationFence),
+    }) : undefined;
   }
 
   get state(): DesktopRestartState {
@@ -196,10 +216,13 @@ export class DesktopRestartAuthority {
   async snapshot(): Promise<DesktopRestartSnapshot> {
     this.expire();
     const revision = this.revision;
-    const deadline = this.now() + this.readTimeoutMs;
+    // Worker fencing and all owner reads share the original prepare budget.
+    const deadline = Math.min(this.now() + this.readTimeoutMs,
+      this.attempt?.phase === 'preparing' ? this.attempt.prepareDeadline : Infinity);
     const results = await Promise.all(this.owners.map((owner) => this.readOwner(owner, deadline)));
     const owners = results.flatMap((result) => result.activity ? [result.activity] : []);
     const blockers = results.flatMap((result) => result.blockers);
+    if (this.fenceReleaseFailed) blockers.push(unknown('owner_failed', this.preparationFence?.owner));
     blockers.push(...this.checkGenerations(owners));
     if (this.now() >= deadline) blockers.push(unknown('snapshot_timeout'));
     this.expire();
@@ -260,6 +283,27 @@ export class DesktopRestartAuthority {
   }
 
   private async prepareInner(attempt: Attempt): Promise<DesktopRestartPrepareResult> {
+    const initialRevision = this.revision;
+    if (this.preparationFence) {
+      // The top-level ingress fence is already closed. Only now fence the
+      // existing worker, before obtaining its non-spawning activity proof.
+      const fence = this.preparationFence;
+      const fenceId = `restart:${this.fenceEpoch}:${attempt.sequence}`;
+      attempt.fenceId = fenceId;
+      attempt.fenceClosing = Promise.resolve().then(() => fence.close(fenceId));
+      const closed = await this.readBeforeDeadline(() => attempt.fenceClosing, attempt.prepareDeadline);
+      if (this.attempt !== attempt) return failure('cancelled');
+      if (closed.kind !== 'value') {
+        const result = failure('unknown', [unknown(closed.kind === 'timeout' ? 'owner_timeout' : 'owner_failed', fence.owner)]);
+        this.reopen(attempt, result);
+        return result;
+      }
+      if (initialRevision !== this.revision || this.ingress !== 0) {
+        const result = failure('unknown', [unknown('activity_changed')]);
+        this.reopen(attempt, result);
+        return result;
+      }
+    }
     const snapshot = await this.snapshot();
     if (this.attempt !== attempt) return failure('cancelled');
     const blockers = [...snapshot.blockers, ...this.checkGenerations(snapshot.owners)];
@@ -332,6 +376,17 @@ export class DesktopRestartAuthority {
     this.revision += 1;
     attempt.resolvePrepare(result);
     attempt.resolveCommit?.(result);
+    if (attempt.fenceId && attempt.fenceClosing && this.preparationFence) {
+      // A timeout/cancel is not completion of an in-flight fence request. Join
+      // its actual settlement, then send the exact-ID release in order. Keep
+      // this cleanup counted so another prepare cannot overtake it.
+      const release = this.acquire();
+      const fenceId = attempt.fenceId;
+      const fence = this.preparationFence;
+      void attempt.fenceClosing.catch(() => {}).then(() => fence.release(fenceId)).catch(() => {
+        this.fenceReleaseFailed = true;
+      }).finally(release);
+    }
   }
 
   private checkGenerations(activities: readonly DesktopOwnerActivity[]): DesktopRestartBlocker[] {

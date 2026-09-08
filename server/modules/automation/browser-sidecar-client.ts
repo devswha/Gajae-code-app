@@ -5,12 +5,17 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
+
 import { isBrowserSessionState } from '../../../shared/browserSessionState.js';
+import type { DesktopOwnerActivity } from '../../../shared/desktopUpdateProtocol.js';
 
 import {
   BROWSER_PROTOCOL_VERSION,
   BrowserNdjsonDecoder,
   serializeBrowserFrame,
+  isBrowserChildActivity,
+  type BrowserChildActivity,
   type BrowserCommand,
   type BrowserEventFrame,
   type BrowserInput,
@@ -26,6 +31,7 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  uncertain?: boolean;
 };
 
 export type BrowserEventListener = (event: BrowserEventFrame) => void;
@@ -35,6 +41,7 @@ type BrowserSidecarClientOptions = {
   sidecarPath?: string;
   recoveryAttempts?: number;
   recoveryDelayMs?: number;
+  desktopRestartAdmission?: DesktopWorkAdmission;
 };
 
 type RecoverableSession = {
@@ -60,13 +67,57 @@ export class BrowserSidecarClient {
   private decoder = new BrowserNdjsonDecoder();
   private starting?: Promise<void>;
   private recovering?: Promise<void>;
+  private recoveryDeferred = false;
   private shuttingDown = false;
   private readonly pending = new Map<string, Pending>();
   private readonly listeners = new Set<BrowserEventListener>();
   private readonly sessions = new Map<string, RecoverableSession>();
   private ownedBrowserPid?: number;
+  private admission?: DesktopWorkAdmission;
+  private readonly activityEpoch = randomUUID();
+  private activityRevision = 0;
+  private dispatching = 0;
+  private closing = 0;
+  private transportUncertain = false;
+  private browserClosureUncertain = false;
+  private browserWorkDispatched = false;
+  private childRequestSequence = 0;
+  private childActivityEpoch?: string;
+  private childActivity?: BrowserChildActivity;
+  private childActivityInvalid = false;
 
-  constructor(private readonly options: BrowserSidecarClientOptions = {}) {}
+  constructor(private readonly options: BrowserSidecarClientOptions = {}) {
+    this.admission = options.desktopRestartAdmission;
+  }
+
+  configureDesktopRestartAdmission(admission?: DesktopWorkAdmission): void {
+    this.admission = admission;
+    this.activityRevision++;
+  }
+
+  getGeneration(): string { return `${this.activityEpoch}:${this.activityRevision}`; }
+
+  /** Pure observation of the existing request/recovery/session owners. */
+  snapshotActivity(): DesktopOwnerActivity {
+    const unknown: string[] = [];
+    if ([...this.pending.values()].some((request) => request.uncertain)) unknown.push('browser_request_unconfirmed');
+    if (this.transportUncertain) unknown.push('browser_transport_unconfirmed');
+    if (this.browserClosureUncertain) unknown.push('browser_closure_unconfirmed');
+    const child = this.childActivity;
+    const current = child && child.epoch === this.childActivityEpoch && child.requestSequence === this.childRequestSequence;
+    if (this.childActivityInvalid || (this.childActivityEpoch && !current)) unknown.push('browser_child_activity_unconfirmed');
+    if (this.browserWorkDispatched && this.sessions.size === 0 && !current) unknown.push('browser_child_quiescence_unconfirmed');
+    if (current) unknown.push(...child.unknown);
+    return {
+      owner: 'browser', generation: this.getGeneration(), complete: unknown.length === 0,
+      starting: Number(Boolean(this.starting)) + (current ? child.starting : 0),
+      queued: this.dispatching + Number(this.recoveryDeferred) + (current ? child.queued : 0),
+      running: this.pending.size + (current ? child.running + child.callbacks : 0),
+      settling: this.closing + Number(Boolean(this.recovering)) + Number(this.shuttingDown && Boolean(this.child))
+        + (current ? child.settling : 0),
+      approvals: 0, retained: this.sessions.size + (current ? child.retained + Number(child.browserAlive) : 0), unknown,
+    };
+  }
 
   /** Pid of the Chromium process the sidecar currently owns, when known. */
   get browserPid(): number | undefined {
@@ -121,24 +172,30 @@ export class BrowserSidecarClient {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.activityRevision++;
     const child = this.child;
-    if (!child) {
-      this.sessions.clear();
-      return;
-    }
+    if (!child) return;
+    this.closing++;
+    this.activityRevision++;
     try {
-      await this.request('shutdown', undefined, {}, 2_000);
+      // Shutdown is lifecycle-owned, not an idle query or a new producer.
+      await this.requestStarted('shutdown', undefined, {}, 2_000);
     } catch {
       this.killOwnedProcess(child);
+    } finally {
+      // A response/kill request is not process-exit evidence. fail(..., true)
+      // owns transport closure and clears requests only on the close event.
+      this.closing--;
+      this.activityRevision++;
     }
-    this.child = undefined;
-    this.sessions.clear();
   }
 
   private async ensureStarted(): Promise<void> {
-    if (this.child && this.child.exitCode === null) return;
     if (this.starting) return this.starting;
     if (this.shuttingDown) throw new Error('Browser automation is shutting down.');
+    if (this.transportUncertain) throw new Error('Browser sidecar closure is unconfirmed.');
+    if (this.child && this.child.exitCode === null) return;
+    this.activityRevision++;
     this.starting = (async () => {
       const compiled = !import.meta.url.endsWith('.ts');
       const sidecarPath = this.options.sidecarPath
@@ -160,15 +217,21 @@ export class BrowserSidecarClient {
         env,
       });
       this.child = child;
+      this.childRequestSequence = 0;
+      this.childActivityEpoch = undefined;
+      this.childActivity = undefined;
+      this.childActivityInvalid = false;
+      this.activityRevision++;
       this.decoder = new BrowserNdjsonDecoder();
       child.stdout.on('data', (chunk: Buffer) => this.handleData(child, chunk));
       child.stderr.on('data', (chunk: Buffer) => logDiagnostic(chunk.toString()));
       child.stdin.on('error', (error) => this.fail(child, error));
       child.on('error', (error) => this.fail(child, error));
-      child.on('close', () => this.fail(child, new Error('Browser sidecar exited.')));
+      child.on('close', () => this.fail(child, new Error('Browser sidecar exited.'), true));
       await this.requestStarted('initialize', undefined, {}, 10_000);
     })().finally(() => {
       this.starting = undefined;
+      this.activityRevision++;
     });
     return this.starting;
   }
@@ -180,9 +243,22 @@ export class BrowserSidecarClient {
     timeoutMs = 30_000,
     signal?: AbortSignal,
   ): Promise<unknown> {
-    await this.ensureStarted();
-    if (this.recovering && method !== 'status' && method !== 'shutdown') await this.recovering;
-    return this.requestStarted(method, sessionId, payload, timeoutMs, signal);
+    // Includes lazy status/state, preview subscription, open/command/input and
+    // cleanup requests: none of these is a cached read.
+    const release = this.admission?.enter(`automation.browser.${method}`);
+    this.dispatching++;
+    this.activityRevision++;
+    try {
+      if (signal?.aborted) throw new Error('Browser request was cancelled.');
+      if (this.recoveryDeferred) this.startRecovery(this.recoverySnapshots());
+      await this.ensureStarted();
+      if (this.recovering && method !== 'status' && method !== 'shutdown') await this.recovering;
+      return await this.requestStarted(method, sessionId, payload, timeoutMs, signal);
+    } finally {
+      this.dispatching--;
+      this.activityRevision++;
+      release?.();
+    }
   }
 
   private requestStarted(
@@ -194,25 +270,30 @@ export class BrowserSidecarClient {
   ): Promise<unknown> {
     const child = this.child;
     if (!child || child.exitCode !== null) return Promise.reject(new Error('Browser sidecar is unavailable.'));
+    if (signal?.aborted) return Promise.reject(new Error('Browser request was cancelled.'));
     const id = `browser-${randomUUID()}`;
     const frame: BrowserRequestFrame = {
       protocolVersion: BROWSER_PROTOCOL_VERSION,
       kind: 'request',
       id,
       method,
+      sequence: ++this.childRequestSequence,
       ...(sessionId ? { sessionId } : {}),
       payload,
     };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error('Browser sidecar request timed out.'));
+        abandon(new Error('Browser sidecar request timed out.'));
       }, timeoutMs);
-      const onAbort = () => {
+      const abandon = (error: Error) => {
+        const pending = this.pending.get(id);
+        if (!pending || pending.uncertain) return;
         clearTimeout(timer);
-        this.pending.delete(id);
-        reject(new Error('Browser request was cancelled.'));
+        pending.uncertain = true;
+        this.activityRevision++;
+        pending.reject(error);
       };
+      const onAbort = () => abandon(new Error('Browser request was cancelled.'));
       signal?.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {
         method,
@@ -227,7 +308,10 @@ export class BrowserSidecarClient {
         },
         timer,
       });
-      child.stdin.write(serializeBrowserFrame(frame));
+      if (method === 'session.open') this.browserWorkDispatched = true;
+      this.activityRevision++;
+      try { child.stdin.write(serializeBrowserFrame(frame)); }
+      catch (error) { abandon(error instanceof Error ? error : new Error('Browser request write failed.')); }
     });
   }
 
@@ -237,7 +321,20 @@ export class BrowserSidecarClient {
       for (const frame of this.decoder.push(chunk)) {
         if (frame.kind === 'response') this.settle(frame);
         else if (frame.kind === 'event') {
-          if (frame.method === 'async' && frame.payload.type === 'browser.process') {
+          if (frame.method === 'async' && frame.payload.type === 'browser.runtime.activity') {
+            const activity = frame.payload.activity;
+            if (!isBrowserChildActivity(activity)
+              || (this.childActivityEpoch && activity.epoch !== this.childActivityEpoch)
+              || (this.childActivity && (activity.epoch !== this.childActivity.epoch || activity.revision <= this.childActivity.revision))) {
+              this.childActivityInvalid = true;
+            } else {
+              this.childActivity = { ...activity, unknown: [...activity.unknown] };
+              this.childActivityInvalid = false;
+            }
+            this.activityRevision++;
+          } else if (frame.method === 'async' && frame.payload.type === 'browser.process') {
+            this.activityRevision++;
+            if (frame.payload.pid === null && this.ownedBrowserPid && !this.childActivityEpoch) this.browserClosureUncertain = true;
             this.ownedBrowserPid = typeof frame.payload.pid === 'number'
               && Number.isSafeInteger(frame.payload.pid)
               && frame.payload.pid > 0
@@ -256,42 +353,66 @@ export class BrowserSidecarClient {
   private settle(frame: BrowserResponseFrame): void {
     const pending = this.pending.get(frame.id);
     if (!pending) return;
-    this.pending.delete(frame.id);
-    clearTimeout(pending.timer);
     const responseSessionId = 'sessionId' in frame ? frame.sessionId : undefined;
     if (pending.method !== frame.method || pending.sessionId !== responseSessionId) {
+      clearTimeout(pending.timer);
+      pending.uncertain = true;
+      this.activityRevision++;
       pending.reject(new Error('Browser sidecar returned a mismatched response.'));
       return;
     }
+    this.pending.delete(frame.id);
+    clearTimeout(pending.timer);
+    this.activityRevision++;
     if (!frame.ok) pending.reject(new Error(`${frame.error?.code ?? 'browser_error'}: ${frame.error?.message ?? 'Browser operation failed.'}`));
     else {
+      if (frame.method === 'initialize' && frame.result && typeof frame.result === 'object') {
+        const result = frame.result as Record<string, unknown>;
+        if (result.activityProtocol === 1 && typeof result.activityEpoch === 'string'
+          && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(result.activityEpoch)) {
+          this.childActivityEpoch = result.activityEpoch;
+        }
+      }
       this.remember(frame.method, responseSessionId, frame.result);
       pending.resolve(frame.result);
     }
   }
 
-  private fail(child: ChildProcessWithoutNullStreams, error: Error): void {
+  private fail(child: ChildProcessWithoutNullStreams, error: Error, closed = false): void {
     if (child !== this.child) return;
-    this.child = undefined;
+    this.transportUncertain = !closed;
+    this.activityRevision++;
     logDiagnostic(error.message);
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      pending.uncertain = true;
       pending.reject(new Error('Browser sidecar disconnected.'));
     }
-    this.pending.clear();
     this.killOwnedProcess(child, this.ownedBrowserPid);
+    if (!closed) return;
+    // The sidecar and Chromium have separate process groups. Sidecar exit
+    // alone must not turn a lost browser (or a half-finished launch) into idle.
+    const provedBrowserExit = this.childActivity && this.childActivity.epoch === this.childActivityEpoch
+      && this.childActivity.requestSequence === this.childRequestSequence && !this.childActivity.browserAlive
+      && !this.childActivity.starting && !this.childActivity.unknown.length && !this.childActivityInvalid;
+    if (!provedBrowserExit && (this.ownedBrowserPid || this.browserWorkDispatched)) {
+      this.browserClosureUncertain = true;
+    }
+    this.child = undefined;
+    this.pending.clear();
     this.ownedBrowserPid = undefined;
+    if (provedBrowserExit && !this.browserClosureUncertain) {
+      // The child transport is now closed too: no queued JS callback can
+      // launch a new browser after its final, sequence-bound absence proof.
+      this.childActivity = undefined;
+      this.childActivityEpoch = undefined;
+      this.childActivityInvalid = false;
+      this.browserWorkDispatched = false;
+    }
     if (this.shuttingDown || this.sessions.size === 0) return;
 
-    const snapshots = [...this.sessions.entries()].map(([sessionId, session]) => ({
-      sessionId,
-      subscribed: session.subscribed,
-      state: {
-        sessionId,
-        activeTabId: session.state.activeTabId,
-        tabs: session.state.tabs.map((tab) => ({ ...tab })),
-      },
-    }));
+    this.recoveryDeferred = true;
+    const snapshots = this.recoverySnapshots();
     for (const snapshot of snapshots) {
       this.emit({
         protocolVersion: BROWSER_PROTOCOL_VERSION,
@@ -306,14 +427,18 @@ export class BrowserSidecarClient {
         method: 'state',
         sessionId: snapshot.sessionId,
         payload: { sessionId: snapshot.sessionId, activeTabId: null, tabs: [] },
-      });
+      }, false);
     }
     this.startRecovery(snapshots);
   }
 
   private remember(method: BrowserRequestMethod, sessionId: string | undefined, value: unknown): void {
     if (!sessionId) return;
+    this.activityRevision++;
     if (method === 'session.close') {
+      // Legacy children close best-effort. Upgraded children supply independent
+      // epoch/sequence-bound activity; their close reply alone is not idle proof.
+      if (!this.childActivityEpoch && this.browserWorkDispatched && this.sessions.has(sessionId)) this.browserClosureUncertain = true;
       this.sessions.delete(sessionId);
       return;
     }
@@ -325,7 +450,11 @@ export class BrowserSidecarClient {
     if (method === 'screencast.unsubscribe') existing.subscribed = false;
     const state = this.browserState(value, sessionId);
     if (state) existing.state = state;
-    this.sessions.set(sessionId, existing);
+    // Unsubscribe/state for an unknown session must not manufacture retained
+    // ownership. Empty *existing* sessions stay retained until explicit close.
+    if (this.sessions.has(sessionId) || method === 'session.open' || method === 'screencast.subscribe' || state?.tabs.length) {
+      this.sessions.set(sessionId, existing);
+    }
   }
 
   private browserState(value: unknown, sessionId: string): BrowserSessionState | null {
@@ -333,19 +462,39 @@ export class BrowserSidecarClient {
     return { sessionId, activeTabId: value.activeTabId, tabs: value.tabs.map((tab) => ({ ...tab })) };
   }
 
-  private emit(event: BrowserEventFrame): void {
-    if (event.method === 'state' && event.sessionId) this.remember('session.state', event.sessionId, event.payload);
+  private emit(event: BrowserEventFrame, remember = true): void {
+    // Delayed title/history callbacks from a closed session are replayable
+    // metadata, not evidence that a new session was opened.
+    if (remember && event.method === 'state' && event.sessionId && (this.sessions.has(event.sessionId)
+      || [...this.pending.values()].some((pending) => pending.sessionId === event.sessionId
+        && (pending.method === 'session.open' || pending.method === 'screencast.subscribe')))) {
+      this.remember('session.state', event.sessionId, event.payload);
+    }
     for (const listener of this.listeners) {
       try { listener(event); } catch { /* One consumer cannot break recovery fan-out. */ }
     }
+  }
+
+  private recoverySnapshots() {
+    return [...this.sessions.entries()].map(([sessionId, session]) => ({
+      sessionId, subscribed: session.subscribed,
+      state: { sessionId, activeTabId: session.state.activeTabId, tabs: session.state.tabs.map((tab) => ({ ...tab })) },
+    }));
   }
 
   private startRecovery(
     snapshots: Array<{ sessionId: string; state: BrowserSessionState; subscribed: boolean }>,
   ): void {
     if (this.recovering || this.shuttingDown) return;
+    let release: (() => void) | undefined;
+    try { release = this.admission?.enter('automation.browser.recovery'); }
+    catch { return; } // Retained recovery snapshots remain busy; no hidden spawn.
+    this.recoveryDeferred = false;
+    this.activityRevision++;
     this.recovering = this.recoverSessions(snapshots).finally(() => {
       this.recovering = undefined;
+      this.activityRevision++;
+      release?.();
     });
   }
 

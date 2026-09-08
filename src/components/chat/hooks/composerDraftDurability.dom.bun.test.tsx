@@ -4,6 +4,7 @@ import { afterEach, test } from 'node:test';
 import { act, cleanup, fireEvent, render, renderHook, waitFor } from '@testing-library/react';
 
 import type { Project, ProjectSession } from '../../../types/app';
+import { resetComposerFreezeForTests } from '../../../shared/composerFreeze';
 import { decideQueuedDispatch, useQueuedMessageAutoSend } from '../../../hooks/useQueuedMessageAutoSend';
 import type { SessionActivityMap } from '../../../hooks/useSessionProtection';
 import { draftInputKey, queuedMessageKey, readQueuedMessages, writeQueuedMessages } from '../utils/chatStorage';
@@ -51,7 +52,7 @@ const submit = () => ({ preventDefault() {} }) as never;
 const image = (body = 'fixture') => new File([body], 'fixture.png', { type: 'image/png', lastModified: 12345 });
 const snapshot = (input = 'old', conversation = 'session-a'): StoredComposerDraft => ({ projectId: project.projectId, conversation, input, images: [image()], queue: [], revision: 1 });
 globalThis.fetch = (async () => new Response('[]', { headers: { 'content-type': 'application/json' } })) as typeof fetch;
-afterEach(() => { cleanup(); localStorage.clear(); });
+afterEach(() => { cleanup(); resetComposerFreezeForTests(); localStorage.clear(); });
 
 test('actual composer form events save and hydrate a File attachment after remount', async () => {
   const repository = new Repository();

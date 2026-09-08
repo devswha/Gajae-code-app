@@ -43,6 +43,17 @@ export function createApiSuccessResponse<TData>(data: TData): ApiSuccessShape<TD
   return { success: true, data };
 }
 
+const httpActivityEpoch = randomUUID();
+let httpActivityRevision = 0n;
+let httpHandlers = 0;
+export const getHttpActivityGeneration = (): string => `${httpActivityEpoch}:${httpActivityRevision}`;
+export function snapshotHttpActivity() {
+  return {
+    owner: 'http-callbacks', generation: getHttpActivityGeneration(), complete: true,
+    starting: 0, queued: 0, running: httpHandlers, settling: 0, approvals: 0, retained: 0, unknown: [],
+  };
+}
+
 export function asyncHandler(handler: (req: Request, res: Response, next: NextFunction) => unknown | Promise<unknown>): RequestHandler {
   return (req, res, next) => {
     let release: (() => void) | undefined;
@@ -50,7 +61,17 @@ export function asyncHandler(handler: (req: Request, res: Response, next: NextFu
       const admission = req.app?.locals.desktopRestartAdmission as DesktopWorkAdmission | undefined;
       // Use the registered route, not a caller-controlled URL/query/body. Even
       // GET handlers can start native processes and must acquire before awaiting.
-      release = admission?.enter('http:handler');
+      const releaseAdmission = admission?.enter('http:handler');
+      httpHandlers += 1;
+      httpActivityRevision += 1n;
+      let released = false;
+      release = () => {
+        if (released) return;
+        released = true;
+        httpHandlers -= 1;
+        httpActivityRevision += 1n;
+        releaseAdmission?.();
+      };
       const outcome = Promise.resolve(handler(req, res, next));
       // Response finish/close is not completion of the actual handler. In
       // particular, client disconnect must not let prepare overtake a write.

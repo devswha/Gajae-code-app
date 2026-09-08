@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 import type { JobGitDiffResponse } from '../../shared/gjc-job-projection-protocol.js';
+import { withInternalActivity } from '../shared/desktop-internal-activity.js';
 
 import { GjcGitClient } from './gjc-git-client.js';
 
@@ -48,7 +49,22 @@ function diffResponse(value: unknown): JobGitDiffResponse {
   return { text, paths };
 }
 /** Resolves git operations from an immutable job binding, never a client-supplied path. */
-function execute(cwd: string, args: string[]): Promise<string> { return new Promise((resolve, reject) => { const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] }); let stdout = ''; let stderr = ''; child.stdout.on('data', value => { stdout += value; }); child.stderr.on('data', value => { stderr += value; }); child.on('error', reject); child.on('close', code => code === 0 ? resolve(stdout) : reject(new Error(stderr.trim() || `git ${args[0]} failed`))); }); }
+function execute(cwd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = ''; let failure: Error | undefined;
+    child.stdout.on('data', value => { stdout += value; });
+    child.stderr.on('data', value => { stderr += value; });
+    // An error (including a failed kill) is not an exit/stdio-close proof.
+    // The enclosing root must retain this child and its continuation until close.
+    child.on('error', error => { failure ??= error; });
+    child.once('close', code => {
+      if (failure) reject(failure);
+      else if (code === 0) resolve(stdout);
+      else reject(new Error(stderr.trim() || `git ${args[0]} failed`));
+    });
+  });
+}
 export class GjcJobGitService {
   private readonly summaryCache = new Map<string, CachedGitSummary>();
   constructor(private readonly jobs: Jobs, private readonly gitForRoot: (root: string) => Git, private readonly publishAdminEvent?: (jobId: string, eventId: string, payload: Record<string, unknown>) => Promise<void>) {}
@@ -62,9 +78,15 @@ export class GjcJobGitService {
     return { job, path: worktree.path, git };
   }
   async resolve(jobId: string): Promise<{ job: JobSnapshot; path: string; git: Git }> {
+    return withInternalActivity('git-service:resolve', () => this.resolveOwned(jobId));
+  }
+  private async resolveOwned(jobId: string): Promise<{ job: JobSnapshot; path: string; git: Git }> {
     return this.resolveSnapshot(snapshot(await this.jobs.get({ jobId })));
   }
   async summaries(jobIds: readonly string[], options: { forceRefresh?: boolean } = {}): Promise<Record<string, GitSummary>> {
+    return withInternalActivity('git-service:summaries', () => this.summariesOwned(jobIds, options));
+  }
+  private async summariesOwned(jobIds: readonly string[], options: { forceRefresh?: boolean }): Promise<Record<string, GitSummary>> {
     const ids = [...new Set(jobIds)];
     if (ids.length > 50) throw Object.assign(new Error('At most 50 job IDs are supported.'), { code: 'invalid_request' });
     const summaries: Record<string, GitSummary> = {};
@@ -114,23 +136,39 @@ export class GjcJobGitService {
     }
   }
 
-  async status(jobId: string): Promise<unknown> { const binding = await this.resolve(jobId); return binding.git.status({ jobId, branch: binding.job.branch, path: binding.path }); }
-  async diff(jobId: string): Promise<JobGitDiffResponse> {
-    const binding = await this.resolve(jobId);
-    const value = await binding.git.diff({ jobId, branch: binding.job.branch, path: binding.path, mode: 'base', baseCommit: binding.job.baseCommit, includeUntracked: true });
-    return diffResponse(value);
-  }
-  async publish(jobId: string): Promise<{ branch: string }> {
-    return this.lifecycle(jobId, 'publish', async () => {
-      const binding = await this.resolve(jobId);
-      await execute(binding.path, ['push', '-u', 'origin', binding.job.branch!]);
-      return { branch: binding.job.branch! };
+  async status(jobId: string): Promise<unknown> {
+    return withInternalActivity('git-service:status', async () => {
+      const binding = await this.resolveOwned(jobId);
+      return binding.git.status({ jobId, branch: binding.job.branch, path: binding.path });
     });
   }
-  async hasCommits(jobId: string): Promise<boolean> { const binding = await this.resolve(jobId); return Boolean((await execute(binding.path, ['rev-list', '--max-count=1', `${binding.job.baseCommit}..HEAD`])).trim()); }
+  async diff(jobId: string): Promise<JobGitDiffResponse> {
+    return withInternalActivity('git-service:diff', async () => {
+      const binding = await this.resolveOwned(jobId);
+      const value = await binding.git.diff({ jobId, branch: binding.job.branch, path: binding.path, mode: 'base', baseCommit: binding.job.baseCommit, includeUntracked: true });
+      return diffResponse(value);
+    });
+  }
+  async publish(jobId: string): Promise<{ branch: string }> {
+    return withInternalActivity('git-service:publish', () => this.lifecycle(jobId, 'publish', async () => {
+      const binding = await this.resolveOwned(jobId);
+      await execute(binding.path, ['push', '-u', 'origin', binding.job.branch!]);
+      return { branch: binding.job.branch! };
+    }));
+  }
+  async hasCommits(jobId: string): Promise<boolean> {
+    return withInternalActivity('git-service:has-commits', () => this.hasCommitsOwned(jobId));
+  }
+  private async hasCommitsOwned(jobId: string): Promise<boolean> {
+    const binding = await this.resolveOwned(jobId);
+    return Boolean((await execute(binding.path, ['rev-list', '--max-count=1', `${binding.job.baseCommit}..HEAD`])).trim());
+  }
   async commit(jobId: string, message: unknown, paths: unknown): Promise<{ commit: string; eventId: string }> {
+    return withInternalActivity('git-service:commit', () => this.commitOwned(jobId, message, paths));
+  }
+  private async commitOwned(jobId: string, message: unknown, paths: unknown): Promise<{ commit: string; eventId: string }> {
     const input = commitInput(message, paths);
-    const binding = await this.resolve(jobId);
+    const binding = await this.resolveOwned(jobId);
     const changed = new Set((await execute(binding.path, ['status', '--porcelain', '--untracked-files=all'])).split('\n').filter(Boolean).map(line => line.slice(3).replace(/^"|"$/gu, '')));
     if (input.paths.some(path => !changed.has(path))) throw Object.assign(new Error('Commit paths must be currently changed relative paths.'), { code: 'invalid_request' });
     await execute(binding.path, ['add', '--', ...input.paths]);
@@ -141,9 +179,12 @@ export class GjcJobGitService {
     return { commit, eventId };
   }
   async createPullRequest<T>(jobId: string, create: (context: { branch: string; baseBranch: string; remoteUrl: string }) => Promise<T>): Promise<T> {
+    return withInternalActivity('git-service:pull-request', () => this.createPullRequestOwned(jobId, create));
+  }
+  private async createPullRequestOwned<T>(jobId: string, create: (context: { branch: string; baseBranch: string; remoteUrl: string }) => Promise<T>): Promise<T> {
     return this.lifecycle(jobId, 'pr', async () => {
-      const binding = await this.resolve(jobId);
-      if (!await this.hasCommits(jobId)) throw new Error('Cannot create a pull request: the job branch has no commits beyond its base commit.');
+      const binding = await this.resolveOwned(jobId);
+      if (!await this.hasCommitsOwned(jobId)) throw new Error('Cannot create a pull request: the job branch has no commits beyond its base commit.');
       const reference = await execute(binding.path, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
       const baseBranch = reference.trim().replace(/^refs\/remotes\/origin\//u, '');
       if (!baseBranch) throw new Error('Unable to determine the remote default branch.');
@@ -151,7 +192,7 @@ export class GjcJobGitService {
     });
   }
   async prContext(jobId: string): Promise<{ branch: string; baseBranch: string; remoteUrl: string }> {
-    return this.createPullRequest(jobId, async context => context);
+    return withInternalActivity('git-service:pr-context', () => this.createPullRequestOwned(jobId, async context => context));
   }
 }
 
