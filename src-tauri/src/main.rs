@@ -30,7 +30,13 @@ mod updater_binding;
 #[cfg(target_os = "macos")]
 mod updater_bridge;
 #[cfg(target_os = "macos")]
+mod updater_bundle;
+#[cfg(target_os = "macos")]
 mod updater_discovery;
+#[cfg(target_os = "macos")]
+mod updater_install;
+#[cfg(target_os = "macos")]
+mod updater_location;
 #[cfg(target_os = "macos")]
 mod updater_manifest;
 #[cfg(target_os = "macos")]

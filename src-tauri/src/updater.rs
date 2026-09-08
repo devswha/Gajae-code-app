@@ -23,8 +23,9 @@ use crate::{
         self, DiscoveryCompleteness, DiscoveryCursor, DiscoveryError, DiscoveryPolicy,
         SelectedRelease,
     },
-    updater_manifest::{parse_manifest, Channel, Manifest, ProductIdentity},
-    updater_signature::{digest, verify_archive},
+    updater_install::{InstallError, VerifiedArchive},
+    updater_manifest::{Channel, Manifest, ProductIdentity},
+    updater_signature::verify_archive,
     updater_store::{PreparedRecord, Store},
     updater_transport::{build_client, HttpsClient},
 };
@@ -777,25 +778,21 @@ fn validate_cache(
     key: &str,
     os: &str,
 ) -> Result<Option<VerifiedTarget>, PrepareError> {
-    let Some((record, bytes)) = store.load().map_err(|_| PrepareError::Cache)? else {
+    let Some(archive) = VerifiedArchive::load(store, key).map_err(|error| match error {
+        InstallError::Signature => PrepareError::Signature,
+        InstallError::Archive => PrepareError::Archive,
+        _ => PrepareError::Cache,
+    })?
+    else {
         return Ok(None);
     };
-    let manifest =
-        parse_manifest(record.manifest.as_bytes(), &identity()).map_err(|_| PrepareError::Cache)?;
-    if !eligible_cached(&manifest, os)? {
+    let manifest = archive.manifest();
+    let record = archive.record();
+    if !eligible_cached(manifest, os)? {
         return Ok(None);
     }
-    if digest(&bytes) != record.archive_sha256 {
-        return Err(PrepareError::Cache);
-    }
-    verify_archive(&bytes, key, &manifest.signature).map_err(|_| PrepareError::Signature)?;
-    let inventory =
-        inspect_archive(&bytes, &archive_identity(&manifest)).map_err(|_| PrepareError::Archive)?;
-    if serde_json::to_value(inventory).map_err(|_| PrepareError::Archive)? != record.inventory {
-        return Err(PrepareError::Cache);
-    }
     Ok(Some(VerifiedTarget {
-        manifest,
+        manifest: manifest.clone(),
         release_id: record.release_id,
         manifest_asset_id: record.manifest_asset_id,
         archive_asset_id: record.archive_asset_id,
@@ -862,6 +859,7 @@ fn interval_delay() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{updater_manifest::parse_manifest, updater_signature::digest};
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
     struct Temp(PathBuf);
     impl Temp {

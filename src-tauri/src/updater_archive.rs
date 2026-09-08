@@ -839,7 +839,11 @@ impl MetadataValue {
     }
 }
 
-fn validate_plist(bytes: &[u8], identity: &ArchiveIdentity) -> Result<(), String> {
+fn parse_plist(bytes: &[u8]) -> Result<MetadataValue, String> {
+    require(
+        bytes.len() <= MAX_METADATA_BYTES,
+        "Info.plist exceeds metadata limit",
+    )?;
     let Document(value) = if bytes.starts_with(b"bplist00") {
         plist::from_reader(Cursor::new(bytes))
     } else {
@@ -860,6 +864,32 @@ fn validate_plist(bytes: &[u8], identity: &ArchiveIdentity) -> Result<(), String
         result
     }
     .map_err(|_| "Invalid, duplicate or excessive Info.plist metadata")?;
+    Ok(value)
+}
+
+/// The running app's pre-install check shares the archive's bounded semantic
+/// parser, including binary reference expansion/depth and duplicate-key limits.
+pub(crate) fn validate_installed_plist(
+    bytes: &[u8],
+    identifier: &str,
+    executable: &str,
+    desktop_version: &str,
+) -> Result<(), String> {
+    let value = parse_plist(bytes)?;
+    for (key, expected) in [
+        ("CFBundleIdentifier", identifier),
+        ("CFBundleExecutable", executable),
+        ("CFBundleShortVersionString", desktop_version),
+        ("CFBundleVersion", desktop_version),
+        ("CFBundlePackageType", "APPL"),
+    ] {
+        value.equals(key, expected)?;
+    }
+    Ok(())
+}
+
+fn validate_plist(bytes: &[u8], identity: &ArchiveIdentity) -> Result<(), String> {
+    let value = parse_plist(bytes)?;
     for (key, expected) in [
         ("CFBundleName", identity.product_name.as_str()),
         ("CFBundleDisplayName", identity.product_name.as_str()),
@@ -1386,6 +1416,40 @@ mod tests {
             get(&mut fixtures, PLIST).data = plist_bytes(&value, binary);
             inspect(&fixtures).unwrap();
         }
+    }
+
+    #[test]
+    fn installed_identity_uses_the_same_bounded_duplicate_rejecting_plist_parser() {
+        let identity = identity();
+        let value = plist_value();
+        for binary in [false, true] {
+            assert!(validate_installed_plist(
+                &plist_bytes(&value, binary),
+                &identity.bundle_identifier,
+                &identity.executable,
+                &identity.desktop_version
+            )
+            .is_ok());
+        }
+        let xml = String::from_utf8(plist_bytes(&value, false)).unwrap();
+        let duplicate = xml.replace(
+            "</dict>",
+            "<key>CFBundleIdentifier</key><string>spoof</string></dict>",
+        );
+        assert!(validate_installed_plist(
+            duplicate.as_bytes(),
+            &identity.bundle_identifier,
+            &identity.executable,
+            &identity.desktop_version
+        )
+        .is_err());
+        assert!(validate_installed_plist(
+            &vec![b'x'; MAX_METADATA_BYTES + 1],
+            &identity.bundle_identifier,
+            &identity.executable,
+            &identity.desktop_version
+        )
+        .is_err());
     }
 
     #[test]
@@ -2118,6 +2182,13 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         let inventory = inspect_archive(&bytes, &identity).unwrap();
+        if let Some(app) = std::env::var_os("GJC_ARCHIVE_FIXTURE_BUNDLE") {
+            let proof =
+                crate::updater_bundle::verify_inventory(std::path::Path::new(&app), &inventory)
+                    .expect("existing installed fixture must match the complete archive inventory");
+            assert_eq!(proof.inventory_sha256(), inventory.inventory_sha256);
+            eprintln!("Existing bundle matched {} signed-archive inventory entries (inventory equivalence only).", inventory.entries.len());
+        }
         if let Some(path) = std::env::var_os("GJC_ARCHIVE_FIXTURE_INVENTORY") {
             let file = std::fs::File::open(path).unwrap();
             let mut bytes = Vec::new();

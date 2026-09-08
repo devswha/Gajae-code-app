@@ -181,6 +181,22 @@ pub struct SelectedRelease {
     pub manifest: Manifest,
 }
 
+/// Immutable identities from a signature-verified cache. This is not install consent.
+pub struct PreparedIdentity<'a> {
+    pub release_id: u64,
+    pub manifest_asset_id: u64,
+    pub archive_asset_id: u64,
+    pub archive_size: u64,
+    pub manifest_bytes: &'a [u8],
+}
+
+/// The exact final endpoint native has just validated. It can contain an
+/// expiring delivery token, so never serialize, persist or debug-print it.
+pub struct CheckedManifest {
+    pub selected: SelectedRelease,
+    pub endpoint: Url,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IncompleteReason {
     PageBudget,
@@ -275,6 +291,86 @@ pub async fn fetch_archive(
     timeout: Duration,
 ) -> Result<Vec<u8>, DiscoveryError> {
     fetch_archive_with(client, policy, selected, timeout).await
+}
+
+/// Reconstruct only the staged release, not an entire discovery scan. The
+/// caller shares its absolute five-second preflight deadline with plugin check.
+pub async fn revalidate_prepared(
+    client: &HttpsClient,
+    policy: &DiscoveryPolicy,
+    prepared: PreparedIdentity<'_>,
+    deadline: Instant,
+) -> Result<CheckedManifest, DiscoveryError> {
+    revalidate_prepared_with(client, policy, prepared, deadline).await
+}
+
+async fn revalidate_prepared_with(
+    transport: &impl Transport,
+    policy: &DiscoveryPolicy,
+    prepared: PreparedIdentity<'_>,
+    deadline: Instant,
+) -> Result<CheckedManifest, DiscoveryError> {
+    let manifest = parse_manifest(prepared.manifest_bytes, &policy.identity())
+        .map_err(|_| DiscoveryError::InvalidManifest)?;
+    if prepared.release_id == 0
+        || prepared.manifest_asset_id == 0
+        || prepared.archive_asset_id == 0
+        || prepared.archive_size == 0
+        || prepared.archive_size > MAX_ARCHIVE_BYTES
+    {
+        return Err(DiscoveryError::IdentityChanged);
+    }
+    let mut budget = Budget {
+        deadline,
+        requests: 0,
+        pages: 0,
+    };
+    let response = budget
+        .fetch(
+            transport,
+            &policy.wire_url(&policy.api(&format!("/{}", prepared.release_id))),
+            Accept::GithubJson,
+            MAX_PAGE_BYTES,
+        )
+        .await?;
+    require_ok(&response)?;
+    let release: ReleaseRecord =
+        serde_json::from_slice(&response.body).map_err(|_| DiscoveryError::InvalidRelease)?;
+    let (release, manifest_asset, archive_asset) =
+        release_assets(policy, &release)?.ok_or(DiscoveryError::IdentityChanged)?;
+    if release.id != prepared.release_id
+        || manifest_asset.id != prepared.manifest_asset_id
+        || archive_asset.id != prepared.archive_asset_id
+        || archive_asset.size != prepared.archive_size
+        || manifest_asset.size != prepared.manifest_bytes.len() as u64
+    {
+        return Err(DiscoveryError::IdentityChanged);
+    }
+    let selected = SelectedRelease {
+        release,
+        manifest_asset,
+        archive_asset,
+        manifest,
+        manifest_bytes: prepared.manifest_bytes.to_vec(),
+    };
+    if !eligible(policy, &selected)? {
+        return Err(DiscoveryError::IdentityChanged);
+    }
+    // Plugin check always requests application/json, even when given a custom
+    // Accept header. Start at the canonical public download URL, not GitHub's
+    // asset API whose octet-stream and JSON representations can differ.
+    let (bytes, endpoint) = fetch_asset_at(
+        transport,
+        policy,
+        &mut budget,
+        &selected.manifest_asset,
+        policy.wire_url(&selected.manifest_asset.download_url),
+    )
+    .await?;
+    if bytes != prepared.manifest_bytes {
+        return Err(DiscoveryError::IdentityChanged);
+    }
+    Ok(CheckedManifest { selected, endpoint })
 }
 
 type FetchFuture<'a> =
@@ -757,7 +853,24 @@ async fn fetch_asset(
     budget: &mut Budget,
     asset: &AssetIdentity,
 ) -> Result<Vec<u8>, DiscoveryError> {
-    let mut url = policy.wire_url(&asset.api_url);
+    fetch_asset_at(
+        transport,
+        policy,
+        budget,
+        asset,
+        policy.wire_url(&asset.api_url),
+    )
+    .await
+    .map(|(bytes, _endpoint)| bytes)
+}
+
+async fn fetch_asset_at(
+    transport: &impl Transport,
+    policy: &DiscoveryPolicy,
+    budget: &mut Budget,
+    asset: &AssetIdentity,
+    mut url: Url,
+) -> Result<(Vec<u8>, Url), DiscoveryError> {
     let mut visited = HashSet::new();
     for redirects in 0..=MAX_REDIRECTS {
         // URLs with query tokens are ephemeral, not included in any result,
@@ -772,7 +885,7 @@ async fn fetch_asset(
             if response.location.is_some() || response.body.len() as u64 != asset.size {
                 return Err(DiscoveryError::SizeMismatch);
             }
-            return Ok(response.body);
+            return Ok((response.body, url));
         }
         if !matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308) {
             return Err(DiscoveryError::HttpStatus(response.status.as_u16()));
@@ -1218,6 +1331,112 @@ mod tests {
             }
         }
         panic!("injected finite scan did not complete")
+    }
+
+    fn prepared<'a>(release: &Value, bytes: &'a [u8]) -> PreparedIdentity<'a> {
+        let id = release["id"].as_u64().unwrap();
+        PreparedIdentity {
+            release_id: id,
+            manifest_asset_id: id * 10 + 1,
+            archive_asset_id: id * 10 + 2,
+            archive_size: 4,
+            manifest_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn reconstruction_revalidates_ids_and_returns_only_the_final_delivery_endpoint() {
+        let policy = policy(Channel::Beta);
+        let fake = Fake::default();
+        let (release, bytes) = release(&policy, 7, "2.0.0-beta.11", "0.2.5", "13.0");
+        fake.release(&policy, &release, &bytes);
+        let public = policy.download("v2.0.0-beta.11", "desktop-update.json");
+        let delivery: Url = "https://release-assets.githubusercontent.com/github-production-release-asset/123/abcdef?token=ephemeral".parse().unwrap();
+        fake.set(&public, Reply::redirect(delivery.as_str()));
+        fake.set(&delivery, Reply::ok(bytes.clone()));
+        let checked = tauri::async_runtime::block_on(revalidate_prepared_with(
+            &fake,
+            &policy,
+            prepared(&release, &bytes),
+            Instant::now() + Duration::from_secs(5),
+        ))
+        .unwrap();
+        assert_eq!(checked.endpoint, delivery);
+        assert_eq!(checked.selected.manifest_bytes, bytes);
+        assert_eq!(fake.calls().len(), 3);
+        assert_eq!(fake.calls()[1], public.as_str());
+        assert!(fake
+            .calls()
+            .iter()
+            .all(|url| !url.contains("per_page") && !url.ends_with("tar.gz")));
+    }
+
+    #[test]
+    fn reconstruction_refuses_replaced_assets_metadata_and_download_redirects() {
+        for alteration in [
+            "manifest-id",
+            "archive-id",
+            "archive-size",
+            "bytes",
+            "redirect",
+        ] {
+            let policy = policy(Channel::Beta);
+            let fake = Fake::default();
+            let (release, bytes) = release(&policy, 3, "2.0.0-beta.11", "0.2.5", "13.0");
+            fake.release(&policy, &release, &bytes);
+            let public = policy.download("v2.0.0-beta.11", "desktop-update.json");
+            let mut source = prepared(&release, &bytes);
+            match alteration {
+                "manifest-id" => source.manifest_asset_id += 9,
+                "archive-id" => source.archive_asset_id += 9,
+                "archive-size" => source.archive_size += 1,
+                "bytes" => {
+                    let mut altered = bytes.clone();
+                    let i = altered.iter().position(|byte| *byte == b'2').unwrap();
+                    altered[i] = b'3';
+                    fake.set(&public, Reply::ok(altered));
+                }
+                "redirect" => {
+                    fake.set(&public, Reply::redirect("https://evil.invalid/update.json"))
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                tauri::async_runtime::block_on(revalidate_prepared_with(
+                    &fake,
+                    &policy,
+                    source,
+                    Instant::now() + Duration::from_secs(5)
+                ))
+                .is_err(),
+                "{alteration}"
+            );
+            assert!(fake.calls().len() <= 2);
+        }
+    }
+
+    #[test]
+    fn expired_reconstruction_budget_and_invalid_cache_issue_no_requests() {
+        let policy = policy(Channel::Beta);
+        let fake = Fake::default();
+        let (release, bytes) = release(&policy, 3, "2.0.0-beta.11", "0.2.5", "13.0");
+        let result = tauri::async_runtime::block_on(revalidate_prepared_with(
+            &fake,
+            &policy,
+            prepared(&release, &bytes),
+            Instant::now(),
+        ));
+        assert!(matches!(result, Err(DiscoveryError::Deadline)));
+        let mut invalid = prepared(&release, &bytes);
+        invalid.archive_asset_id = 0;
+        assert!(tauri::async_runtime::block_on(revalidate_prepared_with(
+            &fake,
+            &policy,
+            invalid,
+            Instant::now() + Duration::from_secs(5)
+        ))
+        .is_err());
+        assert!(fake.calls().is_empty());
     }
 
     #[test]

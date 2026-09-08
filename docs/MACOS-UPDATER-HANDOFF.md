@@ -1,5 +1,14 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 활성 목표: 자동 업데이트 완성과 앱 배포
+
+목표는 준비 경로 구현으로 축소하지 않는다. 현재 이어지는 네이티브 설치 작업과
+검증 근거, 다음 시작/건강 상태/복구 연결의 순서는
+`DESKTOP-UPDATER-INSTALL-PROGRESS.md`에 있다. 공식 installer 호출, durable
+attempt writer, 전체 설치 트리 검증 코드를 작성했지만 **앱 시작·재시작 경로는
+아직 이 코드를 호출하지 않는다.** 원격 CI에서 드러난 엔진 테스트 SSOT 누락은
+`7ef7cda`로 수정했다. 자동 설치/배포 완료를 선언하거나 목표를 닫지 않았다.
+
 ## 2026-09-08 재개: 실제 admission 연결과 초안 보존
 
 `server/index.js`에 하나의 restart authority를 만들고 HTTP handler, 채팅 메시지,
