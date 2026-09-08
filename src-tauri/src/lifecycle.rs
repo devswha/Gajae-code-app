@@ -68,6 +68,19 @@ impl SidecarLifecycle {
             .is_some()
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn owns_pid(&self, expected: u32) -> bool {
+        *self.pid.lock().expect("sidecar lifecycle lock poisoned") == Some(expected)
+    }
+
+    /// Serialize the last pre-server update decision with Quit and every spawn.
+    /// The callback must only change in-memory admission; never do installer I/O.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn begin_startup_update(&self, admit: impl FnOnce() -> bool) -> bool {
+        let pid = self.pid.lock().expect("sidecar lifecycle lock poisoned");
+        pid.is_none() && !self.is_shutting_down() && admit()
+    }
+
     /// The final app.exit() must be allowed through ExitRequested, but only
     /// after Quit has fenced off new spawns and the tracked server has exited.
     pub fn shutdown_complete(&self) -> bool {
@@ -204,6 +217,10 @@ pub fn handle_close_request(window: &Window, event: &tauri::WindowEvent) {
         // Keep the window alive until the server finishes: shutdown errors
         // still need a visible window, and destroying it must not skip Quit.
         api.prevent_close();
+        #[cfg(target_os = "macos")]
+        if crate::updater_launch::holds_exit(window.app_handle()) {
+            return;
+        }
 
         // Linux has no macOS Reopen event (and no tray UI in this app). Hiding
         // the last window would leave the server and instance lock invisible.

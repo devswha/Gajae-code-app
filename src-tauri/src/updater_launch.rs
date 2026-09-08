@@ -1,0 +1,583 @@
+//! Native launch admission and verified successor health. Installation is
+//! currently actuated only by the explicit compile-bound QA qualification path;
+//! public activation still needs the approved G0/G3/release evidence.
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
+
+use tauri::{AppHandle, Manager};
+use tokio::sync::Notify;
+
+use crate::{
+    updater_attempt::{self, Journal, Phase as AttemptPhase, SuccessorAttempt, Target},
+    updater_binding::{Binding, Mode},
+    updater_install::{
+        ApplyError, PreparedInstall, Reconstruction, VerifiedArchive, VerifiedSuccessor,
+        PREFLIGHT_TIMEOUT,
+    },
+    updater_location::InstallLocation,
+    updater_screen::{self, Screen, ScreenState},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Phase {
+    Checking,
+    Normal,
+    AwaitingHealth,
+    Installing,
+    Restarting,
+    Recovery,
+}
+
+struct PendingSuccessor {
+    attempt: SuccessorAttempt,
+    proof: VerifiedSuccessor,
+}
+
+pub(crate) struct LaunchGate {
+    phase: AtomicU8,
+    pending: Mutex<Option<PendingSuccessor>>,
+    rendered_epoch: AtomicU64,
+    rendered: Notify,
+}
+
+impl Default for LaunchGate {
+    fn default() -> Self {
+        Self {
+            phase: AtomicU8::new(Phase::Checking as u8),
+            pending: Mutex::new(None),
+            rendered_epoch: AtomicU64::new(0),
+            rendered: Notify::new(),
+        }
+    }
+}
+
+impl LaunchGate {
+    fn phase(&self) -> Phase {
+        match self.phase.load(Ordering::Acquire) {
+            1 => Phase::Normal,
+            2 => Phase::AwaitingHealth,
+            3 => Phase::Installing,
+            4 => Phase::Restarting,
+            5 => Phase::Recovery,
+            _ => Phase::Checking,
+        }
+    }
+    fn set_phase(&self, phase: Phase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn begin_install(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                Phase::Checking as u8,
+                Phase::Installing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn admit(&self, root: &Path) -> Result<(), String> {
+        match self.phase() {
+            Phase::Normal => updater_attempt::check(root),
+            Phase::AwaitingHealth => {
+                let pending = self
+                    .pending
+                    .lock()
+                    .map_err(|_| "Update successor lock failed.")?;
+                let pending = pending
+                    .as_ref()
+                    .ok_or("Missing verified update successor.")?;
+                pending.attempt.validate_startup(&pending.proof)
+            }
+            _ => Err("Desktop update verification/recovery blocks server startup.".into()),
+        }
+    }
+}
+
+pub(crate) fn admit_server(app: &AppHandle, root: &Path) -> Result<(), String> {
+    app.state::<LaunchGate>().admit(root)
+}
+
+pub(crate) fn holds_exit(app: &AppHandle) -> bool {
+    app.try_state::<LaunchGate>()
+        .is_some_and(|gate| matches!(gate.phase(), Phase::Installing | Phase::Restarting))
+}
+
+pub(crate) fn expected_restart(app: &AppHandle, code: Option<i32>) -> bool {
+    code == Some(tauri::RESTART_EXIT_CODE)
+        && app
+            .try_state::<LaunchGate>()
+            .is_some_and(|gate| gate.phase() == Phase::Restarting)
+}
+
+fn local_page(url: &tauri::Url) -> bool {
+    url.scheme() == "tauri"
+        && url.host_str() == Some("localhost")
+        && matches!(url.path(), "/" | "/index.html")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn screen_script(app: &AppHandle) -> Option<String> {
+    let (epoch, screen) = app.state::<ScreenState>().published()?;
+    Some(paint_script(epoch, &screen))
+}
+
+fn paint_script(epoch: u64, screen: &Screen) -> String {
+    let script = updater_screen::script(screen);
+    // The callback is an embedded-page paint acknowledgment only. It cannot
+    // choose an archive, command, location, key, or installation outcome.
+    format!("(()=>{{const epoch={epoch};const html=document.documentElement;if(Number(html.dataset.gajaeUpdaterEpoch||0)>epoch)return;html.dataset.gajaeUpdaterEpoch=String(epoch);{script}const mounted=document.getElementById('gajae-updater-screen');if(!mounted)return;mounted.dataset.epoch=String(epoch);requestAnimationFrame(()=>requestAnimationFrame(()=>{{if(!mounted.isConnected||document.getElementById('gajae-updater-screen')!==mounted||mounted.dataset.epoch!==String(epoch)||html.dataset.gajaeUpdaterEpoch!==String(epoch))return;const t=window.__TAURI__?.core??window.__TAURI_INTERNALS__;if(t?.invoke)t.invoke('ack_updater_screen',{{epoch}}).catch(()=>{{}});}}));}})();")
+}
+
+pub(crate) fn restore_screen(webview: &tauri::Webview) -> bool {
+    if webview.label() != "main" || !webview.url().is_ok_and(|url| local_page(&url)) {
+        return false;
+    }
+    let app = webview.app_handle();
+    if app.state::<LaunchGate>().phase() == Phase::Normal {
+        return false;
+    }
+    if let Some(script) = screen_script(app) {
+        let _ = webview.eval(script);
+        return true;
+    }
+    false
+}
+
+pub(crate) fn acknowledge_screen(app: &AppHandle, window: &tauri::WebviewWindow, epoch: u64) {
+    if window.label() != "main" || !window.url().is_ok_and(|url| local_page(&url)) {
+        return;
+    }
+    let gate = app.state::<LaunchGate>();
+    if epoch == 0
+        || app
+            .state::<ScreenState>()
+            .published()
+            .map(|(current, _)| current)
+            != Some(epoch)
+    {
+        return;
+    }
+    gate.rendered_epoch.store(epoch, Ordering::Release);
+    gate.rendered.notify_one();
+}
+
+fn show(app: &AppHandle, screen: Screen) -> Result<u64, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Update window is unavailable.")?;
+    let epoch = app.state::<ScreenState>().publish(screen);
+    if window.url().is_ok_and(|url| local_page(&url)) {
+        window
+            .eval(screen_script(app).ok_or("Update screen is unavailable.")?)
+            .map_err(|_| "Could not display update screen.")?;
+    } else {
+        window
+            .navigate(
+                "tauri://localhost/index.html"
+                    .parse()
+                    .expect("static recovery URL"),
+            )
+            .map_err(|_| "Could not open embedded update screen.")?;
+    }
+    let _ = window.unminimize();
+    window.show().map_err(|_| "Could not show update window.")?;
+    window
+        .set_focus()
+        .map_err(|_| "Could not focus update window.")?;
+    Ok(epoch)
+}
+
+async fn show_confirmed(app: &AppHandle, screen: Screen) -> Result<(), String> {
+    let epoch = show(app, screen)?;
+    let gate = app.state::<LaunchGate>();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = gate.rendered.notified();
+            if gate.rendered_epoch.load(Ordering::Acquire) == epoch {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .map_err(|_| "Embedded update screen did not acknowledge display.".into())
+}
+
+fn trace(event: &'static str) {
+    if cfg!(debug_assertions) && Binding::compiled().mode == Mode::Qa {
+        eprintln!("[updater-qa:{}] {event}", std::process::id());
+    }
+}
+
+fn handoff_verified_install(
+    gate: &LaunchGate,
+    present: impl FnOnce() -> Result<u64, String>,
+    restart: impl FnOnce(),
+) {
+    gate.set_phase(Phase::Restarting);
+    let _ = present();
+    restart();
+}
+
+fn recover(app: &AppHandle, message: &str) {
+    trace("recovery");
+    app.state::<LaunchGate>().set_phase(Phase::Recovery);
+    let _ = show(
+        app,
+        Screen::Recovery {
+            message: message.to_owned(),
+        },
+    );
+}
+
+pub(crate) fn server_failed(app: &AppHandle, message: &str) -> bool {
+    match app.state::<LaunchGate>().phase() {
+        // A rejected Retry must not overwrite an in-flight updater document or
+        // turn a live installer into a false terminal recovery state.
+        Phase::Checking | Phase::Installing | Phase::Restarting => true,
+        Phase::AwaitingHealth | Phase::Recovery => {
+            recover(app, message);
+            true
+        }
+        Phase::Normal => false,
+    }
+}
+
+fn normal_start(app: &AppHandle) {
+    if app
+        .state::<crate::lifecycle::SidecarLifecycle>()
+        .is_shutting_down()
+    {
+        return;
+    }
+    app.state::<ScreenState>().clear();
+    app.state::<LaunchGate>().set_phase(Phase::Normal);
+    crate::supervisor::start(app.clone());
+}
+
+pub(crate) fn start(app: AppHandle, qa_install: bool) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = start_inner(&app, qa_install).await {
+            recover(&app, &error);
+        }
+    });
+}
+
+async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
+    trace("launch-start");
+    let root = crate::supervisor::desktop_data_root(app)?;
+    let binding = Binding::compiled();
+    let profile = app.try_state::<crate::qa_profile::QaProfile>();
+    let active = cfg!(target_arch = "aarch64")
+        && binding.admits_profile(
+            profile.as_ref().map(|profile| profile.root()),
+            !cfg!(debug_assertions),
+        );
+    let absent = updater_attempt::check(&root).is_ok();
+    if !active {
+        if !absent {
+            return Err(
+                "Unfinished update requires the matching updater-enabled app for verification."
+                    .into(),
+            );
+        }
+        normal_start(app);
+        return Ok(());
+    }
+    if absent && (!qa_install || binding.mode != Mode::Qa) {
+        // Current public builds continue preparation only until the required
+        // installation qualification exists; do not penalize normal startup.
+        normal_start(app);
+        return Ok(());
+    }
+    // No candidate adds no update I/O/network work to ordinary fresh startup.
+    let cached = root.join("desktop-update-cache/ready.json");
+    if absent && !cached.exists() {
+        normal_start(app);
+        return Ok(());
+    }
+    show(app, Screen::Checking)?;
+    let handle = app.clone();
+    let runtime =
+        tauri::async_runtime::spawn_blocking(move || crate::updater::initialize(&handle, binding))
+            .await;
+    let runtime = match runtime {
+        Ok(Ok(runtime)) => runtime,
+        _ if absent => {
+            normal_start(app);
+            return Ok(());
+        }
+        _ => return Err("Update successor initialization failed.".into()),
+    };
+    let journal = Journal::open(&root)?;
+    let loaded = journal.load()?;
+    let location = InstallLocation::validate(
+        &runtime.binding,
+        &std::env::current_exe().map_err(|_| "Current executable is unavailable.")?,
+    );
+    let location = match location {
+        Ok(location) => location,
+        Err(_) if loaded.is_none() => {
+            normal_start(app);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let store = runtime.store.clone();
+    let key = runtime.binding.public_key.clone();
+    let archive =
+        tauri::async_runtime::spawn_blocking(move || VerifiedArchive::load(&store, &key)).await;
+    let archive = match archive {
+        Ok(Ok(archive)) => archive,
+        _ if loaded.is_none() => {
+            normal_start(app);
+            return Ok(());
+        }
+        _ => return Err("Cached archive needed for successor verification is invalid.".into()),
+    };
+    if let Some(loaded) = loaded {
+        if loaded.phase() != AttemptPhase::AwaitingHealth {
+            return Err("An interrupted installation cannot be retried automatically.".into());
+        }
+        let archive =
+            archive.ok_or("The signed archive needed to verify the successor is missing.")?;
+        let target = loaded.target().clone();
+        let proof = tauri::async_runtime::spawn_blocking(move || {
+            archive.verify_successor(&target, &location)
+        })
+        .await
+        .map_err(|_| "Successor verification failed.")?
+        .map_err(|_| "The running app does not match the signed update target.")?;
+        let attempt = journal.resume_verified(&loaded, &proof)?;
+        trace("successor-verified");
+        *app.state::<LaunchGate>()
+            .pending
+            .lock()
+            .map_err(|_| "Update successor lock failed.")? =
+            Some(PendingSuccessor { attempt, proof });
+        app.state::<LaunchGate>().set_phase(Phase::AwaitingHealth);
+        crate::supervisor::start(app.clone());
+        return Ok(());
+    }
+    let Some(archive) = archive else {
+        normal_start(app);
+        return Ok(());
+    };
+    if !runtime.store.preferences()?.automatic
+        || !crate::updater::eligible_cached(archive.manifest(), &runtime.os)
+            .map_err(|error| error.code().to_owned())?
+    {
+        normal_start(app);
+        return Ok(());
+    }
+    // A QA qualification explicitly runs against synthetic app/data roots whose
+    // previous process tree the harness has proved stopped. This port check is
+    // an extra veto, NOT a general production previous-owner proof. Public
+    // activation remains blocked until G0/real ownership qualification is done.
+    if !qa_install || runtime.binding.mode != Mode::Qa {
+        normal_start(app);
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + PREFLIGHT_TIMEOUT;
+    qa_port_is_unoccupied(&root)?;
+    if app
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(runtime.binding.public_key.clone())
+                .build(),
+        )
+        .is_err()
+    {
+        // No installer or journal mutation has begun. Initialization failure is
+        // a deferred update, not a reason to strand the otherwise valid old app.
+        normal_start(app);
+        return Ok(());
+    }
+    let prepared = archive
+        .reconstruct(
+            app,
+            Reconstruction {
+                client: &runtime.client,
+                policy: &runtime.policy,
+                location: &location,
+                key: &runtime.binding.public_key,
+                certificate: runtime.certificate.clone(),
+                deadline,
+            },
+        )
+        .await;
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            normal_start(app);
+            return Ok(());
+        }
+    };
+    show_confirmed(app, Screen::Applying).await?;
+    trace("applying-visible");
+    if !app
+        .state::<crate::lifecycle::SidecarLifecycle>()
+        .begin_startup_update(|| app.state::<LaunchGate>().begin_install())
+    {
+        return Ok(());
+    }
+    run_install(app, prepared, journal, location).await
+}
+
+async fn run_install(
+    app: &AppHandle,
+    prepared: PreparedInstall,
+    journal: Journal,
+    location: InstallLocation,
+) -> Result<(), String> {
+    trace("install-begin");
+    let result =
+        tauri::async_runtime::spawn_blocking(move || prepared.apply(&journal, &location)).await;
+    match result {
+        Ok(Ok(installed)) => {
+            trace("install-returned-verified");
+            if installed.target().target_desktop_version == env!("CARGO_PKG_VERSION") {
+                return Err("An update cannot relaunch the same desktop version.".into());
+            }
+            // Mutation has completed and AwaitingHealth is durable. Occluded
+            // WebKit pages may stop producing animation frames: do not strand
+            // a verified replacement waiting for another paint acknowledgement.
+            // The strict Applying paint barrier before mutation is unchanged.
+            handoff_verified_install(
+                &app.state::<LaunchGate>(),
+                || show(app, Screen::Restarting),
+                || {
+                    trace("restart-requested");
+                    app.request_restart();
+                },
+            );
+            Ok(())
+        }
+        Ok(Err(ApplyError::Precondition)) => {
+            normal_start(app);
+            Ok(())
+        }
+        _ => Err(
+            "Installation did not prove a complete replacement. Automatic retry is blocked.".into(),
+        ),
+    }
+}
+
+fn qa_port_is_unoccupied(root: &Path) -> Result<(), String> {
+    let port = crate::desktop_origin::DesktopOrigin::load(root.to_owned())?.requested_port();
+    if port == 0 {
+        return Ok(());
+    }
+    match std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(250),
+    ) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+        _ => Err("The QA origin is occupied or its previous owner is uncertain.".into()),
+    }
+}
+
+pub(crate) async fn revalidate_successor(app: &AppHandle) -> Result<Option<Target>, String> {
+    if app.state::<LaunchGate>().phase() != Phase::AwaitingHealth {
+        return Ok(None);
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let gate = app.state::<LaunchGate>();
+        let pending = gate
+            .pending
+            .lock()
+            .map_err(|_| "Update successor lock failed.")?;
+        let pending = pending
+            .as_ref()
+            .ok_or("Verified update successor disappeared.")?;
+        pending
+            .proof
+            .revalidate_bundle()
+            .map_err(|_| "Installed update changed during startup.")?;
+        pending.attempt.validate_startup(&pending.proof)?;
+        Ok(Some(pending.proof.target().clone()))
+    })
+    .await
+    .map_err(|_| "Successor verification task failed.")?
+}
+
+pub(crate) fn finish_health(
+    app: &AppHandle,
+    proof: &crate::supervisor::HealthyServer,
+) -> Result<(), String> {
+    let gate = app.state::<LaunchGate>();
+    let mut pending = gate
+        .pending
+        .lock()
+        .map_err(|_| "Update successor lock failed.")?;
+    let successor = pending
+        .take()
+        .ok_or("Verified update successor is missing.")?;
+    if let Err(error) = successor.attempt.finish(proof) {
+        gate.set_phase(Phase::Recovery);
+        return Err(error);
+    }
+    gate.set_phase(Phase::Normal);
+    trace("successor-health-committed");
+    app.state::<ScreenState>().clear();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn gate_starts_closed_and_only_one_install_can_claim_it() {
+        let gate = LaunchGate::default();
+        assert!(gate.admit(Path::new("/does-not-exist")).is_err());
+        assert!(gate.begin_install());
+        assert!(!gate.begin_install());
+        assert!(gate.admit(Path::new("/does-not-exist")).is_err());
+        gate.set_phase(Phase::Recovery);
+        assert!(!gate.begin_install());
+    }
+    #[test]
+    fn normal_admission_retains_the_existing_presence_guard() {
+        let gate = LaunchGate::default();
+        gate.set_phase(Phase::Normal);
+        assert!(gate.admit(Path::new("/does-not-exist")).is_ok());
+        gate.set_phase(Phase::AwaitingHealth);
+        assert!(gate.admit(Path::new("/does-not-exist")).is_err());
+    }
+
+    #[test]
+    fn verified_install_handoff_does_not_depend_on_another_paint_success() {
+        use std::cell::RefCell;
+        for presentation in [Ok(4), Err("window unavailable".to_owned())] {
+            let gate = LaunchGate::default();
+            gate.set_phase(Phase::Installing);
+            let events = RefCell::new(Vec::new());
+            handoff_verified_install(
+                &gate,
+                || {
+                    assert_eq!(gate.phase(), Phase::Restarting);
+                    events.borrow_mut().push("present");
+                    presentation
+                },
+                || {
+                    assert_eq!(gate.phase(), Phase::Restarting);
+                    events.borrow_mut().push("restart");
+                },
+            );
+            assert_eq!(*events.borrow(), ["present", "restart"]);
+        }
+    }
+}

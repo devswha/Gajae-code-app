@@ -36,9 +36,13 @@ mod updater_discovery;
 #[cfg(target_os = "macos")]
 mod updater_install;
 #[cfg(target_os = "macos")]
+mod updater_launch;
+#[cfg(target_os = "macos")]
 mod updater_location;
 #[cfg(target_os = "macos")]
 mod updater_manifest;
+#[cfg(target_os = "macos")]
+mod updater_screen;
 #[cfg(target_os = "macos")]
 mod updater_signature;
 #[cfg(target_os = "macos")]
@@ -204,6 +208,10 @@ fn desktop_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoa
     #[cfg(target_os = "macos")]
     updater_bridge::page_load(webview, payload);
     if payload.event() == tauri::webview::PageLoadEvent::Finished {
+        #[cfg(target_os = "macos")]
+        if updater_launch::restore_screen(webview) {
+            return;
+        }
         supervisor::restore_recovery(webview);
     }
     #[cfg(target_os = "linux")]
@@ -260,6 +268,12 @@ fn retry_desktop_server(app: tauri::AppHandle) {
     supervisor::start(app);
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn ack_updater_screen(app: tauri::AppHandle, window: tauri::WebviewWindow, epoch: u64) {
+    updater_launch::acknowledge_screen(&app, &window, epoch);
+}
+
 fn main() {
     match build_info::handle_cli(std::env::args_os().skip(1)) {
         Ok(Some(info)) => {
@@ -276,7 +290,9 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     let qa_profile = (|| -> Result<Option<qa_profile::QaProfile>, String> {
-        let Some(root) = qa_profile::requested_root(std::env::args().skip(1))? else {
+        let requested = qa_profile::requested_root(std::env::args().skip(1))?;
+        updater_binding::Binding::compiled().validate_launch_profile(requested.as_deref())?;
+        let Some(root) = requested else {
             return Ok(None);
         };
         let version = std::process::Command::new("/usr/bin/sw_vers")
@@ -293,6 +309,21 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     });
+    #[cfg(target_os = "macos")]
+    let qa_install = {
+        let count = std::env::args()
+            .filter(|arg| arg == "--qa-update-install")
+            .count();
+        if count > 1
+            || (count == 1
+                && (qa_profile.is_none()
+                    || updater_binding::Binding::compiled().mode != updater_binding::Mode::Qa))
+        {
+            eprintln!("--qa-update-install requires one compile-bound isolated QA profile.");
+            std::process::exit(2);
+        }
+        count == 1
+    };
     #[cfg(not(target_os = "macos"))]
     if std::env::args().any(|arg| arg == "--qa-profile" || arg.starts_with("--qa-profile=")) {
         eprintln!("--qa-profile is currently supported only on macOS 14 or newer.");
@@ -302,6 +333,13 @@ fn main() {
     #[cfg(target_os = "macos")]
     let (context, qa_windows) = {
         let mut context = context;
+        if cfg!(target_arch = "aarch64") {
+            updater_binding::Binding::compiled().configure_plugin(
+                context.config_mut(),
+                qa_profile.as_ref().map(|profile| profile.root()),
+                !cfg!(debug_assertions),
+            );
+        }
         let windows = qa_profile
             .as_ref()
             .map(|profile| profile.configure(context.config_mut()))
@@ -327,123 +365,147 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(navigation::plugin())
         .on_page_load(desktop_page_load)
-        .on_window_event(lifecycle::handle_close_request)
-        .invoke_handler(tauri::generate_handler![retry_desktop_server])
-        .setup(move |app| {
-            // A held lock means another instance is running. Setup errors
-            // abort inside did_finish_launching (panic_cannot_unwind ->
-            // SIGABRT -> crash-reporter dialog), so report the bounded
-            // ownership failure and exit with a nonzero status instead;
-            // macOS LaunchServices focuses the running instance on reopen.
-            // A failed bounded handoff is still a failed launch: never report
-            // success when this process did not acquire ownership.
-            #[cfg(not(target_os = "linux"))]
-            let lock_result = {
-                #[cfg(target_os = "macos")]
-                {
-                    if qa_profile.is_some() {
-                        // QaProfile already owns its lock, before window
-                        // creation.
-                        Ok(None)
-                    } else {
-                        acquire_single_instance_lock().map(Some)
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                {
+        .on_window_event(lifecycle::handle_close_request);
+    #[cfg(target_os = "macos")]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        retry_desktop_server,
+        ack_updater_screen
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![retry_desktop_server]);
+    let builder = builder.setup(move |app| {
+        // A held lock means another instance is running. Setup errors
+        // abort inside did_finish_launching (panic_cannot_unwind ->
+        // SIGABRT -> crash-reporter dialog), so report the bounded
+        // ownership failure and exit with a nonzero status instead;
+        // macOS LaunchServices focuses the running instance on reopen.
+        // A failed bounded handoff is still a failed launch: never report
+        // success when this process did not acquire ownership.
+        #[cfg(not(target_os = "linux"))]
+        let lock_result = {
+            #[cfg(target_os = "macos")]
+            {
+                if qa_profile.is_some() {
+                    // QaProfile already owns its lock, before window
+                    // creation.
+                    Ok(None)
+                } else {
                     acquire_single_instance_lock().map(Some)
                 }
-            };
-            #[cfg(not(target_os = "linux"))]
-            let lock = match lock_result {
-                Ok(lock) => lock,
-                Err(message) => {
-                    eprintln!("{message}");
-                    std::process::exit(1);
-                }
-            };
-            #[cfg(not(target_os = "linux"))]
-            if let Some(lock) = lock {
-                app.manage(lock);
             }
-            #[cfg(target_os = "macos")]
-            if let Some(profile) = qa_profile {
-                app.manage(profile);
-            }
-            app.manage(navigation::LoopbackOrigin::default());
-            app.manage(lifecycle::SidecarLifecycle::default());
-            app.manage(supervisor::RecoveryScreen::default());
-            #[cfg(target_os = "macos")]
-            app.manage(updater::Preparation::default());
-            #[cfg(target_os = "macos")]
-            app.manage(updater_bridge::Bridge::default());
-            #[cfg(target_os = "macos")]
-            if let Some(profile) = app.try_state::<qa_profile::QaProfile>() {
-                profile.create_windows(app, &qa_windows)?;
-            }
-            #[cfg(target_os = "linux")]
+            #[cfg(target_os = "windows")]
             {
-                app.manage(StartupDeepLinks::new(
-                    activation
-                        .urls
-                        .into_iter()
-                        .filter_map(|url| url.parse().ok())
-                        .collect(),
-                ));
-                let app_handle = app.handle().clone();
-                app.manage(instance.listen(move |activation| {
-                    if app_handle
-                        .state::<lifecycle::SidecarLifecycle>()
-                        .is_shutting_down()
-                    {
-                        return false;
-                    }
-                    let app = app_handle.clone();
-                    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                    if app_handle
-                        .run_on_main_thread(move || {
-                            if app
-                                .state::<lifecycle::SidecarLifecycle>()
-                                .is_shutting_down()
-                            {
-                                let _ = sender.send(false);
-                                return;
-                            }
-                            receive_deep_links(
-                                &app,
-                                activation
-                                    .urls
-                                    .into_iter()
-                                    .filter_map(|url| url.parse().ok())
-                                    .collect(),
-                            );
-                            focus_main_window(&app);
-                            let _ = sender.send(true);
-                        })
-                        .is_err()
-                    {
-                        return false;
-                    }
-                    // Acknowledge only once the UI thread accepted the request;
-                    // Close may fence activations while this callback is queued.
-                    receiver
-                        .recv_timeout(std::time::Duration::from_secs(2))
-                        .unwrap_or(false)
-                })?);
+                acquire_single_instance_lock().map(Some)
             }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let lock = match lock_result {
+            Ok(lock) => lock,
+            Err(message) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        if let Some(lock) = lock {
+            app.manage(lock);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(profile) = qa_profile {
+            app.manage(profile);
+        }
+        app.manage(navigation::LoopbackOrigin::default());
+        app.manage(lifecycle::SidecarLifecycle::default());
+        app.manage(supervisor::RecoveryScreen::default());
+        #[cfg(target_os = "macos")]
+        app.manage(updater_launch::LaunchGate::default());
+        #[cfg(target_os = "macos")]
+        app.manage(updater_screen::ScreenState::default());
+        #[cfg(target_os = "macos")]
+        app.manage(updater::Preparation::default());
+        #[cfg(target_os = "macos")]
+        app.manage(updater_bridge::Bridge::default());
+        #[cfg(target_os = "macos")]
+        if let Some(profile) = app.try_state::<qa_profile::QaProfile>() {
+            profile.create_windows(app, &qa_windows)?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            app.manage(StartupDeepLinks::new(
+                activation
+                    .urls
+                    .into_iter()
+                    .filter_map(|url| url.parse().ok())
+                    .collect(),
+            ));
             let app_handle = app.handle().clone();
-            app.deep_link().on_open_url(move |event| {
-                receive_deep_links(&app_handle, event.urls());
-            });
-            supervisor::start(app.handle().clone());
-            Ok(())
+            app.manage(instance.listen(move |activation| {
+                if app_handle
+                    .state::<lifecycle::SidecarLifecycle>()
+                    .is_shutting_down()
+                {
+                    return false;
+                }
+                let app = app_handle.clone();
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                if app_handle
+                    .run_on_main_thread(move || {
+                        if app
+                            .state::<lifecycle::SidecarLifecycle>()
+                            .is_shutting_down()
+                        {
+                            let _ = sender.send(false);
+                            return;
+                        }
+                        receive_deep_links(
+                            &app,
+                            activation
+                                .urls
+                                .into_iter()
+                                .filter_map(|url| url.parse().ok())
+                                .collect(),
+                        );
+                        focus_main_window(&app);
+                        let _ = sender.send(true);
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                // Acknowledge only once the UI thread accepted the request;
+                // Close may fence activations while this callback is queued.
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap_or(false)
+            })?);
+        }
+        let app_handle = app.handle().clone();
+        app.deep_link().on_open_url(move |event| {
+            receive_deep_links(&app_handle, event.urls());
         });
+        #[cfg(target_os = "macos")]
+        updater_launch::start(app.handle().clone(), qa_install);
+        #[cfg(not(target_os = "macos"))]
+        supervisor::start(app.handle().clone());
+        Ok(())
+    });
     let app = builder
         .build(context)
         .expect("failed to run Gajae Code App desktop shell");
     app.run(
         |app: &tauri::AppHandle<tauri::Wry>, event: tauri::RunEvent| match event {
-            tauri::RunEvent::ExitRequested { api, .. } => {
+            tauri::RunEvent::ExitRequested { api, code, .. } => {
+                #[cfg(target_os = "macos")]
+                if updater_launch::expected_restart(app, code) {
+                    return;
+                }
+                #[cfg(target_os = "macos")]
+                if updater_launch::holds_exit(app) {
+                    api.prevent_exit();
+                    return;
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = code;
                 #[cfg(target_os = "macos")]
                 updater::unhealthy(app);
                 // graceful_quit finishes with app.exit(), which requests exit

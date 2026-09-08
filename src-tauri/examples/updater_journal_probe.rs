@@ -4,6 +4,9 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "../src/updater_attempt.rs"]
+// This standalone historical probe uses only the admission reader. The live
+// successor/health journal is exercised by the application binary's tests.
+#[allow(dead_code)]
 mod updater_attempt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "support/updater_journal.rs"]

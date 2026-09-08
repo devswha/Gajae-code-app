@@ -370,7 +370,7 @@ pub(crate) fn after_healthy(app: &AppHandle) {
 }
 
 #[derive(Debug)]
-enum PrepareError {
+pub(crate) enum PrepareError {
     Cancelled,
     Binding,
     Cache,
@@ -381,7 +381,7 @@ enum PrepareError {
     Discovery(DiscoveryError),
 }
 impl PrepareError {
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Cancelled => "preparation_cancelled",
             Self::Binding => "binding_mismatch",
@@ -395,12 +395,13 @@ impl PrepareError {
     }
 }
 
-struct Runtime {
-    store: Arc<Store>,
-    client: HttpsClient,
-    policy: DiscoveryPolicy,
-    binding: Binding,
-    os: String,
+pub(crate) struct Runtime {
+    pub(crate) store: Arc<Store>,
+    pub(crate) client: HttpsClient,
+    pub(crate) policy: DiscoveryPolicy,
+    pub(crate) binding: Binding,
+    pub(crate) os: String,
+    pub(crate) certificate: Option<reqwest::Certificate>,
 }
 
 #[derive(Clone)]
@@ -419,7 +420,7 @@ impl VerifiedTarget {
     }
 }
 
-fn initialize(app: &AppHandle, binding: Binding) -> Result<Runtime, PrepareError> {
+pub(crate) fn initialize(app: &AppHandle, binding: Binding) -> Result<Runtime, PrepareError> {
     let profile = app.try_state::<crate::qa_profile::QaProfile>();
     let root = crate::supervisor::desktop_data_root(app).map_err(|_| PrepareError::Binding)?;
     let executable = std::env::current_exe().map_err(|_| PrepareError::Binding)?;
@@ -471,7 +472,7 @@ fn initialize(app: &AppHandle, binding: Binding) -> Result<Runtime, PrepareError
         None
     };
     let client = build_client(
-        certificate,
+        certificate.clone(),
         Duration::from_secs(5),
         Duration::from_secs(10 * 60),
     )
@@ -482,6 +483,7 @@ fn initialize(app: &AppHandle, binding: Binding) -> Result<Runtime, PrepareError
         policy,
         binding,
         os,
+        certificate,
     })
 }
 
@@ -809,7 +811,7 @@ fn installed_channel() -> Result<Channel, PrepareError> {
     }
 }
 
-fn eligible_cached(manifest: &Manifest, os: &str) -> Result<bool, PrepareError> {
+pub(crate) fn eligible_cached(manifest: &Manifest, os: &str) -> Result<bool, PrepareError> {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|_| PrepareError::Policy)?;
     let floor = Version::new(0, 2, 3);
     let parse_os = |value: &str| -> Result<[u16; 3], PrepareError> {

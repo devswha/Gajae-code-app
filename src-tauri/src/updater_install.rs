@@ -14,7 +14,7 @@ use tokio::time::Instant;
 
 use crate::{
     updater_archive::{inspect_archive, ArchiveIdentity, ArchiveInventory},
-    updater_attempt::{Journal, Target, VerifiedBundleProof},
+    updater_attempt::{Journal, Target, VerifiedBundleProof, VerifiedSuccessorProof},
     updater_bundle::{verify_inventory, VerifiedBundle},
     updater_discovery::{revalidate_prepared, DiscoveryPolicy, PreparedIdentity},
     updater_location::InstallLocation,
@@ -92,8 +92,45 @@ impl VerifiedArchive {
     pub(crate) fn record(&self) -> &PreparedRecord {
         &self.record
     }
-    pub(crate) fn inventory(&self) -> &ArchiveInventory {
-        &self.inventory
+    /// Matching receipt/version strings are insufficient. Verify the signed
+    /// cached artifact, this compiled B identity and the entire current B tree.
+    pub(crate) fn verify_successor(
+        self,
+        target: &Target,
+        location: &InstallLocation,
+    ) -> Result<VerifiedSuccessor, InstallError> {
+        let source = semver::Version::parse(&target.source_desktop_version)
+            .map_err(|_| InstallError::Changed)?;
+        if !self.manifest.version.cmp_precedence(&source).is_gt()
+            || target.app_path != location.app()
+            || target.target_desktop_version != env!("CARGO_PKG_VERSION")
+            || target.target_product_version != env!("GJC_EXPECTED_PAYLOAD_VERSION")
+            || self.manifest.version.to_string() != target.target_desktop_version
+            || self.manifest.product_version.to_string() != target.target_product_version
+            || self.inventory.archive_sha256 != target.archive_sha256
+            || self.inventory.inventory_sha256 != target.inventory_sha256
+            || self.inventory.runtime_manifest_sha256 != target.runtime_manifest_sha256
+            || target.runtime_manifest_sha256 != env!("GJC_EXPECTED_RUNTIME_MANIFEST_SHA256")
+        {
+            return Err(InstallError::Changed);
+        }
+        location.revalidate().map_err(|_| InstallError::Changed)?;
+        let proof =
+            verify_inventory(location.app(), &self.inventory).map_err(|_| InstallError::Archive)?;
+        crate::expected_payload::ExpectedPayload::compiled()
+            .and_then(|expected| {
+                expected.verify_payload(
+                    &location
+                        .app()
+                        .join("Contents/Resources/resources/server-payload"),
+                )
+            })
+            .map_err(|_| InstallError::Changed)?;
+        Ok(VerifiedSuccessor {
+            archive: self,
+            target: target.clone(),
+            proof,
+        })
     }
 
     /// The registered plugin uses exactly the final native-validated endpoint.
@@ -172,6 +209,36 @@ impl VerifiedArchive {
             update,
             app: location.app().to_owned(),
         })
+    }
+}
+
+/// Opaque evidence retained while B starts. No serialized receipt can construct it.
+pub(crate) struct VerifiedSuccessor {
+    archive: VerifiedArchive,
+    target: Target,
+    proof: VerifiedBundle,
+}
+
+impl crate::updater_attempt::proof_seal::Sealed for VerifiedSuccessor {}
+impl VerifiedSuccessorProof for VerifiedSuccessor {
+    fn target(&self) -> &Target {
+        &self.target
+    }
+}
+impl VerifiedSuccessor {
+    pub(crate) fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// Before committing health, compare the complete B tree again while its
+    /// SPA is still withheld. This is not an unbounded event-thread operation.
+    pub(crate) fn revalidate_bundle(&self) -> Result<(), InstallError> {
+        let verified = verify_inventory(self.proof.root(), &self.archive.inventory)
+            .map_err(|_| InstallError::Archive)?;
+        if verified.inventory_sha256() != self.proof.inventory_sha256() {
+            return Err(InstallError::Changed);
+        }
+        Ok(())
     }
 }
 
