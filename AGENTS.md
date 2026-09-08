@@ -165,6 +165,11 @@ is `.ts`/`.tsx`. Routing is react-router-dom 7.
   Worker startup checks both and refuses mismatched/nested dependency instances.
   A verified SDK patch is source-integrity evidence, not proof of complete SDK
   quiescence; unrepresented streaming/extension work must still block restart.
+  `shared/sdkLifecyclePolicy.json` owns the file-count bound used by the applier,
+  worker and native payload/archive guard. After changing the canonical patch,
+  reapply it through a clean install and explicitly regenerate tracked runtime
+  hashes with `npm run fill:runtime-manifest -- --update` before verification;
+  normal dev/build gates only check the manifest and do not bless changed hashes.
 - **Chat tool cards follow the runtime, not Claude**: `src/components/chat/tools/configs/toolConfigs.ts`
   is keyed by the tool's own lowercase name (`bash`, `read`, `edit`, `todo_write`), and
   its accessors read the runtime's parameter schema. `server/gjc-tool-configs.bun.test.ts`

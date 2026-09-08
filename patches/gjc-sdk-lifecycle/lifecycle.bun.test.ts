@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, rename } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, rename, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { test } from 'node:test';
@@ -20,7 +20,17 @@ const { withFileLock } = await load('@gajae-code/coding-agent', 'src/config/file
 const { AuthStorage } = await load('@gajae-code/ai', 'src/auth-storage.ts');
 const { SessionManager } = await load('@gajae-code/coding-agent', 'src/session/session-manager.ts');
 const { SessionDisposalIncompleteError } = await load('@gajae-code/coding-agent', 'src/session/agent-session.ts');
-const { AssistantMessageEventStream } = await load('@gajae-code/ai', 'src/utils/event-stream.ts');
+const { AssistantMessageEventStream, runAppStreamProducer, getAppStreamProducer, adoptAppStreamProducer } = await load('@gajae-code/ai', 'src/utils/event-stream.ts');
+const { streamPiNative } = await load('@gajae-code/ai', 'src/providers/pi-native-client.ts');
+const { streamFromLazyImport, streamSimple } = await load('@gajae-code/ai', 'src/stream.ts');
+const builtins = await load('@gajae-code/ai', 'src/providers/register-builtins.ts');
+const { iterateWithIdleTimeout } = await load('@gajae-code/ai', 'src/utils/idle-iterator.ts');
+const { AppSdkHostOwner } = await load('@gajae-code/coding-agent', 'src/sdk/host/host.ts');
+const { SessionSdkSessionRuntime, createSdkSessionRuntimeExtension } = await load('@gajae-code/coding-agent', 'src/sdk/host/session-runtime.ts');
+const { createSdkWebSocketTransport } = await load('@gajae-code/coding-agent', 'src/sdk/host/websocket-transport.ts');
+const { PromptDeadlineManager } = await load('@gajae-code/coding-agent', 'src/sdk/prompt-deadline-manager.ts');
+const { Broker } = await load('@gajae-code/coding-agent', 'src/sdk/broker/broker.ts');
+const { createReconciliationStore } = await load('@gajae-code/coding-agent', 'src/sdk/reconciliation-extensions.ts');
 const { registerCustomApi, unregisterCustomApis } = await load('@gajae-code/ai', 'src/api-registry.ts');
 const { z } = await load('zod', 'index.js');
 
@@ -348,7 +358,7 @@ test('borrowed registry activity is independent from session disposal and joins 
   } finally { release.resolve(); await f.close(); }
 });
 
-test('documented limit: a provider tail not represented by its returned stream remains outside this join', async () => {
+test('opaque provider tail stays explicitly unknown after its iterator and result have settled', async () => {
   const released = deferred(); let tailSettled = false;
   let tail: Promise<void> | undefined;
   const agent = new Agent({ initialState: { model }, getApiKey: async () => 'offline', streamFn: () => {
@@ -365,8 +375,384 @@ test('documented limit: a provider tail not represented by its returned stream r
     await lifecycle.awaitPhysicalRunResources(agent.resourceLedger);
     assert.ok(tail, 'the held task was started by the actual provider factory');
     assert.equal(tailSettled, false, 'stream result/iterator completion is not an all-provider producer-lifetime API');
+    const activity = lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger);
+    assert.equal(activity.complete, false);
+    assert.deepEqual(activity.unknown, ['sdk_provider_producer_unrepresented']);
     released.resolve(); await tail;
+    assert.equal(lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger).complete, false, 'unrepresented work cannot clear itself');
   } finally { released.resolve(); await tail; }
+});
+
+for (const fails of [false, true]) {
+  test(`registered producer retains an early terminal through actual ${fails ? 'rejecting' : 'successful'} finally`, async () => {
+    const entered = deferred(); const release = deferred(); let finalized = false;
+    const events = new AssistantMessageEventStream();
+    runAppStreamProducer(events, async () => {
+      assert.ok(getAppStreamProducer(events), 'reserved before invoking producer');
+      try {
+        const message = answer(); events.push({ type: 'done', reason: 'stop', message });
+        if (fails) throw new Error('ordinary producer failure');
+      } finally { entered.resolve(); await release.promise; finalized = true; }
+    });
+    await entered.promise;
+    assert.equal((await events.result()).stopReason, 'stop');
+    const agent = new Agent({ initialState: { model }, getApiKey: async () => 'offline', streamFn: () => events });
+    try {
+      await agent.prompt('offline');
+      const joined = lifecycle.awaitPhysicalRunResources(agent.resourceLedger);
+      await stillPending(joined); assert.equal(finalized, false);
+      assert.ok(lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger).running > 0);
+      release.resolve(); await joined;
+      assert.equal(finalized, true);
+      assert.equal(lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger).complete, true);
+    } finally { release.resolve(); await getAppStreamProducer(events).completion; }
+  });
+}
+
+test('structurally forged completion and a terminal-only class instance confer no producer authority', () => {
+  const events = stream();
+  events.getAppStreamProducer = () => ({ completion: Promise.resolve(), getUnknown: () => [] });
+  events.producerCompletion = Promise.resolve();
+  assert.equal(getAppStreamProducer(events), undefined);
+  assert.equal(getAppStreamProducer({ completion: Promise.resolve() }), undefined);
+});
+
+test('wrapper completion joins nested producers and preserves missing child coverage', async () => {
+  const release = deferred(); const inner = new AssistantMessageEventStream(); const outer = new AssistantMessageEventStream();
+  runAppStreamProducer(inner, async () => { try { inner.end(answer()); } finally { await release.promise; } });
+  runAppStreamProducer(outer, async () => {
+    adoptAppStreamProducer(outer, inner);
+    adoptAppStreamProducer(outer, stream());
+    outer.end(answer());
+  });
+  try {
+    await outer.result(); await stillPending(getAppStreamProducer(outer).completion);
+    release.resolve(); await getAppStreamProducer(outer).completion;
+    assert.deepEqual(getAppStreamProducer(outer).getUnknown(), ['sdk_provider_producer_unrepresented']);
+  } finally { release.resolve(); }
+});
+
+// An actual built-in transport publishes the terminal event before draining the
+// response body. The injected fetch never makes a network request.
+function heldNativeTransport() {
+  let body!: ReadableStreamDefaultController<Uint8Array>;
+  const transportModel = { ...model, transport: 'pi-native' };
+  const response = new Response(new ReadableStream<Uint8Array>({ start(controller) { body = controller; } }),
+    { headers: { 'content-type': 'text/event-stream' } });
+  const make = () => streamPiNative(transportModel, { messages: [] }, { fetch: async () => response });
+  body.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'done', reason: 'stop', message: answer() })}\n\n`));
+  return { make, release: () => body.close() };
+}
+
+test('real pi-native built-in retains terminal-before-EOF through core physical join', async () => {
+  const transport = heldNativeTransport(); const events = transport.make();
+  const agent = new Agent({ initialState: { model }, getApiKey: async () => 'offline', streamFn: () => events });
+  try {
+    await events.result(); await agent.prompt('offline');
+    const joined = lifecycle.awaitPhysicalRunResources(agent.resourceLedger);
+    await stillPending(joined); transport.release(); await joined;
+    assert.equal(lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger).complete, true);
+  } finally { if (lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger).running) transport.release(); }
+});
+
+test('real built-in producer survives lazy import and a real SDK session disposal deadline', async () => {
+  const f = await sessionFixture(); const transport = heldNativeTransport(); const source = 'app-physical-native';
+  registerCustomApi(model.api, () => streamFromLazyImport(async () => transport.make()), source);
+  let released = false;
+  try {
+    await f.session.prompt('offline terminal-before-tail');
+    const joined = f.session.awaitDisposeCompletion();
+    await assert.rejects(f.session.dispose(), (error: unknown) => error instanceof SessionDisposalIncompleteError);
+    await stillPending(joined);
+    assert.ok(f.session.getAppLifecycleActivity().running > 0);
+    transport.release(); released = true; await joined;
+    const activity = f.session.getAppLifecycleActivity();
+    assert.equal(activity.running + activity.starting + activity.settling, 0);
+    assert.equal(activity.unknown.includes('sdk_provider_producer_unrepresented'), false);
+    assert.deepEqual(activity.unknown, []);
+    assert.equal(activity.complete, true, 'the enabled default host and built-in producer now have physical owners');
+  } finally { if (!released) transport.release(); unregisterCustomApis(source); await f.close(); }
+});
+
+test('normal built-in lazy dispatch exposes a retained completion without provider requests', async () => {
+  const events = builtins.streamOllama({ ...model, provider: 'ollama', api: 'ollama-chat' }, { messages: [] }, {
+    fetch: async () => new Response('{"message":{"role":"assistant","content":"offline"},"done":true}\n'),
+  });
+  for await (const _event of events) { /* exercise the wrapper consumer */ }
+  const owner = getAppStreamProducer(events); assert.ok(owner);
+  await owner.completion; assert.deepEqual(owner.getUnknown(), []);
+});
+
+test('forceAbort cannot discharge a late factory response with a real built-in producer tail', async () => {
+  const transport = heldNativeTransport(); const events = transport.make();
+  const entered = deferred(); const factory = deferred(); let released = false;
+  const agent = new Agent({ initialState: { model }, getApiKey: async () => 'offline', streamFn: async () => {
+    entered.resolve(); await factory.promise; return events;
+  } });
+  const prompt = agent.prompt('offline late factory');
+  try {
+    await entered.promise; agent.forceAbort(); await agent.waitForIdle();
+    const joined = lifecycle.awaitPhysicalRunResources(agent.resourceLedger);
+    await stillPending(joined); factory.resolve(); await prompt;
+    await stillPending(joined); transport.release(); released = true; await joined;
+    assert.equal(lifecycle.getPhysicalRunResourceActivity(agent.resourceLedger).complete, true);
+  } finally { factory.resolve(); if (!released) transport.release(); await prompt; }
+});
+
+test('failed SDK factory joins its already-started workspace discovery before rejecting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gjc-factory-discovery-'));
+  const cwd = join(root, 'project'); const agentDir = join(root, 'agent'); await mkdir(cwd);
+  const authStorage = await discoverAuthStorage(agentDir);
+  const settings = await Settings.loadForScope({ cwd, agentDir });
+  settings.override('workspaceTree.mode', 'eager'); settings.override('startup.networkPrewarm', false);
+  const registry = new ModelRegistry(authStorage, join(agentDir, 'models.yml'), settings, { agentDir });
+  const entered = deferred(); const failReached = deferred(); const release = deferred(); let started = false;
+  const facade = new Proxy(settings, { get(target, property) {
+    if (property === 'get') return (key: string) => {
+      if (started && key === 'providers.webSearch') { failReached.resolve(); throw new Error('offline creation failure after discovery'); }
+      return target.get(key);
+    };
+    const value = Reflect.get(target, property, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const pending = createAgentSession({ cwd, agentDir, settings: facade, authStorage, modelRegistry: registry,
+    contextFiles: [], promptTemplates: [], slashCommands: [],
+    runtimeServices: { workspaceTree: { get: async () => {
+      started = true; entered.resolve(); await release.promise;
+      return { snapshot: { rootPath: cwd, rendered: '', truncated: false, totalLines: 0, agentsMdFiles: [] } };
+    } } },
+  });
+  void pending.catch(() => {});
+  try {
+    await entered.promise; await failReached.promise; await stillPending(pending);
+    release.resolve(); await assert.rejects(pending, /offline creation failure after discovery/);
+  } finally {
+    release.resolve(); await pending.catch(() => {}); await registry.dispose(); authStorage.close(); await settings.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function memorySdkTransport(send: () => Promise<void> = async () => {}) {
+  let handler: ((id: string, frame: Record<string, unknown>) => void) | undefined;
+  return {
+    sessionId: 'physical-host', stateRoot: '/tmp/unused-physical-host', token: 'offline-only',
+    onFrame(next: typeof handler) { handler = next; return () => { handler = undefined; }; },
+    sendFrame: send, start: async () => ({ url: 'ws://127.0.0.1:1' }), stop: async () => {},
+    awaitAppLifecycleSettlement: async () => {},
+    feed(frame: Record<string, unknown>) { handler?.('local-fixture', frame); },
+  };
+}
+
+test('host physical owner keeps dispatched control, response delivery and its callback after logical stop', async () => {
+  const work = deferred(); const workEntered = deferred(); const write = deferred(); const writeEntered = deferred();
+  const publication = deferred(); const publicationEntered = deferred();
+  const transport = memorySdkTransport(async () => { writeEntered.resolve(); await write.promise; });
+  const runtime = new SessionSdkSessionRuntime({ transport,
+    control: async () => { workEntered.resolve(); await work.promise; return { ok: true }; },
+    onControlResponseDelivery: async () => { publicationEntered.resolve(); await publication.promise; },
+  });
+  try {
+    await runtime.start(); transport.feed({ type: 'control_request', id: 'held-control', operation: 'fixture' });
+    await workEntered.promise; await runtime.stop();
+    const joined = runtime.awaitAppLifecycleSettlement(); await stillPending(joined);
+    work.resolve(); await writeEntered.promise; await stillPending(joined);
+    write.resolve(); await publicationEntered.promise; await stillPending(joined);
+    publication.resolve(); await joined;
+    assert.equal(runtime.appLifecycleOwner.getAppLifecycleActivity().running, 0);
+  } finally { work.resolve(); write.resolve(); publication.resolve(); await runtime.stop(); await runtime.awaitAppLifecycleSettlement(); }
+});
+
+test('host directed deliveries are session-local and cannot escape through sendFrameTo', async () => {
+  const release = deferred(); const entered = deferred();
+  const a = new SessionSdkSessionRuntime({ transport: memorySdkTransport(async () => { entered.resolve(); await release.promise; }) });
+  const b = new SessionSdkSessionRuntime({ transport: memorySdkTransport() });
+  try {
+    await a.start(); await b.start(); a.sendFrameTo(['fixture'], { type: 'message_update' }); await entered.promise;
+    await a.stop(); await b.stop(); await b.awaitAppLifecycleSettlement();
+    const joined = a.awaitAppLifecycleSettlement(); await stillPending(joined);
+    release.resolve(); await joined;
+  } finally { release.resolve(); await a.stop(); await b.stop(); await a.awaitAppLifecycleSettlement(); }
+});
+
+for (const fails of [false, true]) {
+  test(`real WebSocket transport retains its 250ms shutdown loser through ${fails ? 'late rejection' : 'completion'}`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'gjc-owned-websocket-'));
+    const release = deferred(); const entered = deferred(); let actualServer: ReturnType<typeof Bun.serve> | undefined;
+    const transport = await createSdkWebSocketTransport({ sessionId: 'held-stop', stateRoot: root, token: 'offline-only',
+      serve(options: Parameters<typeof Bun.serve>[0]) {
+        const server = Bun.serve(options); actualServer = server;
+        return new Proxy(server, { get(target, property) {
+          if (property === 'stop') return async () => {
+            entered.resolve(); await release.promise; await target.stop(true);
+            if (fails) throw new Error('late physical server stop failure');
+          };
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      },
+    });
+    try {
+      const endpoint = await transport.start(); assert.match(endpoint.url, /^ws:\/\/127\.0\.0\.1:/);
+      const stopped = transport.stop(); await entered.promise; await stopped;
+      const joined = transport.awaitAppLifecycleSettlement(); void joined.catch(() => {});
+      await stillPending(joined); release.resolve();
+      if (fails) await assert.rejects(joined, /late physical server stop failure/);
+      else await joined;
+      await assert.rejects(stat(join(root, 'sdk/held-stop.json')), { code: 'ENOENT' });
+    } finally { release.resolve(); await transport.stop().catch(() => {}); await actualServer?.stop(true); await rm(root, { recursive: true, force: true }); }
+  });
+}
+
+test('deadline logical clear does not discharge an in-flight reconciliation write', async () => {
+  const entered = deferred(); const release = deferred(); const owner = new AppSdkHostOwner();
+  const manager = new PromptDeadlineManager({ appLifecycleOwner: owner, getLeaseMs: () => 1, getMaxMs: () => 1,
+    reconciliation: { lookup: () => ({ status: 'accepted' }),
+      claimPendingOutcome: async () => { entered.resolve(); await release.promise; }, finalizeOutcome: async () => {},
+    },
+  });
+  try {
+    manager.onAccepted({ commandId: 'physical-deadline', turnId: 'one' }); await entered.promise;
+    manager.clearAll(); const joined = owner.awaitAppLifecycleSettlement(); await stillPending(joined);
+    release.resolve(); await joined;
+    const activity = owner.getAppLifecycleActivity(); assert.equal(activity.queued + activity.running, 0);
+  } finally { manager.clearAll(); release.resolve(); await owner.awaitAppLifecycleSettlement(); }
+});
+
+test('retired-owner timer cancellation releases only the future callback, not accepted async work', async () => {
+  const owner = new AppSdkHostOwner(); const entered = deferred(); const release = deferred();
+  let dispatched = false;
+  const future = owner.schedule(() => { dispatched = true; }, 60_000);
+  const active = owner.schedule(async () => { entered.resolve(); await release.promise; }, 0);
+  try {
+    await entered.promise; owner.cancelTimer(future); owner.cancelTimer(active);
+    const joined = owner.awaitAppLifecycleSettlement(); await stillPending(joined);
+    assert.equal(dispatched, false); release.resolve(); await joined;
+    assert.equal(owner.getAppLifecycleActivity().running, 0);
+  } finally { owner.cancelTimer(future); release.resolve(); }
+});
+
+test('actual hosted lifecycle drain retains retired-owner timers and persistence after bounded shutdown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gjc-host-retired-'));
+  const broker = new Broker({ agentDir: root });
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+  const submitted = deferred(); const accepted = deferred(); const writeEntered = deferred(); const writeRelease = deferred();
+  const drainTimeout = deferred(); let holdWrites = false; let owner!: InstanceType<typeof AppSdkHostOwner>;
+  const transport = memorySdkTransport();
+  const store = createReconciliationStore({ sessionFile: join(root, 'session.jsonl'), sessionId: transport.sessionId });
+  const heldStore = new Proxy(store, { get(target, property) {
+    if (property === 'transact') return async (...args: unknown[]) => {
+      if (holdWrites) { writeEntered.resolve(); await writeRelease.promise; }
+      return target.transact(...args);
+    };
+    const value = Reflect.get(target, property, target); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  createSdkSessionRuntimeExtension({
+    on(name: string, callback: (event: unknown, ctx: unknown) => Promise<void>) { handlers.set(name, callback); },
+    sendUserMessage: async (_text: unknown, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+      await options.onPreflightAcceptCommit?.(); accepted.resolve(); await submitted.promise; return 'finished';
+    },
+  }, { agentDir: root, createTransport: async () => transport, registerAppLifecycleOwner: (value: typeof owner) => { owner = value; },
+    onLifecycleDrainTimeoutForTests: () => drainTimeout.resolve(),
+    terminalAbortSeams: { getReconciliationStore: () => heldStore },
+  });
+  const ctx = { cwd: root, sdkBindings: () => [], isIdle: () => true, abort: () => {},
+    sessionManager: { getSessionId: () => transport.sessionId, getSessionFile: () => join(root, 'session.jsonl'),
+      getSessionName: () => undefined, getBranch: () => [] },
+  };
+  let end: Promise<void> | undefined;
+  try {
+    await broker.start(); await handlers.get('session_start')!({}, ctx);
+    transport.feed({ type: 'control_request', id: 'accepted-physical', operation: 'turn.prompt', input: { text: 'offline' } });
+    await accepted.promise; await handlers.get('agent_start')!({ type: 'agent_start' }, ctx);
+    holdWrites = true;
+    end = handlers.get('agent_end')!({ type: 'agent_end', messages: [], stopReason: 'stop' }, ctx);
+    await writeEntered.promise;
+    const shutdown = handlers.get('session_shutdown')!({}, ctx);
+    await drainTimeout.promise; await shutdown;
+    assert.ok(owner.getAppLifecycleActivity().queued > 0, 'the actual retired owner cleanup timer is reserved');
+    const joined = owner.awaitAppLifecycleSettlement(); await stillPending(joined);
+    holdWrites = false; writeRelease.resolve(); await end; await stillPending(joined);
+    submitted.resolve(); await joined;
+    const activity = owner.getAppLifecycleActivity(); assert.equal(activity.running + activity.queued, 0);
+    assert.deepEqual(activity.unknown, []);
+  } finally {
+    holdWrites = false; writeRelease.resolve(); submitted.resolve(); await end;
+    await handlers.get('session_shutdown')?.({}, ctx); await owner?.awaitAppLifecycleSettlement();
+    await broker.stop(); await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a real SDK session with its default WebSocket host actively enabled reaches physical completion', async () => {
+  assert.notEqual(process.env.GJC_SDK_DISABLE, '1', 'this test must exercise enabled hosting');
+  const f = await sessionFixture(); const source = 'app-host-enabled';
+  // Pre-start an in-process broker in this isolated root. ensureBroker can reuse
+  // it without spawning or signalling a detached process.
+  const broker = new Broker({ agentDir: f.settings.getAgentDir() });
+  const endpointFile = join(f.settings.getCwd(), '.gjc/state/sdk', `${f.session.sessionManager.getSessionId()}.json`);
+  registerCustomApi(model.api, () => {
+    const events = new AssistantMessageEventStream();
+    runAppStreamProducer(events, async () => { events.push({ type: 'done', reason: 'stop', message: answer() }); });
+    return events;
+  }, source);
+  try {
+    await broker.start(); await f.session.extensionRunner.emit({ type: 'session_start' });
+    const endpoint = JSON.parse(await readFile(endpointFile, 'utf8'));
+    assert.match(endpoint.url, /^ws:\/\/127\.0\.0\.1:/);
+    await f.session.prompt('offline with live default host');
+    await f.session.awaitDisposeCompletion();
+    await assert.rejects(stat(endpointFile), { code: 'ENOENT' });
+    const activity = f.session.getAppLifecycleActivity();
+    assert.equal(activity.starting + activity.running + activity.settling, 0);
+    assert.equal(activity.complete, true); assert.deepEqual(activity.unknown, []);
+  } finally { unregisterCustomApis(source); await f.session.awaitDisposeCompletion().catch(() => {}); await broker.stop(); await f.close(); }
+});
+
+for (const cancel of [false, true]) {
+  test(`producer owns idle-iterator ${cancel ? 'abort' : 'timeout'} losers through their physical settlement`, async () => {
+    const next = deferred<IteratorResult<unknown>>(); const returned = deferred<IteratorResult<unknown>>();
+    const started = deferred(); const controller = new AbortController(); const events = new AssistantMessageEventStream();
+    runAppStreamProducer(events, async () => {
+      try {
+        const input = { [Symbol.asyncIterator]() { return {
+          next: () => { started.resolve(); return next.promise; }, return: () => returned.promise,
+        }; } };
+        for await (const _value of iterateWithIdleTimeout(input, {
+          idleTimeoutMs: cancel ? 60_000 : 5, abortSignal: controller.signal, errorMessage: 'held iterator',
+        })) { /* no value until the held read settles */ }
+      } catch { events.push({ type: 'done', reason: 'stop', message: answer() }); }
+    });
+    try {
+      await started.promise; if (cancel) controller.abort();
+      await events.result(); const owner = getAppStreamProducer(events);
+      await stillPending(owner.completion);
+      next.resolve({ done: true, value: undefined }); await stillPending(owner.completion);
+      returned.resolve({ done: true, value: undefined }); await owner.completion;
+      assert.deepEqual(owner.getUnknown(), []);
+    } finally { next.resolve({ done: true, value: undefined }); returned.resolve({ done: true, value: undefined }); }
+  });
+}
+
+test('auth retry wrapper retains the first attempt tail even when a later attempt is terminal', async () => {
+  const release = deferred(); const source = 'app-auth-retry-physical'; let attempts = 0;
+  registerCustomApi(model.api, () => {
+    const events = new AssistantMessageEventStream(); const first = attempts++ === 0;
+    runAppStreamProducer(events, async () => {
+      try {
+        if (first) {
+          const error = { ...answer([], 'error'), errorStatus: 401, errorMessage: 'Unauthorized' };
+          events.push({ type: 'error', reason: 'error', error });
+        } else events.push({ type: 'done', reason: 'stop', message: answer() });
+      } finally { if (first) await release.promise; }
+    });
+    return events;
+  }, source);
+  try {
+    const events = streamSimple(model, { messages: [] }, { apiKey: 'offline-first', onAuthError: async () => 'offline-second' });
+    await events.result(); assert.equal(attempts, 2);
+    const owner = getAppStreamProducer(events); assert.ok(owner);
+    await stillPending(owner.completion); release.resolve(); await owner.completion;
+    assert.deepEqual(owner.getUnknown(), []);
+  } finally { release.resolve(); unregisterCustomApis(source); }
 });
 
 async function authFixture(options: Record<string, unknown> = {}) {

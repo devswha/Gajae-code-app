@@ -22,6 +22,57 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_PREFERENCES_BYTES: usize = 4096;
 const MAX_CACHE_FILES: usize = 8;
 
+/// Notification navigation state, separate from the updater cache. Reuse the
+/// same descriptor-relative atomic I/O; these URLs grant no update authority.
+pub(crate) struct LinkStore(Store);
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingLinks {
+    schema: u8,
+    urls: Vec<String>,
+}
+
+impl LinkStore {
+    pub(crate) fn open(root: &Path) -> Result<Self, String> {
+        Store::open_named(root, "desktop-deep-links").map(Self)
+    }
+
+    pub(crate) fn read(&self) -> Result<Vec<String>, String> {
+        let Some(bytes) = self.0.read("pending.json", 8192)? else {
+            return Ok(Vec::new());
+        };
+        let record: PendingLinks =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid pending desktop links.")?;
+        Self::validate(&record)?;
+        Ok(record.urls)
+    }
+
+    pub(crate) fn write(&self, urls: Vec<String>) -> Result<(), String> {
+        let record = PendingLinks { schema: 1, urls };
+        Self::validate(&record)?;
+        let _guard = self
+            .0
+            .mutation
+            .lock()
+            .map_err(|_| "Pending links lock failed.")?;
+        self.0.atomic_json("pending.json", &record, 8192)
+    }
+
+    fn validate(record: &PendingLinks) -> Result<(), String> {
+        if record.schema != 1
+            || record.urls.len() > 16
+            || record
+                .urls
+                .iter()
+                .any(|url| url.is_empty() || url.len() > 256 || url.chars().any(char::is_control))
+        {
+            return Err("Invalid pending desktop links.".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
@@ -158,8 +209,12 @@ enum SyncPoint {
 
 impl Store {
     pub fn open(data_root: &Path) -> Result<Self, String> {
+        Self::open_named(data_root, "desktop-update-cache")
+    }
+
+    fn open_named(data_root: &Path, directory_name: &str) -> Result<Self, String> {
         let parent = open_root(data_root)?;
-        let name = c_name("desktop-update-cache")?;
+        let name = c_name(directory_name)?;
         let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
         if result != 0
             && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
@@ -168,7 +223,7 @@ impl Store {
         }
         let directory = open_at(
             &parent,
-            "desktop-update-cache",
+            directory_name,
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;

@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
+import policy from '../shared/sdkLifecyclePolicy.json' with { type: 'json' };
+
 import { applySdkLifecyclePatch } from './apply-sdk-lifecycle-patch.mjs';
 
 const hash = (text) => createHash('sha256').update(text).digest('hex');
@@ -40,6 +42,15 @@ test('check-only refuses unapplied sources without writing', async (t) => {
   const f = await fixture(t);
   await assert.rejects(applySdkLifecyclePatch(f.root, f.manifest, { checkOnly: true }), /not been applied/u);
   assert.equal(hash(await fs.readFile(f.source())), f.manifest.files[0].beforeSha256);
+});
+
+test('shared file-count policy supports the complete transport inventory and rejects overflow before writes', async (t) => {
+  const f = await fixture(t, Array.from({ length: policy.maxFiles }, (_, index) => `file${index}.ts`));
+  const overflow = structuredClone(f.manifest);
+  overflow.files.push({ ...overflow.files[0], path: 'src/overflow.ts' });
+  await assert.rejects(applySdkLifecyclePatch(f.root, overflow), /Invalid SDK lifecycle patch manifest/u);
+  assert.equal(hash(await fs.readFile(f.source())), f.manifest.files[0].beforeSha256);
+  assert.equal((await applySdkLifecyclePatch(f.root, f.manifest)).verified, policy.maxFiles);
 });
 
 test('all sources are validated before replacing any one file', async (t) => {
@@ -107,6 +118,8 @@ test('absolute symlink-alias CLI paths execute apply/check instead of silently s
   await fs.mkdir(path.join(f.root, 'scripts'));
   await fs.mkdir(path.join(f.root, 'patches/gjc-sdk-lifecycle'), { recursive: true });
   await fs.copyFile(new URL('./apply-sdk-lifecycle-patch.mjs', import.meta.url), path.join(f.root, 'scripts/apply-sdk-lifecycle-patch.mjs'));
+  await fs.mkdir(path.join(f.root, 'shared'), { recursive: true });
+  await fs.copyFile(new URL('../shared/sdkLifecyclePolicy.json', import.meta.url), path.join(f.root, 'shared/sdkLifecyclePolicy.json'));
   await fs.writeFile(path.join(f.root, 'patches/gjc-sdk-lifecycle/manifest.json'), JSON.stringify(f.manifest));
   const alias = path.join(f.root, 'alias'); await fs.symlink(f.root, alias);
   const entry = path.join(alias, 'scripts/apply-sdk-lifecycle-patch.mjs');

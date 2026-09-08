@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import test from 'node:test';
 
+import sdkPolicy from '../shared/sdkLifecyclePolicy.json' with { type: 'json' };
+
 import { isVerifiedSdkPatch, verifyRuntimeManifest } from './gjc-runtime-manifest.js';
 
 const sha = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -61,6 +63,18 @@ test('manifest v2 checks native and every SDK post-hash; test overrides cannot m
   assert.equal(await verifyRuntimeManifest(), undefined);
   assert.ok(f.requested.includes(path.join(f.root, 'coding-agent', 'src/session.ts')));
   assert.ok(f.requested.includes(path.join(f.root, 'agent-core', 'src/ledger.ts')));
+});
+
+test('shared SDK file-count limit admits the full boundary and rejects an extra member', async (t) => {
+  const f = fixture(t);
+  while (f.manifest.sdkLifecycle.files.length < sdkPolicy.maxFiles) {
+    const relative = `src/provider-${f.manifest.sdkLifecycle.files.length}.ts`;
+    f.files.set(path.join(f.root, 'coding-agent', relative), 'patched provider');
+    f.manifest.sdkLifecycle.files.push({ package: '@gajae-code/coding-agent', path: relative, sha256: sha('patched provider') });
+  }
+  await verifyRuntimeManifest();
+  f.manifest.sdkLifecycle.files.push({ package: '@gajae-code/coding-agent', path: 'src/overflow.ts', sha256: sha('patched provider') });
+  await assert.rejects(verifyRuntimeManifest(), { message: 'GJC runtime manifest validation failed.' });
 });
 
 for (const [name, mutate] of Object.entries({

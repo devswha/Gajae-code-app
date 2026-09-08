@@ -1,5 +1,60 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 2026-09-08 후속: SDK 실제 종료 추적·알림 링크 보존·실패 정리
+
+이전 `4fb43c2`의 Node 22/24, Linux 서버 아카이브와 desktop 빌드 및 Ubuntu
+22.04/24.04 패키지/GUI 검사는 모두 통과했다. 아래는 그 다음 변경이며 공개
+업데이트 활성화나 최종 signed A→B/배포 완료는 아니다.
+
+- SDK 패치를 pristine 0.16.4의 **32개 파일**로 확장했다. 기본 제공 provider의
+  실제 producer finally, iterator timeout loser와 활성화된 기본 WebSocket host의
+  drain/retired owner/delivery 완료를 추적한다. 지원되는 일반 SDK 세션은 실제
+  dispose join 뒤 complete/zero가 된다. generic notification host, opaque
+  extension/provider, Grok 별도 구현, Cursor 내부 subtask, buffered credential
+  callback, 미증명 custom transport/실패 factory는 여전히 unknown이다.
+  자세한 범위: [SDK patch](../patches/gjc-sdk-lifecycle/README.md).
+- `npm ci`가 32개 파일을 새 설치에 적용했고, 공식 `--update` 생성기로 tracked
+  runtime manifest를 갱신했다. shared `sdkLifecyclePolicy.json`이 applier/worker/
+  native parser의 공통 상한(32)을 소유한다. Manifest SHA-256:
+  `7a1b8c20246ffbbe11e69656a0e0327f8d6c2ac8dff2333f5d56d6ec02f75e44`.
+- macOS 알림 링크를 updater cache와 별도인 `desktop-deep-links/pending.json`에
+  descriptor-relative atomic/fsync 방식으로 보존한다. 부팅/적용/복구 중에는
+  이동하지 않으며 정상 main origin의 root 이동을 관측한 뒤 정확한 delivery
+  epoch/prefix를 ACK한다. ACK 이전 종료는 다음 프로세스가 재전달한다. 전달과
+  durable ACK 사이의 crash는 중복 root focus가 가능한 at-least-once 계약이다.
+  URL shape/credential/query/fragment 검증과 16개 상한, 실패 시 보존은 유지한다.
+- 실제 포트 충돌 QA에서 `ws`가 HTTP bind error를 전달하면서 초기화를 빠져나가
+  자동화 소켓을 남기던 문제를 발견했다. 두 error emitter를 기다리는 listener와
+  initializer join/조기 signal handler/실패 cleanup을 연결했다. 부팅 전 실패는
+  새 job mutation을 시작하지 않는다. 자동화 정리 미확인도 정상 exit로 감추지 않는다.
+
+검증:
+
+- `/private/tmp/gajae-sdk32-verify-promotion.log`: 전체 verify exit 0.
+  실제 설치 SDK 계약 104 pass/선택적 live 1 skip, lifecycle wrapper도 통과.
+  이전 manifest hash 미갱신 및 import-order 실패 로그는 별도로 보존했다.
+- `/private/tmp/gajae-server-startup-failure-tests.log`: 10 pass. 실제 HTTP/ws와
+  실제 index initializer를 함께 실행해 bind 실패 시 소유 Unix socket 정리를 확인.
+- `/private/tmp/gajae-deep-link-qa.cgeQ8X/native-sdk32.log`: native 318 pass,
+  build-binding 10 pass, 6 ignored(전용 child helper는 부모 테스트가 별도 실행).
+  같은 폴더의 `clippy-sdk32.log`도 통과했다.
+- 같은 폴더의 `payload-sdk32.log`: fresh staging에서 32개 patch 적용과 out-of-tree
+  packaged smoke 통과. **이 앱은 debug/ad-hoc QA이며 signed release 증거가 아니다.**
+
+실제 GUI: 격리 root `gajae-update-qa-c29Vlg`, origin `127.0.0.1:61106`.
+초기 OS URL activation은 queued 1 → delivered 1로 처리됐다. 포트 충돌 상태에서
+남긴 링크는 recovery 중 전달되지 않았다. 수정 전 실패가 남긴 `a.sock`은 앱
+종료/실제 profile lock 아래 `a-before-startup-cleanup.sock`으로 보존한 뒤 새
+패키지로 같은 실패를 다시 만들었다. 새 실패에서는 server가 code 1로 정리되고
+`a.sock`이 사라졌으며 링크 두 개는 남았다. 포트를 해제하고 URL 없이 새로
+실행하자 `fixed-resumed-stderr.log`의 delivered 2 및 빈 pending record,
+`fixed-resumed-ax.txt`/`.png`의 정상 root 화면을 확인했다. fixture socket/로그는
+보존한다. 생산 앱/데이터/키/공개 release는 변경하지 않았다.
+
+남은 목표는 동일 소스 signed/notarized A→B와 폭넓은 데이터/취소·복구 검증,
+production owner/OS13/키 custody·backup 조건, updater 활성화 및 최초/후속 공개
+배포다. 이 결과로 모든 SDK 확장이나 OS 이탈 descendant를 증명하지 않는다.
+
 ## 2026-09-08 현재: 실제 버튼 A10 → B3 교체·재시작·첨부 보존 통과
 
 격리된 QA 앱에서 About의 `Update and restart`로 A10(product beta.10 / desktop

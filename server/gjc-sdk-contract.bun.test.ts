@@ -41,6 +41,10 @@ import { GJC_MODEL_UNRESOLVED_CODE, GJC_MODEL_UNRESOLVED_MESSAGE } from './gjc-m
 import { GJC_CLEANUP_UNCONFIRMED_CODE } from './gjc-cleanup-error.js';
 import { isVerifiedSdkPatch, verifyRuntimeManifest } from './gjc-runtime-manifest.js';
 
+// The test starts an isolated in-process broker so enabled hosting never needs
+// to spawn a detached broker. Resolve within this exact SDK source instance.
+const { Broker } = await import(new URL('./broker/broker.ts', import.meta.resolve('@gajae-code/coding-agent/sdk/session')).href);
+
 type Listener = (event: unknown) => void;
 type Deferred<T> = { promise: Promise<T>; resolve(value: T): void; reject(error: Error): void };
 
@@ -3014,12 +3018,19 @@ test('worker observation certifies an unused SDK adapter and preserves OAuth unw
   }
 });
 
-test('real SDK disposal completion is not broadened into an escaped-background ownership proof', async () => {
+test('real SDK adapter becomes eligible after its actively enabled default host completes cleanup', async () => {
   const f = await identityFixture();
+  const broker = new Broker({ agentDir: join(f.root, 'agent') });
   try {
+    assert.notEqual(process.env.GJC_SDK_DISABLE, '1');
+    await broker.start();
     await f.run('actual-sdk-disposal', async (session) => {
       assert.equal(typeof session.awaitDisposeCompletion, 'function');
-      assert.equal(f.adapter.observeActivity().complete, false);
+      await session.extensionRunner!.emit({ type: 'session_start' });
+      const endpoint = join(f.options.cwd, '.gjc/state/sdk', `${session.sessionManager.getSessionId()}.json`);
+      assert.match(JSON.parse(await readFile(endpoint, 'utf8')).url, /^ws:\/\/127\.0\.0\.1:/);
+      assert.equal(f.adapter.observeActivity().complete, true, 'coverage is not idle while a run is active');
+      assert.ok(f.adapter.observeActivity().running > 0);
     });
     await f.sessions[0]!.awaitDisposeCompletion();
     // Stop future maintenance admission, not accepted work; an open registry
@@ -3027,8 +3038,73 @@ test('real SDK disposal completion is not broadened into an escaped-background o
     f.adapter.setAdmissionFence(true);
     const actual = f.adapter.observeActivity();
     assert.equal(actual.starting + actual.running + actual.settling, 0);
-    assert.deepEqual(actual.unknown, ['sdk_background_ownership_unproven']);
-    assert.equal(actual.complete, false);
+    assert.deepEqual(actual.unknown, []);
+    assert.equal(actual.complete, true);
+  } finally {
+    for (const session of f.sessions) await session.awaitDisposeCompletion().catch(() => {});
+    await broker.stop(); await f.close();
+  }
+});
+
+test('SDK physical session receipt clears represented work only after retained disposal', async () => {
+  const physical = deferred<void>(); const entered = deferred<void>();
+  const session = new FakeAgentSession(); let finished = false; let revision = 0;
+  const factory = (async () => {
+    Object.assign(session, {
+      getAppLifecycleActivity: () => ({ generation: `physical-session:${revision}`, complete: true,
+        starting: 0, queued: 0, running: finished ? 0 : 1, settling: 0, unknown: [] }),
+      awaitDisposeCompletion: async () => { entered.resolve(); await physical.promise; finished = true; revision++; },
+    });
+    return { session, setToolUIContext: session.setToolUIContext.bind(session) };
+  }) as unknown as GjcAgentSessionFactory;
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, { createSessionFactory: factory });
+  const run = f.adapter.spawnGjc('offline owned', { ...f.options, runHandle: 'physical-session' }, { send() {} });
+  try {
+    await session.promptStarted.promise;
+    session.complete(); await entered.promise;
+    f.adapter.setAdmissionFence(true);
+    const held = f.adapter.observeActivity();
+    assert.ok(held.settling > 0);
+    assert.deepEqual(held.unknown, []);
+    assert.equal(finished, false);
+    physical.resolve(); await run;
+    const done = f.adapter.observeActivity();
+    assert.equal(done.starting + done.queued + done.running + done.settling, 0);
+    assert.equal(done.complete, true);
+    assert.deepEqual(done.unknown, []);
+    assert.notEqual(done.generation, held.generation);
+  } finally { physical.resolve(); session.complete(); await run; await f.close(); }
+});
+
+test('SDK physical disposal retains feature-specific unknown instead of blanket-clearing it', async () => {
+  const session = new FakeAgentSession();
+  const factory = (async () => {
+    Object.assign(session, {
+      getAppLifecycleActivity: () => ({ generation: `opaque:${Number(session.disposed)}`, complete: false,
+        starting: 0, queued: 0, running: session.disposed ? 0 : 1, settling: 0,
+        unknown: ['sdk_provider_producer_unrepresented'] }),
+    });
+    return { session, setToolUIContext: session.setToolUIContext.bind(session) };
+  }) as unknown as GjcAgentSessionFactory;
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, { createSessionFactory: factory });
+  const run = f.adapter.spawnGjc('offline opaque', { ...f.options, runHandle: 'opaque-session' }, { send() {} });
+  try {
+    await session.promptStarted.promise; session.complete(); await run;
+    f.adapter.setAdmissionFence(true);
+    const done = f.adapter.observeActivity();
+    assert.equal(done.complete, false);
+    assert.deepEqual(done.unknown, ['sdk_provider_producer_unrepresented']);
+  } finally { session.complete(); await run; await f.close(); }
+});
+
+test('SDK rejected factory cannot discharge potentially escaped creation work without an owner', async () => {
+  const f = await fixture(undefined, undefined, undefined, undefined, undefined, undefined, {
+    createSessionFactory: async () => { throw new Error('offline startup failure'); },
+  });
+  try {
+    await assert.rejects(f.adapter.spawnGjc('offline creation', { ...f.options, runHandle: 'failed-factory' }, { send() {} }));
+    f.adapter.setAdmissionFence(true);
+    assert.deepEqual(f.adapter.observeActivity().unknown, ['sdk_background_ownership_unproven']);
   } finally { await f.close(); }
 });
 

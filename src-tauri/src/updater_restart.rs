@@ -466,6 +466,10 @@ async fn prepare_restart(app: &AppHandle, attempt: Arc<Attempt>) -> Result<Reply
     if !attempt.current() || Instant::now() >= attempt.deadline {
         return abort(app, &attempt, "updater_restart_cancelled").await;
     }
+    crate::reset_deep_link_readiness(app);
+    if crate::flush_deep_links(app).is_err() {
+        return abort(app, &attempt, "updater_pending_links_unavailable").await;
+    }
     let state = match snapshot(app) {
         Ok(state) => state,
         Err(_) => return abort(app, &attempt, "updater_unavailable").await,

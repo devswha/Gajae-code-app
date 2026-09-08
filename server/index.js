@@ -85,6 +85,7 @@ import { createGjcAppFactory } from './app-factory.js';
 import { DesktopUpdateRelay } from './services/desktop-update-relay.js';
 import { createDesktopRestartRuntime } from './services/desktop-restart-runtime.js';
 import { DesktopRestartBackend } from './services/desktop-restart-backend.js';
+import { listenForStartup } from './services/server-listener.js';
 import { getShellActivityGeneration, snapshotShellActivity } from './modules/websocket/services/shell-websocket.service.js';
 import { isWorkspaceRoot } from './modules/projects/index.js';
 import projectModuleRoutes from './modules/projects/projects.routes.js';
@@ -1648,17 +1649,109 @@ async function removeLocalServerMarker() {
 // Initialize database and start server
 async function startServer() {
     const releaseStartup = enterInternalActivity('server:startup');
+    let startupFlight = Promise.resolve();
+    let jobsInitialized = false;
+    let shutdownStarted = false;
+    let shutdownExitCode = 0;
+    const shutdownRuntimeServices = async (exitCode = 0) => {
+        shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+        if (shutdownStarted) {
+            return;
+        }
+        shutdownStarted = true;
+        // Normal quit is not a restart-idle observation. Once this path
+        // starts, no reversible preparation may certify an idle runtime.
+        markInternalActivityUncertain('runtime_shutdown_started');
+        await startupFlight.catch(() => { });
+        // Persist interruption before any slower observer cleanup. Otherwise
+        // a not-yet-started worker can cancel admission back to ready while
+        // watcher shutdown awaits, erasing the interrupted-resume contract.
+        // A committed native restart has already proved every durable job
+        // idle and closed all ingress. Do not start a fresh native mutation
+        // after that commit; normal Quit still records interruption first.
+        let gjcShutdownFenced = desktopRestartAdmission.state === 'committed' || !jobsInitialized;
+        try {
+            if (!gjcShutdownFenced)
+                await gjcJobOrchestrator.interruptForShutdown();
+            gjcShutdownFenced = true;
+        }
+        catch (err) {
+            console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);
+        }
+        // Join the actual watcher startup/synchronization/exit lifetime.
+        // The old eager close ran before the asynchronous listen callback,
+        // and never closed the watcher that callback subsequently started.
+        try {
+            await closeSessionsWatcher();
+        }
+        catch (err) {
+            console.error('[Watcher] Shutdown is unconfirmed; refusing normal process exit:', err?.message || err);
+            process.exitCode = 1;
+            return;
+        }
+        await drainWebSocketClients(wss.clients);
+        server.close();
+        wss.close();
+        server.closeAllConnections?.();
+        try {
+            await shutdownGjcWorker();
+        }
+        catch (err) {
+            console.error('[GJC Worker] Worker tree reap failed during shutdown; refusing normal process exit:', err?.message || err);
+            process.exitCode = 1;
+            setInterval(() => { }, 60 * 60 * 1000);
+            return;
+        }
+        try {
+            await automationService.shutdown();
+        }
+        catch (err) {
+            console.error('[Automation] Sidecar shutdown failed:', err?.message || err);
+            process.exitCode = 1;
+            setInterval(() => { }, 60 * 60 * 1000);
+            return;
+        }
+        if (gjcShutdownFenced) {
+            try {
+                gjcJobOrchestrator.close();
+            }
+            catch (err) {
+                console.error('[GJC Jobs] Error closing authority clients during shutdown:', err?.message || err);
+            }
+        }
+        try {
+            await removeLocalServerMarker();
+        }
+        catch (err) {
+            console.error('[Local Server] Error removing server marker during shutdown:', err?.message || err);
+        }
+        process.exit(shutdownExitCode);
+    };
+    process.on('SIGTERM', () => void shutdownRuntimeServices());
+    process.on('SIGINT', () => void shutdownRuntimeServices());
+    const onServerError = (error) => {
+        console.error('[ERROR] HTTP/WebSocket server failed:', error);
+        void shutdownRuntimeServices(1);
+    };
+    server.on('error', onServerError);
+    wss.on('error', onServerError);
     try {
         // Initialize authentication database
-        await initializeDatabase();
-        await automationService.startBridge();
+        await (startupFlight = initializeDatabase());
+        if (shutdownStarted)
+            return;
+        await (startupFlight = automationService.startBridge());
+        if (shutdownStarted)
+            return;
+        jobsInitialized = true;
         try {
-            await gjcJobOrchestrator.reconcile();
-        } catch (error) {
+            await (startupFlight = gjcJobOrchestrator.reconcile());
+        }
+        catch (error) {
             console.error('[GJC Jobs] Authority reconciliation failed:', error?.message || error);
         }
-
-
+        if (shutdownStarted)
+            return;
         // Fail-closed exposure guard: desktop traffic stays on loopback unless
         // a trusted private-network override is explicitly configured.
         const exposure = evaluateExposure({
@@ -1667,151 +1760,72 @@ async function startServer() {
         });
         if (exposure.level === 'block') {
             console.error(`${c.warn('[SECURITY]')} ${exposure.message}`);
-            process.exit(1);
+            throw new Error(exposure.message);
         }
         if (exposure.level === 'warn') {
             console.warn(`${c.warn('[SECURITY]')} ${exposure.message}`);
         }
-
         // Check if running in production mode (dist folder exists)
         const distIndexPath = path.join(APP_ROOT, 'dist', 'index.html');
         const isProduction = fs.existsSync(distIndexPath);
-
         console.log('');
-
         if (isProduction) {
-            console.log(`${c.info('[INFO]')} To run in production mode, go to http://${DISPLAY_HOST}:${SERVER_PORT}`);            
+            console.log(`${c.info('[INFO]')} To run in production mode, go to http://${DISPLAY_HOST}:${SERVER_PORT}`);
         }
-
         console.log(`${c.info('[INFO]')} To run in development mode with hot-module replacement, go to http://${DISPLAY_HOST}:${VITE_PORT}`);
-   
         // Reserve the asynchronous listen callback before releasing startup.
         // Native readiness can be observed before marker/watcher setup finishes.
         const releaseReady = enterInternalActivity('server:listen-ready', true);
-        let readyStarted = false;
-        const onListenError = () => { if (!readyStarted) releaseReady(); };
-        server.once('error', onListenError);
         try {
-        server.listen(SERVER_PORT, HOST, async () => {
-            readyStarted = true;
-            server.off('error', onListenError);
-            try {
-            const address = server.address();
-            const port = typeof address === 'object' && address ? address.port : Number.parseInt(String(SERVER_PORT), 10);
-            const appRoot = APP_ROOT;
-            await writeLocalServerMarker(port).catch((error) => {
-                console.warn('[WARN] Could not write local server marker:', error.message);
-            });
-
-            if (process.env.GJC_DESKTOP === '1') {
-                console.log(JSON.stringify({
-                    kind: 'gajae-desktop-ready',
-                    pid: process.pid,
-                    host: HOST,
-                    port,
-                    protocolVersion: 1,
-                    version: RUNNING_VERSION,
-                }));
-            }
-
-            console.log('');
-            console.log(c.dim('═'.repeat(63)));
-            console.log(`  ${c.bright('Gajae Code App Server - Ready')}`);
-            console.log(c.dim('═'.repeat(63)));
-            console.log('');
-            console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + port)}`);
-            console.log(`${c.info('[INFO]')} App root: ${c.dim(appRoot)}`);
-            console.log(`${c.tip('[TIP]')}  Run "gajae-app status" for full configuration details`);
-            console.log('');
-
-            // Start watching the projects folder for changes
-            await initializeSessionsWatcher();
-            } catch (error) {
-                markInternalActivityUncertain('server_ready_failed');
-                console.error('[ERROR] Server readiness setup failed:', error);
-            } finally { releaseReady(); }
-        });
-        } catch (error) {
-            server.off('error', onListenError);
-            releaseReady();
-            throw error;
-        }
-
-        let shutdownStarted = false;
-        const shutdownRuntimeServices = async () => {
-            if (shutdownStarted) {
-                return;
-            }
-            shutdownStarted = true;
-            // Normal quit is not a restart-idle observation. Once this path
-            // starts, no reversible preparation may certify an idle runtime.
-            markInternalActivityUncertain('runtime_shutdown_started');
-
-            // Persist interruption before any slower observer cleanup. Otherwise
-            // a not-yet-started worker can cancel admission back to ready while
-            // watcher shutdown awaits, erasing the interrupted-resume contract.
-            // A committed native restart has already proved every durable job
-            // idle and closed all ingress. Do not start a fresh native mutation
-            // after that commit; normal Quit still records interruption first.
-            let gjcShutdownFenced = desktopRestartAdmission.state === 'committed';
-            try {
-                if (!gjcShutdownFenced) await gjcJobOrchestrator.interruptForShutdown();
-                gjcShutdownFenced = true;
-            } catch (err) {
-                console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);
-            }
-
-            // Join the actual watcher startup/synchronization/exit lifetime.
-            // The old eager close ran before the asynchronous listen callback,
-            // and never closed the watcher that callback subsequently started.
-            try {
-                await closeSessionsWatcher();
-            } catch (err) {
-                console.error('[Watcher] Shutdown is unconfirmed; refusing normal process exit:', err?.message || err);
-                process.exitCode = 1;
-                return;
-            }
-
-            await drainWebSocketClients(wss.clients);
-            server.close();
-            wss.close();
-            server.closeAllConnections?.();
-
-            try {
-                await shutdownGjcWorker();
-            } catch (err) {
-                console.error('[GJC Worker] Worker tree reap failed during shutdown; refusing normal process exit:', err?.message || err);
-                process.exitCode = 1;
-                setInterval(() => {}, 60 * 60 * 1000);
-                return;
-            }
-
-            try {
-                await automationService.shutdown();
-            } catch (err) {
-                console.error('[Automation] Sidecar shutdown failed:', err?.message || err);
-            }
-
-            if (gjcShutdownFenced) {
+            await (startupFlight = listenForStartup(server, wss, Number(SERVER_PORT), HOST, async () => {
+                if (shutdownStarted)
+                    return;
                 try {
-                    gjcJobOrchestrator.close();
-                } catch (err) {
-                    console.error('[GJC Jobs] Error closing authority clients during shutdown:', err?.message || err);
+                    const address = server.address();
+                    const port = typeof address === 'object' && address ? address.port : Number.parseInt(String(SERVER_PORT), 10);
+                    const appRoot = APP_ROOT;
+                    await writeLocalServerMarker(port).catch((error) => {
+                        console.warn('[WARN] Could not write local server marker:', error.message);
+                    });
+                    if (shutdownStarted)
+                        return;
+                    if (process.env.GJC_DESKTOP === '1') {
+                        console.log(JSON.stringify({
+                            kind: 'gajae-desktop-ready',
+                            pid: process.pid,
+                            host: HOST,
+                            port,
+                            protocolVersion: 1,
+                            version: RUNNING_VERSION,
+                        }));
+                    }
+                    console.log('');
+                    console.log(c.dim('═'.repeat(63)));
+                    console.log(`  ${c.bright('Gajae Code App Server - Ready')}`);
+                    console.log(c.dim('═'.repeat(63)));
+                    console.log('');
+                    console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + port)}`);
+                    console.log(`${c.info('[INFO]')} App root: ${c.dim(appRoot)}`);
+                    console.log(`${c.tip('[TIP]')}  Run "gajae-app status" for full configuration details`);
+                    console.log('');
+                    // Start watching the projects folder for changes
+                    await initializeSessionsWatcher();
                 }
-            }
-            try {
-                await removeLocalServerMarker();
-            } catch (err) {
-                console.error('[Local Server] Error removing server marker during shutdown:', err?.message || err);
-            }
-            process.exit(0);
-        };
-        process.on('SIGTERM', () => void shutdownRuntimeServices());
-        process.on('SIGINT', () => void shutdownRuntimeServices());
-    } catch (error) {
+                catch (error) {
+                    markInternalActivityUncertain('server_ready_failed');
+                    console.error('[ERROR] Server readiness setup failed:', error);
+                }
+            }));
+        }
+        finally {
+            releaseReady();
+        }
+    }
+    catch (error) {
         console.error('[ERROR] Failed to start server:', error);
-        process.exit(1);
-    } finally {
+        await shutdownRuntimeServices(1);
+    }
+    finally {
         releaseStartup();
     }
 }

@@ -27,6 +27,7 @@ async function fixture(t, { readme = true } = {}) {
   const applier = await readFile(path.join(repository, 'scripts/apply-sdk-lifecycle-patch.mjs'));
   await writeFile(path.join(source, patchDirectory, 'manifest.json'), manifest);
   await writeFile(path.join(source, 'scripts/apply-sdk-lifecycle-patch.mjs'), applier);
+  await copyFile(path.join(repository, 'shared/sdkLifecyclePolicy.json'), path.join(source, 'shared/sdkLifecyclePolicy.json'));
   await copyFile(path.join(repository, 'scripts/fix-node-pty.js'), path.join(source, 'scripts/fix-node-pty.js'));
   await writeFile(path.join(source, patchDirectory, 'manifest.test.mjs'), 'must not ship');
   await writeFile(path.join(source, patchDirectory, 'lifecycle.bun.test.ts'), 'must not ship');
@@ -64,6 +65,7 @@ test('server stage ships the exact patch manifest/applier and optional README, n
     await stageBundleFiles(f.stage, sourcePackage, f.source);
     assert.deepEqual(await readFile(path.join(f.stage, patchDirectory, 'manifest.json')), f.manifest);
     assert.deepEqual(await readFile(path.join(f.stage, 'scripts/apply-sdk-lifecycle-patch.mjs')), f.applier);
+    assert.deepEqual(await readFile(path.join(f.stage, 'shared/sdkLifecyclePolicy.json')), await readFile(path.join(repository, 'shared/sdkLifecyclePolicy.json')));
     assert.deepEqual((await readdir(path.join(f.stage, patchDirectory))).sort(), readme ? ['README.md', 'manifest.json'] : ['manifest.json']);
     await assert.rejects(stat(path.join(f.stage, 'dist-server/index.js.map')), { code: 'ENOENT' });
     const install = JSON.parse(await readFile(path.join(f.stage, 'package.json'), 'utf8'));

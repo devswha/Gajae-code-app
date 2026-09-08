@@ -615,6 +615,7 @@ fn spa_page(url: &tauri::Url) -> bool {
 /// view even when its HTTP waiter disconnected. The event name is the private
 /// current-view capability, not a cookie or public global property.
 pub(crate) fn notify_restart_aborted(app: &AppHandle, attempt_id: &str, epoch: u64) {
+    crate::resume_deep_links(app);
     let Some(run) = app
         .try_state::<Bridge>()
         .and_then(|bridge| bridge.0.lock().ok().and_then(|run| run.clone()))

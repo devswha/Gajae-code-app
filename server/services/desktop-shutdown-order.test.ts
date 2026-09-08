@@ -27,6 +27,9 @@ function fixture(overrides: Record<string, unknown> = {}) {
   const process = { exitCode: 0, exit: (code: number) => events.push(`exit:${code}`) };
   const context = {
     shutdownStarted: false,
+    shutdownExitCode: 0,
+    startupFlight: Promise.resolve(),
+    jobsInitialized: true,
     desktopRestartAdmission: { state: 'open' },
     markInternalActivityUncertain: () => events.push('shutdown'),
     gjcJobOrchestrator: { interruptForShutdown: async () => { events.push('durable-fence'); }, close: () => events.push('jobs-close') },
@@ -40,7 +43,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
     setInterval: () => events.push('hold-unconfirmed-exit'),
     ...overrides,
   };
-  return { run: runInNewContext(`(${shutdown.getText(source)})`, context) as () => Promise<void>, events, process, context };
+  return { run: runInNewContext(`(${shutdown.getText(source)})`, context) as (exitCode?: number) => Promise<void>, events, process, context };
 }
 
 test('durable interruption precedes watcher waits and late pre-start cancellation cannot erase it', async () => {
@@ -90,4 +93,23 @@ test('committed idle restart closes resources without admitting a new native job
   assert.ok(!f.events.includes('durable-fence'));
   assert.ok(f.events.includes('jobs-close'));
   assert.equal(f.events.at(-1), 'exit:0');
+});
+
+test('startup failure joins its initializer and closes resources before reporting exit 1', async () => {
+  const startup = deferred();
+  const f = fixture({ startupFlight: startup.promise, jobsInitialized: false });
+  const closing = f.run(1); await tick();
+  assert.deepEqual(f.events, ['shutdown']);
+  startup.resolve(); await closing;
+  assert.ok(!f.events.includes('durable-fence'), 'early failure cannot lazily start a job mutation');
+  assert.ok(f.events.includes('jobs-close'));
+  assert.equal(f.events.at(-1), 'exit:1');
+});
+
+test('unconfirmed automation cleanup cannot report a clean exit', async () => {
+  const f = fixture({ automationService: { shutdown: async () => { throw new Error('unconfirmed'); } } });
+  await f.run();
+  assert.equal(f.process.exitCode, 1);
+  assert.ok(f.events.includes('hold-unconfirmed-exit'));
+  assert.ok(!f.events.some(event => event.startsWith('exit:')));
 });

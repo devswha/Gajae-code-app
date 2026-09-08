@@ -1,7 +1,10 @@
 # GJC SDK lifecycle remediation — app-owned patch
 
-Status: applied in the development checkout on September 8, 2026 for exactly
-**0.16.4**, after isolated review and verification of every pristine before-hash. This is not
+Status: producer-completion and enabled-default-host remediation verified in isolation
+and applied through a clean checkout `npm ci` on September 8, 2026 for exactly
+**0.16.4**. All 32 files passed pristine before-hash validation and installation;
+check-only subsequently verified all 32. The app, worker and native validators
+share `shared/sdkLifecyclePolicy.json` (maximum 32 files). This is not
 an updater/plugin fork, an upstream publication, or permission to clear
 `sdk_background_ownership_unproven`. Root and packaging postinstall apply this
 same manifest; runtime manifest v2 checks all post-hashes before SDK startup.
@@ -10,7 +13,7 @@ The source-integrity receipt does not authorize installation or certify idle.
 ## Artifact contract and provenance
 
 `manifest.json` uses the agreed schema exactly: schema version 1, id
-`gjc-sdk-lifecycle-v1`, exact package versions, and eight source-file entries with
+`gjc-sdk-lifecycle-v1`, exact package versions, and 32 source-file entries with
 full before/after SHA-256 digests and ordered replace-once edits. Each `before`
 snippet occurs exactly once in the preceding source. The complete transformed
 file must match `afterSha256`; snippet matches alone are not sufficient.
@@ -18,8 +21,12 @@ file must match `afterSha256`; snippet matches alone are not sufficient.
 Pristine packages were fetched on September 8, 2026 into a new temporary
 directory with `npm pack --ignore-scripts --registry=https://registry.npmjs.org`.
 The artifact review did not mutate installed dependencies. Parent integration
-subsequently applied all eight verified edits using the guarded applier; versions
-remain pinned to the published 0.16.4 packages.
+subsequently applied the original eight verified edits using the guarded applier.
+The producer candidate started from independently fetched pristine packages and
+that same guarded eight-file application. New edits were made only to the isolated
+candidate and encoded as additional replace-once operations. All old replacements
+remain in order, including the four otherwise unchanged leaf/registry files;
+versions remain pinned to the published 0.16.4 packages.
 
 | Published package | npm tarball SHA-1 | npm integrity |
 | --- | --- | --- |
@@ -88,8 +95,79 @@ That comparison is not runtime compatibility qualification for a pin upgrade.
    real save promise is retained independently of the latest `#savePromise`.
    The getter exposes the reserved debounce and in-flight writes; the join waits
    for the existing timer/save naturally and never invokes flush/close. A failed
-   save leaves sticky `settings_persistence_unconfirmed`, even once its promise
-   has settled. Normal `flush()`/`flushOrThrow()` semantics are unchanged.
+  save leaves sticky `settings_persistence_unconfirmed`, even once its promise
+  has settled. Normal `flush()`/`flushOrThrow()` semantics are unchanged.
+
+9. **AI stream producer contract (19 additional files).**
+   `src/utils/event-stream.ts` holds per-stream physical owners in a module-private
+   WeakMap. `runAppStreamProducer` reserves the owner before invoking the actual
+   async producer and resolves only after that body, including its real `finally`,
+   and adopted child producers settle. `push`, `end`, `fail`, `result` and iterator
+   completion do not release it. A lookalike property or a bare
+   `AssistantMessageEventStream` is not a registered producer.
+   `src/providers/register-builtins.ts` owns module loading and forwarding, and
+   adopts the inner producer before consuming it. `src/stream.ts` does likewise
+   for lazy imports, custom-provider forwarding and **every** auth-retry attempt.
+   `complete`/`completeSimple` also join known producers, so non-streaming callers
+   such as title generation retain their tail. `result()` itself stays unchanged.
+   `src/utils/idle-iterator.ts` retains raced `next()` and `return()` promises in
+   the initiating producer's async-local owner; its timeout/abort still returns
+   promptly, without discharging the losing physical operation.
+
+   The 15 actual transport bodies are `amazon-bedrock`, `anthropic`,
+   `azure-openai-responses`, `cursor`, `google-gemini-cli`, `google-shared`,
+   `kiro-api-key`, `kiro-codewhisperer`, `ollama`, `openai-completions`,
+   `openai-responses`, `openai-codex-responses`, `openai-anthropic-shim`,
+   `gitlab-duo`, and `pi-native-client` (all `ai/src/providers/*.ts`). Google
+   and Vertex share the patched Google body; Kimi/Synthetic delegate through the
+   patched shim. Shim/GitLab forwarding adopts their inner transport as well.
+   Cursor's body is retained, but its separately dispatched HTTP/2 task/debug
+   work is not fully audited and explicitly remains unknown.
+
+10. **Core/session composition and factory retention.** The core retains each
+    authenticated producer promise in the physical ledger, separately from
+    logical provider settlement. Missing producers and child coverage failures
+    leave sticky `sdk_provider_producer_unrepresented`; quarantine cannot erase
+    either retained promises or that reason. The ledger exposes a pure activity
+    getter. The session composes it with physical prompt/post-prompt owners and
+    the SDK factory's pending work, with disposal/failure generations.
+    Parallel workspace/context/prompt-template discovery is now reserved before
+    invocation, including workspace deadline losers and early factory failure.
+    Direct credential-disabled callbacks and reactive MCP publication reserve
+    returned promises, and cleanup joins accepted work before closing shared
+    resources. The adapter reads these actual owners from creation through
+    retained disposal; it does not turn a source-integrity receipt into coverage.
+
+11. **Enabled default SDK host (five additional files).**
+    `coding-agent/src/sdk/host/host.ts` provides a session-local physical owner
+    and reserves accepted dispatch, activation and send promises before invoking
+    them. Reverse RPC deliveries use the same owned send path. Admission closes
+    on ordinary host stop; already-accepted handlers and writes remain owned.
+    `src/sdk/host/session-runtime.ts` retains directed deliveries, preflight and
+    submission continuations, terminalization/skill recovery, gate resolution,
+    lifecycle persistence and the actual startup/shutdown handlers. Retired-owner
+    cleanup timers have physical reservations through dispatch; cancelling a
+    future timer does not discharge an already-running callback. Existing bounded
+    drains still return on their original budgets. SDK session resource cleanup
+    then joins the separate physical owners before releasing shared resources.
+    `src/sdk/prompt-deadline-manager.ts` similarly retains deadline/retry timers,
+    in-flight expiry writes and uncertainty recovery after logical lease clears.
+    `src/sdk/host/websocket-transport.ts` preserves the 250ms public stop race but
+    retains the actual server-stop loser; its physical join propagates late
+    failure. `src/sdk/host/query/revision-store.ts` joins detached snapshot-unlink
+    promises before final directory cleanup.
+
+    A real SDK session is tested with its default WebSocket host actively started
+    (endpoint creation verified), an offline provider turn, normal disposal and
+    endpoint removal. Its receipt is complete with zero activity. The adapter
+    contract also proves that the enabled default path becomes eligible after
+    cleanup. The fixture pre-starts an isolated **in-process** broker, so no
+    detached process is spawned or signalled. These are ownership tests, not a
+    transport-disable workaround or a certificate for opaque user extensions.
+
+These APIs are additions to the Bun source runtime, not changes to npm declaration
+files. The async-local iterator retention is qualified for the pinned Bun runtime;
+it does not constitute browser or other JavaScript-runtime qualification.
 
 ## Public registry seam
 
@@ -172,7 +250,7 @@ the public `awaitDisposeCompletion(): Promise<void>` signature are unchanged.
 ## Physical evidence and reproduction
 
 `lifecycle.bun.test.ts` imports an explicitly selected isolated candidate SDK and
-core/AI. Only their eight source files differ from pristine published packages.
+core/AI. Only their 32 manifest-listed source files differ from pristine published packages.
 Other dependencies are read-only links to the existing 0.16.4 dependency closure;
 this is not a clean-install, cross-platform or packaged-binary qualification.
 All session data goes into independent temporary fixtures. No live credentials,
@@ -198,6 +276,17 @@ from generation changes or empty diagnostic counters. Coverage includes:
   losers, config resolver reservation-before-invocation, and callback completion;
 - real Settings debounce and file-lock-blocked persistence, overlapping saves,
   durable reload, and actual background-save failure;
+- physical producer `finally` on success/failure after an early terminal event;
+- an **actual pi-native transport** publishing terminal SSE before EOF, through
+  both a core join and real session disposal with its caller deadline;
+- lazy built-in dispatch, nested/custom forwarding and auth-retry loser tails;
+- physical idle-iterator timeout/abort losers, and rejection of forged receipts;
+- accepted host control/response/delivery callbacks after logical stop, independent
+  host owners, actual WebSocket shutdown timeout losers and late failure;
+- a real hosted lifecycle drain exceeding its public budget while persistence
+  and retired-owner timers remain retained, plus physical deadline writes after
+  logical clears and future-vs-running timer cancellation;
+- enabled default-host SDK and adapter cleanup reaching complete, zero activity;
 - the unregistered-provider-tail limitation below.
 
 From the repository, run the read-only/replay tests with the supported Node:
@@ -205,6 +294,11 @@ From the repository, run the read-only/replay tests with the supported Node:
 ```sh
 node --test patches/gjc-sdk-lifecycle/manifest.test.mjs
 ```
+
+During parent integration, set `GJC_SDK_LIFECYCLE_CANDIDATE` to the isolated
+pristine or known-after install root for replay tests; this avoids treating the
+checkout's previous eight-file state as the new manifest's known-after state.
+The full parent-applier tests use the shared policy and require capacity for 32 files.
 
 For physical tests, extract the exact published packages into a fresh temporary
 install layout (`node_modules/@gajae-code/{coding-agent,agent-core,ai}`), supply their
@@ -240,24 +334,39 @@ This patch is **not yet an all-feature SDK quiescence certificate**.
   the leaf seam specifically retains asynchronous work which may escape a raced
   waiter. It does not certify unrepresented work hidden behind a third-party
   provider/store callback's returned promise.
-- `@gajae-code/ai/src/utils/event-stream.ts` resolves `result()` on a terminal
-  `push()`/`end()`. Its iterator completion does not expose a separate promise
-  for a provider producer that continues after terminal publication. The core
-  can join a provider's returned factory, iterator and result promises, but
-  cannot join an unrepresented producer tail. A boundary test demonstrates this
-  explicitly. A complete contract needs an authenticated producer-completion
-  promise supplied by the transport and retained through its real `finally`.
-- `coding-agent/src/sdk/session.ts` still has independently dispatched extension
-  credential-disabled callbacks and reactive conventional-MCP tool publication
-  (pristine lines 1486, 3649, 4794–4799). This candidate does not assert that those
-  callback APIs own/join every asynchronous effect. Their lifetimes need separate
-  validation before certifying sessions with those features.
+- The built-in **producer-body tail gap is closed**, including forwarding and
+  iterator timeout losers. An unregistered custom/extension provider, including
+  the bundled Grok provider's independent implementation, remains unknown. A
+  returned promise is a contract for represented work, not evidence for detached
+  effects hidden by a custom fetch/callback implementation.
+- **Default SDK hosting now has physical ownership, not a blanket exception.**
+  Its bounded return is still not physical completion: the session joins its
+  retained owners and the real WebSocket stop promise. Missing host registration
+  remains `sdk_host_effects_unrepresented`; a custom transport without a physical
+  join is `sdk_host_transport_unrepresented`. Joining a host from the callback it
+  would itself wait for fails explicitly with `sdk_host_reentrant_settlement`
+  instead of manufacturing idle or deadlocking. This does not claim coverage of
+  separate generic notification hosting, which still reports
+  `sdk_notification_effects_unrepresented` when enabled.
+- Explicit/preloaded extensions and discovered hook/plugin factories may detach
+  arbitrary effects; those sessions report `sdk_extension_effects_unrepresented`.
+  `ExtensionRunner.initialize()` can also flush buffered credential-disabled
+  events through unretained microtasks. Although direct returned callback
+  promises are now retained, a session receiving these events reports
+  `sdk_extension_credential_dispatch_unrepresented`. Runner-level queue/finally
+  retention is still required for that buffered path. Borrowed arbitrary runtime
+  services/event buses/MCP managers report `sdk_injected_services_unrepresented`.
+- Cursor's producer is retained, but its HTTP/2 coordinator subtasks and async
+  debug writer still require independent validation and joins; its receipt
+  includes `sdk_cursor_subtasks_unrepresented`.
 - A shell/tool can intentionally detach a descendant or create an external
   effect not represented by its returned promise. Physical promise settlement
   alone is not OS process-tree proof.
-- Early creation failure can leave other startup discovery promises without a
-  returned session owner. This patch closes the enumerated prewarm and async-job
-  failure paths, not every fallible discovery implementation.
+- Failed factories have no returned whole-session receipt. The enumerated
+  parallel discoveries, prewarm and async-job cleanup now join on failure, but
+  all fallible extension/host/discovery implementations have not been certified.
+  The adapter therefore retains `sdk_background_ownership_unproven` for a failed
+  factory rather than inferring coverage from rejection.
 
 Accordingly, do **not** blanket-remove `sdk_background_ownership_unproven` based
 on the marker or this patch. Parent integration must preserve unknown for these

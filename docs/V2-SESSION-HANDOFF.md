@@ -2,6 +2,25 @@
 
 Last updated: 2026-09-08 (private manual-update A10 → B3 and attachment preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
 
+## Follow-up checkpoint — SDK32 and durable notification handoff
+
+`4fb43c2` remote Node 22/24 and Linux server/desktop/package/GUI checks all passed.
+The next work expands the exact 0.16.4 SDK patch to 32 files, physically joins
+built-in provider tails and the actively enabled default WebSocket host, and
+lets supported normal sessions become idle after actual cleanup. Unsupported
+opaque features remain unknown; source hashes alone are never quiescence.
+Clean `npm ci`, the regenerated runtime manifest, and a shared file-count policy
+connect all 32 files to worker/native validation.
+
+macOS notification links now survive startup/recovery/process replacement in a
+separate bounded durable queue. Actual QA uncovered and fixed an HTTP/ws bind
+failure that skipped automation-socket cleanup. The new packaged app removes
+its socket on failure, preserves pending links in recovery, then delivers both
+after a normal reopen without re-supplying URLs. Native tests: 318 + 10 pass;
+whole verify passed. Evidence and exact remaining limits are in the top section
+of [the updater handoff](MACOS-UPDATER-HANDOFF.md). This is debug/ad-hoc QA, not a
+signed same-source release or production activation; the full deployment goal remains open.
+
 ## Current checkpoint — private actual restart passed, not release acceptance
 
 About's `Update and restart` now actually upgrades the isolated A10 (beta.10 /

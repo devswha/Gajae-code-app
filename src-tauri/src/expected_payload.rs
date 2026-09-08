@@ -252,7 +252,7 @@ fn parse_manifest_for_target(bytes: &[u8], platform: &str) -> Result<RuntimeMani
         })
         || sdk.packages.get(allowed[0]) != Some(&manifest.gjc_sdk)
         || sdk.files.is_empty()
-        || sdk.files.len() > 8
+        || sdk.files.len() > sdk_file_limit()?
     {
         return Err(failure());
     }
@@ -303,6 +303,21 @@ fn parse_manifest_for_target(bytes: &[u8], platform: &str) -> Result<RuntimeMani
         return Err("payload runtime manifest lacks the desktop target closure".to_owned());
     }
     Ok(manifest)
+}
+
+fn sdk_file_limit() -> Result<usize, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Policy {
+        schema_version: u8,
+        max_files: usize,
+    }
+    let policy: Policy = serde_json::from_str(include_str!("../../shared/sdkLifecyclePolicy.json"))
+        .map_err(|_| "Invalid compiled SDK lifecycle policy.")?;
+    if policy.schema_version != 1 || policy.max_files == 0 || policy.max_files > 128 {
+        return Err("Invalid compiled SDK lifecycle policy.".into());
+    }
+    Ok(policy.max_files)
 }
 
 /// One strict schema owns both the installed-payload and in-archive checks.
@@ -586,6 +601,27 @@ mod tests {
         expected(source)
             .verify_manifests(source, &formatted)
             .unwrap();
+    }
+
+    #[test]
+    fn shared_sdk_inventory_limit_accepts_the_boundary_and_rejects_overflow() {
+        let mut value = manifest();
+        let files = value["sdkLifecycle"]["files"].as_array_mut().unwrap();
+        let template = files[0].clone();
+        while files.len() < sdk_file_limit().unwrap() {
+            let mut file = template.clone();
+            file["path"] = json!(format!("src/provider-{}.ts", files.len()));
+            files.push(file);
+        }
+        let source = bytes(&value);
+        assert!(expected(&source).verify_manifests(&source, &source).is_ok());
+        let mut overflow = template;
+        overflow["path"] = json!("src/overflow.ts");
+        value["sdkLifecycle"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(overflow);
+        reject_even_with_matching_digest(&value);
     }
 
     #[test]

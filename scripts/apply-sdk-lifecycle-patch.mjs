@@ -5,9 +5,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import policy from '../shared/sdkLifecyclePolicy.json' with { type: 'json' };
+
 const PATCH_ID = 'gjc-sdk-lifecycle-v1';
 const PACKAGES = new Set(['@gajae-code/coding-agent', '@gajae-code/agent-core', '@gajae-code/ai']);
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
+if (policy.schemaVersion !== 1 || !Number.isSafeInteger(policy.maxFiles) || policy.maxFiles < 1 || policy.maxFiles > 128) {
+  throw new Error('Invalid SDK lifecycle file-count policy.');
+}
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
   && [null, Object.prototype].includes(Object.getPrototypeOf(value));
@@ -19,7 +24,7 @@ function validateManifest(manifest) {
   if (!exact(manifest, ['schemaVersion', 'id', 'packages', 'files']) || manifest.schemaVersion !== 1 || manifest.id !== PATCH_ID
     || !plain(manifest.packages) || !Object.keys(manifest.packages).length
     || Object.entries(manifest.packages).some(([name, version]) => !PACKAGES.has(name) || !/^\d+\.\d+\.\d+$/u.test(version))
-    || !Array.isArray(manifest.files) || !manifest.files.length || manifest.files.length > 8) throw new Error('Invalid SDK lifecycle patch manifest.');
+    || !Array.isArray(manifest.files) || !manifest.files.length || manifest.files.length > policy.maxFiles) throw new Error('Invalid SDK lifecycle patch manifest.');
   const paths = new Set();
   for (const file of manifest.files) {
     if (!exact(file, ['package', 'path', 'beforeSha256', 'afterSha256', 'replacements'])

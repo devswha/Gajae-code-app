@@ -26,9 +26,10 @@ export function deepLinkPath(rawUrl: unknown): string | null {
   } catch {
     return null;
   }
-  if (url.protocol !== 'gajae-app:') return null;
-  const segments = `${url.host}${url.pathname}`.split('/').filter(Boolean);
-  if (segments[0] === 'open' && segments[1] === 'job' && /^[A-Za-z0-9._:-]{1,128}$/u.test(segments[2] ?? '')) {
+  if (rawUrl.length > 256 || url.protocol !== 'gajae-app:' || url.hostname !== 'open'
+    || url.username || url.password || url.port || url.search || url.hash) return null;
+  const segments = url.pathname.split('/');
+  if (segments.length === 3 && segments[0] === '' && segments[1] === 'job' && /^[A-Za-z0-9._:-]{1,128}$/u.test(segments[2] ?? '')) {
     return '/';
   }
   return null;

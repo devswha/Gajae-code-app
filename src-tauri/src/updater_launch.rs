@@ -125,6 +125,13 @@ pub(crate) fn expected_restart(app: &AppHandle, code: Option<i32>) -> bool {
             .is_some_and(|gate| gate.phase() == Phase::Restarting)
 }
 
+pub(crate) fn allows_navigation_intents(app: &AppHandle) -> bool {
+    !crate::updater_restart::blocks_start(app)
+        && app
+            .try_state::<LaunchGate>()
+            .is_some_and(|gate| gate.phase() == Phase::Normal)
+}
+
 fn local_page(url: &tauri::Url) -> bool {
     url.scheme() == "tauri"
         && url.host_str() == Some("localhost")
@@ -586,6 +593,7 @@ pub(crate) fn finish_health(
     gate.set_phase(Phase::Normal);
     trace("successor-health-committed");
     app.state::<ScreenState>().clear();
+    crate::resume_deep_links(app);
     Ok(())
 }
 

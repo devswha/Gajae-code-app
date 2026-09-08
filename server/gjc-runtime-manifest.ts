@@ -1,6 +1,8 @@
 import { isAbsolute, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import sdkPolicy from '../shared/sdkLifecyclePolicy.json' with { type: 'json' };
+
 import manifest from './gjc-runtime-manifest.json' with { type: 'json' };
 
 type RuntimeManifestFile = {
@@ -56,7 +58,8 @@ function validSdkLifecycle(value: unknown): value is RuntimeManifest['sdkLifecyc
     || Object.keys(patch.packages).length < REQUIRED_SDK_PACKAGES.length || Object.keys(patch.packages).length > SDK_PACKAGES.size
     || REQUIRED_SDK_PACKAGES.some((name) => !Object.hasOwn(patch.packages, name))
     || Object.entries(patch.packages).some(([name, version]) => !SDK_PACKAGES.has(name) || typeof version !== 'string' || !/^\d+\.\d+\.\d+$/u.test(version))
-    || !Array.isArray(patch.files) || !patch.files.length || patch.files.length > 8) return false;
+    || sdkPolicy.schemaVersion !== 1 || !Number.isSafeInteger(sdkPolicy.maxFiles) || sdkPolicy.maxFiles < 1 || sdkPolicy.maxFiles > 128
+    || !Array.isArray(patch.files) || !patch.files.length || patch.files.length > sdkPolicy.maxFiles) return false;
   const seen = new Set<string>();
   for (const file of patch.files) {
     if (!file || typeof file !== 'object' || Object.keys(file).length !== 3

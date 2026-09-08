@@ -457,6 +457,8 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
   #backgroundTitles = 0;
   #admissionClosed = false;
   #sdkBackgroundOwnershipUnproven = false;
+  readonly #sdkSessionOwners = new Set<ActiveRun['session']>();
+  readonly #sdkCoverageFailures = new Set<string>();
   #baseSettings?: Settings;
   #cleanupFailure?: GjcCleanupUnconfirmedError;
 
@@ -466,6 +468,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     return createHash('sha256').update(JSON.stringify([
       this.#generation, this.#revision, this.oauth.getGeneration(), this.#registryActivity().generation,
       this.#credentialActivity().generation, this.#settingsActivity().generation,
+      [...this.#sdkSessionOwners].map((session) => readSdkLifecycleOwner(session, 'sdk_background_ownership_unproven').generation),
     ])).digest('hex');
   }
 
@@ -523,6 +526,20 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
     const unknown: GjcSdkActivitySnapshot['unknown'][number][] = [];
     if (this.#sdkBackgroundOwnershipUnproven) unknown.push('sdk_background_ownership_unproven');
     if (this.#cleanupFailure) unknown.push('sdk_cleanup_unconfirmed');
+    unknown.push(...this.#sdkCoverageFailures);
+    const activeSessions = new Set([...this.#runs.values()].map((run) => run.session));
+    for (const session of this.#sdkSessionOwners) {
+      const activity = readSdkLifecycleOwner(session, 'sdk_background_ownership_unproven');
+      // An active run already owns its entire subtree until retained disposal.
+      // A returned session not (or no longer) covered by a run still counts.
+      if (!activeSessions.has(session)) {
+        starting += activity.starting;
+        running += activity.running;
+        settling += activity.queued + activity.settling;
+      }
+      unknown.push(...activity.unknown);
+      if (!activity.complete && !activity.unknown.length) unknown.push('sdk_background_ownership_unproven');
+    }
     // Ordinary diagnostics describe coverage. A worker admission proof, unlike
     // those diagnostics, requires the registry's own producer fence to be shut.
     unknown.push(...registry.unknown.filter((reason) => this.#admissionClosed || reason !== 'model_registry_admission_open'));
@@ -848,6 +865,16 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
         console.error('GJC SDK session disposal failed.');
         throw this.#poison();
       }
+      // Only a completed physical teardown plus its live ownership receipt may
+      // retire this session. Source hashes and logical terminal events are not idle proof.
+      if (this.#sdkSessionOwners.has(run.session)) {
+        const activity = readSdkLifecycleOwner(run.session, 'sdk_background_ownership_unproven');
+        if (activity.starting + activity.queued + activity.running + activity.settling === 0) {
+          for (const reason of activity.unknown) this.#sdkCoverageFailures.add(reason);
+          if (!activity.complete && !activity.unknown.length) this.#sdkBackgroundOwnershipUnproven = true;
+          this.#sdkSessionOwners.delete(run.session);
+        }
+      }
       this.#assertHealthy();
       this.#runs.delete(runId);
       this.#revision += 1;
@@ -949,15 +976,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           delegation.setToolUIContext(askController.uiContext);
         }
         this.#assertHealthy();
-        // The app patch retains prewarm/force-recovered work, but source integrity
-        // alone does not prove unrepresented provider tails, reactive callbacks,
-        // shared registry maintenance or all external descendants have settled.
-        // Keep that coverage failure explicit until their real owners are wired.
-        if (!this.#sdkBackgroundOwnershipUnproven) {
-          this.#sdkBackgroundOwnershipUnproven = true;
-          this.#revision += 1;
-        }
-        const result = await (this.options.createSessionFactory ?? createAgentSession)({
+        const result = await Promise.resolve().then(() => (this.options.createSessionFactory ?? createAgentSession)({
           ...sessionOptions,
           // CustomTool is the public SDK replacement API. Never construct the
           // built-in executor: it does not inherit the app permission boundary.
@@ -966,7 +985,17 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
           // The app executor above receives the configured role policy. Only
           // native SDK spawning is denied for goal/delegation-capable sessions.
           spawns: delegation || goalEnabled ? 'deny' : sessionOptions.spawns,
+        })).catch((error: unknown) => {
+          // No returned owner: even a patched factory's rejection is not a
+          // receipt for every fallible discovery/extension implementation.
+          this.#sdkBackgroundOwnershipUnproven = true;
+          this.#revision += 1;
+          throw error;
         });
+        const ownership = readSdkLifecycleOwner(result.session, 'sdk_background_ownership_unproven');
+        if (ownership.unknown.includes('sdk_background_ownership_unproven')) this.#sdkBackgroundOwnershipUnproven = true;
+        else this.#sdkSessionOwners.add(result.session);
+        this.#revision += 1;
         this.#assertHealthy();
         if (config.modelProfile) {
           await activateModelProfile({
