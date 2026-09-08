@@ -33,6 +33,7 @@ enum Phase {
     Installing,
     Restarting,
     Recovery,
+    ManualRestart,
 }
 
 struct PendingSuccessor {
@@ -66,6 +67,7 @@ impl LaunchGate {
             3 => Phase::Installing,
             4 => Phase::Restarting,
             5 => Phase::Recovery,
+            6 => Phase::ManualRestart,
             _ => Phase::Checking,
         }
     }
@@ -103,12 +105,17 @@ impl LaunchGate {
 }
 
 pub(crate) fn admit_server(app: &AppHandle, root: &Path) -> Result<(), String> {
+    if crate::updater_restart::blocks_start(app) {
+        return Err("Manual restart transaction blocks server startup.".into());
+    }
     app.state::<LaunchGate>().admit(root)
 }
 
 pub(crate) fn holds_exit(app: &AppHandle) -> bool {
-    app.try_state::<LaunchGate>()
-        .is_some_and(|gate| matches!(gate.phase(), Phase::Installing | Phase::Restarting))
+    crate::updater_restart::holds_exit(app)
+        || app
+            .try_state::<LaunchGate>()
+            .is_some_and(|gate| matches!(gate.phase(), Phase::Installing | Phase::Restarting))
 }
 
 pub(crate) fn expected_restart(app: &AppHandle, code: Option<i32>) -> bool {
@@ -246,13 +253,52 @@ pub(crate) fn server_failed(app: &AppHandle, message: &str) -> bool {
     match app.state::<LaunchGate>().phase() {
         // A rejected Retry must not overwrite an in-flight updater document or
         // turn a live installer into a false terminal recovery state.
-        Phase::Checking | Phase::Installing | Phase::Restarting => true,
+        Phase::Checking | Phase::Installing | Phase::Restarting | Phase::ManualRestart => true,
         Phase::AwaitingHealth | Phase::Recovery => {
             recover(app, message);
             true
         }
         Phase::Normal => false,
     }
+}
+
+pub(crate) async fn show_manual_applying(app: &AppHandle) -> Result<(), String> {
+    let gate = app.state::<LaunchGate>();
+    gate.phase
+        .compare_exchange(
+            Phase::Normal as u8,
+            Phase::ManualRestart as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| "Native launch state changed before restart.".to_owned())?;
+    show_confirmed(app, Screen::Applying).await
+}
+pub(crate) fn cancel_manual_display(app: &AppHandle, return_url: &tauri::Url) {
+    let gate = app.state::<LaunchGate>();
+    if gate
+        .phase
+        .compare_exchange(
+            Phase::ManualRestart as u8,
+            Phase::Normal as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        app.state::<ScreenState>().clear();
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.navigate(return_url.clone());
+        }
+    }
+}
+pub(crate) fn manual_recovery(app: &AppHandle, message: &str) {
+    recover(app, message);
+}
+pub(crate) fn request_manual_restart(app: &AppHandle) {
+    app.state::<LaunchGate>().set_phase(Phase::Restarting);
+    let _ = show(app, Screen::Restarting);
+    app.request_restart();
 }
 
 fn normal_start(app: &AppHandle) {
@@ -296,7 +342,10 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
         normal_start(app);
         return Ok(());
     }
-    if absent && (!qa_install || binding.mode != Mode::Qa) {
+    let manual_pending = root
+        .join("desktop-update-cache/manual-intent.json")
+        .exists();
+    if absent && ((!qa_install && !manual_pending) || binding.mode != Mode::Qa) {
         // Current public builds continue preparation only until the required
         // installation qualification exists; do not penalize normal startup.
         normal_start(app);
@@ -375,23 +424,26 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
         normal_start(app);
         return Ok(());
     };
-    if !runtime.store.preferences()?.automatic
+    let manual = runtime
+        .store
+        .manual_requested(&archive.record().archive_sha256)
+        .unwrap_or(false);
+    if (!runtime.store.preferences()?.automatic && !manual)
         || !crate::updater::eligible_cached(archive.manifest(), &runtime.os)
             .map_err(|error| error.code().to_owned())?
     {
         normal_start(app);
         return Ok(());
     }
-    // A QA qualification explicitly runs against synthetic app/data roots whose
-    // previous process tree the harness has proved stopped. This port check is
-    // an extra veto, NOT a general production previous-owner proof. Public
-    // activation remains blocked until G0/real ownership qualification is done.
-    if !qa_install || runtime.binding.mode != Mode::Qa {
+    // A manual intent only selects the cached target. Actual process absence,
+    // native bundle identity and signature gates are independently re-proved.
+    if (!qa_install && !manual) || runtime.binding.mode != Mode::Qa {
         normal_start(app);
         return Ok(());
     }
     let deadline = tokio::time::Instant::now() + PREFLIGHT_TIMEOUT;
     qa_port_is_unoccupied(&root)?;
+    let owners = crate::updater_owners::prove_no_packaged_owners(location.app())?;
     if app
         .plugin(
             tauri_plugin_updater::Builder::new()
@@ -426,6 +478,7 @@ async fn start_inner(app: &AppHandle, qa_install: bool) -> Result<(), String> {
         }
     };
     show_confirmed(app, Screen::Applying).await?;
+    owners.revalidate()?;
     trace("applying-visible");
     if !app
         .state::<crate::lifecycle::SidecarLifecycle>()

@@ -1,4 +1,4 @@
-import { invalidateComposerFreeze } from '../../../shared/composerFreeze';
+import { invalidateComposerFreeze, isComposerSealed } from '../../../shared/composerFreeze';
 
 const DRAFT_KEY_PREFIX = 'draft_input_';
 const QUEUE_KEY_PREFIX = 'queued_message_';
@@ -20,6 +20,7 @@ const removeKeys = (keys: string[]) => { keys.forEach((key) => localStorage.remo
 
 export const safeLocalStorage = {
   setItem: (key: string, value: string) => {
+    if (isComposerSealed()) return;
     try { localStorage.setItem(key, value); return; } catch (error: any) {
       if (error?.name !== 'QuotaExceededError') { console.error('localStorage error:', error); return; }
     }
@@ -37,6 +38,7 @@ export const safeLocalStorage = {
     try { return localStorage.getItem(key); } catch (error) { console.error('localStorage getItem error:', error); return null; }
   },
   removeItem: (key: string) => {
+    if (isComposerSealed()) return;
     try { localStorage.removeItem(key); } catch (error) { console.error('localStorage removeItem error:', error); }
   },
 };
@@ -76,6 +78,7 @@ export function readQueuedMessages(sessionId: string): StoredQueuedMessage[] {
 }
 
 export function writeQueuedMessages(sessionId: string, messages: StoredQueuedMessage[]): boolean {
+  if (isComposerSealed()) return false;
   invalidateComposerFreeze();
   const queue = messages.filter((message) => message.content.trim() || message.attachmentCount);
   try {

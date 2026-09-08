@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -22,6 +22,7 @@ use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::updater_backend::Backend;
 use crate::updater_binding::{Binding, Mode};
 
 const MAX_REQUEST: usize = 4096;
@@ -40,6 +41,20 @@ enum Command {
     SetAutomatic { automatic: bool },
     #[serde(rename = "restart")]
     Restart {},
+    #[serde(rename = "restartPrepared")]
+    RestartPrepared {
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
+        #[serde(rename = "draftEpoch")]
+        draft_epoch: u64,
+    },
+    #[serde(rename = "restartCancel")]
+    RestartCancel {
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
+        #[serde(rename = "draftEpoch")]
+        draft_epoch: u64,
+    },
 }
 
 #[derive(Deserialize)]
@@ -63,6 +78,16 @@ struct Challenge {
     epoch: String,
     pid: u32,
     nonce: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackendAttach {
+    protocol_version: u8,
+    kind: String,
+    secret: String,
+    epoch: String,
+    pid: u32,
 }
 
 fn server_proof(secret: &str, epoch: &str, nonce: &str) -> String {
@@ -179,6 +204,8 @@ struct Run {
     retired: AtomicBool,
     pending: AtomicUsize,
     socket: PathBuf,
+    backend_claimed: AtomicBool,
+    backend: OnceLock<Arc<Backend>>,
 }
 
 impl Run {
@@ -189,6 +216,47 @@ impl Run {
             authority.view = None;
         }
         self.retired.store(true, Ordering::Release);
+        if let Some(backend) = self.backend.get() {
+            backend.retire();
+        }
+    }
+
+    fn attach_backend(&self, stream: &mut UnixStream, value: BackendAttach, peer: u32) {
+        let admitted = self.authority.lock().is_ok_and(|authority| {
+            authority.active
+                && value.protocol_version == 1
+                && value.kind == "backendAttach"
+                && peer == authority.pid
+                && value.pid == authority.pid
+                && equal_secret(&value.epoch, &authority.epoch)
+                && equal_secret(&value.secret, &authority.secret)
+        });
+        if !admitted
+            || self.retired.load(Ordering::Acquire)
+            || self.backend_claimed.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Ok(clone) = stream.try_clone() else {
+            return;
+        };
+        let Ok(backend) = Backend::new(clone, value.epoch.clone()) else {
+            return;
+        };
+        let backend = Arc::new(backend);
+        // Publish the channel only after its acknowledgement is on the wire,
+        // so a concurrent UI request cannot send control before backendAttached.
+        if !write_response(
+            stream,
+            &serde_json::json!({"protocolVersion":1,"kind":"backendAttached","epoch":value.epoch}),
+        ) {
+            backend.retire();
+            return;
+        }
+        let _ = self.backend.set(backend.clone());
+        if self.retired.load(Ordering::Acquire) {
+            backend.retire();
+        }
     }
 }
 
@@ -263,6 +331,8 @@ pub(crate) fn attach(app: &AppHandle, pid: u32) -> Result<Option<Vec<u8>>, Strin
         retired: AtomicBool::new(false),
         pending: AtomicUsize::new(0),
         socket,
+        backend_claimed: AtomicBool::new(false),
+        backend: OnceLock::new(),
     });
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -383,7 +453,7 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         .then_some(pid as u32)
 }
 
-fn serve(stream: UnixStream, run: &Run, app: &AppHandle) {
+fn serve(stream: UnixStream, run: &Arc<Run>, app: &AppHandle) {
     serve_protocol(stream, run, |request, peer| {
         // Authority is checked after acquiring the coordinator's operation lock.
         let admit = || {
@@ -395,25 +465,192 @@ fn serve(stream: UnixStream, run: &Run, app: &AppHandle) {
                     .is_ok_and(|mut authority| authority.admit(request, peer))
         };
         let updater = app.state::<crate::updater::Preparation>();
+        let restarts = app.state::<crate::updater_restart::Restarts>();
         match &request.command {
-            Command::Status {} => updater.snapshot(admit),
-            Command::Check {} => updater.manual_check(admit),
-            Command::SetAutomatic { automatic } => updater.set_automatic(*automatic, admit),
-            Command::Restart {} => {
-                if admit() {
-                    Err("updater_installation_unavailable")
-                } else {
-                    Err("updater_unauthorized")
+            Command::Status {} => updater.snapshot(admit).map(|state| {
+                crate::updater_restart::Reply::Snapshot(restarts.decorate(
+                    app,
+                    run.backend.get(),
+                    state,
+                ))
+            }),
+            Command::Check {} => {
+                if crate::updater_restart::blocks_start(app) {
+                    return Err("updater_busy");
                 }
+                updater.manual_check(admit).map(|state| {
+                    crate::updater_restart::Reply::Snapshot(restarts.decorate(
+                        app,
+                        run.backend.get(),
+                        state,
+                    ))
+                })
+            }
+            Command::SetAutomatic { automatic } => {
+                if crate::updater_restart::blocks_start(app) {
+                    return Err("updater_busy");
+                }
+                updater.set_automatic(*automatic, admit).map(|state| {
+                    crate::updater_restart::Reply::Snapshot(restarts.decorate(
+                        app,
+                        run.backend.get(),
+                        state,
+                    ))
+                })
+            }
+            Command::Restart {} => {
+                if !admit() {
+                    return Err("updater_unauthorized");
+                }
+                restarts.begin(app, restart_context(app, run, request)?)
+            }
+            Command::RestartPrepared {
+                attempt_id,
+                draft_epoch,
+            } => {
+                if !admit()
+                    || !crate::updater_backend::hex_id(attempt_id)
+                    || *draft_epoch == 0
+                    || *draft_epoch > 9_007_199_254_740_991
+                {
+                    return Err("updater_unauthorized");
+                }
+                restarts.prepared(app, attempt_id, *draft_epoch)
+            }
+            Command::RestartCancel {
+                attempt_id,
+                draft_epoch,
+            } => {
+                if !admit()
+                    || !crate::updater_backend::hex_id(attempt_id)
+                    || *draft_epoch == 0
+                    || *draft_epoch > 9_007_199_254_740_991
+                {
+                    return Err("updater_unauthorized");
+                }
+                restarts.cancel(app, attempt_id, *draft_epoch)
             }
         }
     });
 }
 
-fn serve_protocol(
+fn restart_context(
+    app: &AppHandle,
+    run: &Arc<Run>,
+    request: &Request,
+) -> Result<crate::updater_restart::Context, &'static str> {
+    let backend = run
+        .backend
+        .get()
+        .filter(|backend| backend.available())
+        .cloned()
+        .ok_or("updater_backend_unavailable")?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or("updater_unavailable")?;
+    let return_url = window.url().map_err(|_| "updater_unavailable")?;
+    if return_url.origin().ascii_serialization() != request.origin || !spa_page(&return_url) {
+        return Err("updater_unauthorized");
+    }
+    let view = request.view.clone();
+    let epoch = request.epoch.clone();
+    let pid = request.pid;
+    let original = run.clone();
+    let handle = app.clone();
+    let current = Arc::new(move || {
+        !original.retired.load(Ordering::Acquire)
+            && handle
+                .state::<crate::lifecycle::SidecarLifecycle>()
+                .owns_pid(pid)
+            && !handle
+                .state::<crate::lifecycle::SidecarLifecycle>()
+                .is_shutting_down()
+            && original.authority.lock().is_ok_and(|authority| {
+                authority.active
+                    && authority.epoch == epoch
+                    && authority
+                        .view
+                        .as_ref()
+                        .is_some_and(|current| equal_secret(&current.token, &view))
+            })
+    });
+    let original = run.clone();
+    let handle = app.clone();
+    let epoch = request.epoch.clone();
+    let same_run = Arc::new(move || {
+        !original.retired.load(Ordering::Acquire)
+            && handle
+                .state::<crate::lifecycle::SidecarLifecycle>()
+                .owns_pid(pid)
+            && !handle
+                .state::<crate::lifecycle::SidecarLifecycle>()
+                .is_shutting_down()
+            && original
+                .authority
+                .lock()
+                .is_ok_and(|authority| authority.active && authority.epoch == epoch)
+    });
+    Ok(crate::updater_restart::Context {
+        backend,
+        server_pid: pid,
+        return_url,
+        current,
+        same_run,
+    })
+}
+
+fn spa_page(url: &tauri::Url) -> bool {
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && !url.path().starts_with("/api/")
+        && !url.path().starts_with("/desktop/")
+        && !url.path().starts_with("/assets/")
+        && !url.path().ends_with(".html")
+        && !url.path().ends_with(".svg")
+}
+
+/// A precommit owner sends a confirmed rollback directly to the currently bound
+/// view even when its HTTP waiter disconnected. The event name is the private
+/// current-view capability, not a cookie or public global property.
+pub(crate) fn notify_restart_aborted(app: &AppHandle, attempt_id: &str, epoch: u64) {
+    let Some(run) = app
+        .try_state::<Bridge>()
+        .and_then(|bridge| bridge.0.lock().ok().and_then(|run| run.clone()))
+    else {
+        return;
+    };
+    let Some((token, origin)) = run.authority.lock().ok().and_then(|authority| {
+        authority
+            .view
+            .as_ref()
+            .map(|view| (view.token.clone(), view.origin.clone()))
+    }) else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if !window
+        .url()
+        .is_ok_and(|url| spa_page(&url) && url.origin().ascii_serialization() == origin)
+    {
+        return;
+    }
+    let event =
+        serde_json::to_string(&format!("gajae:desktop-restart:{token}")).expect("event name");
+    let detail =
+        serde_json::json!({"kind":"restartAborted","attemptId":attempt_id,"draftEpoch":epoch});
+    let _ = window.eval(format!(
+        "window.dispatchEvent(new CustomEvent({event},{{detail:{detail}}}));"
+    ));
+}
+
+fn serve_protocol<T: Serialize>(
     mut stream: UnixStream,
     run: &Run,
-    execute: impl FnOnce(&Request, u32) -> Result<crate::updater::Snapshot, &'static str>,
+    execute: impl FnOnce(&Request, u32) -> Result<T, &'static str>,
 ) {
     // BSD accepted sockets can retain the listener's nonblocking flag. A read
     // timeout does not clear O_NONBLOCK: frame 2 then spuriously fails before
@@ -444,7 +681,16 @@ fn serve_protocol(
     if !write_response(&mut stream, &response) {
         return;
     }
-    let Ok(request) = read_frame::<Request>(&mut stream, deadline) else {
+    let Ok(message) = read_frame::<serde_json::Value>(&mut stream, deadline) else {
+        return;
+    };
+    if message.get("kind").is_some() {
+        if let Ok(attach) = serde_json::from_value::<BackendAttach>(message) {
+            run.attach_backend(&mut stream, attach, peer);
+        }
+        return;
+    }
+    let Ok(request) = serde_json::from_value::<Request>(message) else {
         return;
     };
     let result = execute(&request, peer);
@@ -486,11 +732,12 @@ pub(crate) fn page_load(webview: &tauri::Webview, payload: &tauri::webview::Page
         return;
     };
     authority.view = None;
+    if payload.event() == tauri::webview::PageLoadEvent::Started {
+        crate::updater_restart::view_lost(app);
+    }
     if payload.event() != tauri::webview::PageLoadEvent::Finished
         || run.retired.load(Ordering::Acquire)
-        || payload.url().scheme() != "http"
-        || payload.url().host_str() != Some("127.0.0.1")
-        || payload.url().path().starts_with("/desktop/bootstrap")
+        || !spa_page(payload.url())
         || !app
             .state::<crate::navigation::LoopbackOrigin>()
             .permits(payload.url())
@@ -517,7 +764,11 @@ pub(crate) fn page_load(webview: &tauri::Webview, payload: &tauri::webview::Page
 fn bridge_script(token: &str, origin: &str) -> String {
     let token = serde_json::to_string(token).expect("token string");
     let origin = serde_json::to_string(origin).expect("origin string");
-    format!("({})({token},{origin});", include_str!("updater_bridge.js"))
+    let qa_diagnostics = cfg!(debug_assertions) && Binding::compiled().mode == Mode::Qa;
+    format!(
+        "({})({token},{origin},{qa_diagnostics});",
+        include_str!("updater_bridge.js")
+    )
 }
 
 #[cfg(test)]
@@ -603,6 +854,8 @@ mod tests {
             retired: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
             socket: socket_path.clone(),
+            backend_claimed: AtomicBool::new(false),
+            backend: OnceLock::new(),
         };
         if let Some(stream) = stream {
             // Deterministically exercise the BSD accept inheritance, regardless
@@ -628,6 +881,137 @@ mod tests {
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "verified");
+    }
+
+    #[test]
+    fn real_node_backend_channel_prepares_commits_and_never_reopens_on_disconnect() {
+        use crate::updater_backend::{Control, State};
+        let directory = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("gub-{}", &secret().unwrap()[..12]));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let socket_path = directory.join("rpc");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let script = r#"
+            import {PassThrough} from 'node:stream';
+            import {DesktopUpdateRelay} from './server/services/desktop-update-relay.ts';
+            import {DesktopRestartBackend} from './server/services/desktop-restart-backend.ts';
+            import {DesktopRestartAuthority} from './server/services/desktop-restart-authority.ts';
+            const backend=new DesktopRestartBackend();
+            // Transport fixture only: no execution owner is fabricated in an app.
+            const authority=new DesktopRestartAuthority({requiredOwners:['ui-drafts'],ownerReaders:{'ui-drafts':backend.draftReader}});
+            backend.attachAuthority(authority);
+            const timer=setTimeout(()=>{process.exitCode=1;relay.retire();},5000);
+            const handler={bind:e=>backend.bind(e),handle:(c,e)=>backend.handle(c,e),disconnected:e=>{
+                backend.disconnected(e);clearTimeout(timer);
+                if(authority.state!=='committed')process.exitCode=1;
+                else console.log('committed fence retained');
+            }};
+            const input=new PassThrough();
+            const relay=new DesktopUpdateRelay({input,restart:handler,platform:'darwin',env:{GJC_DESKTOP:'1',GJC_DESKTOP_UPDATE_PIPE:'1'}});
+            input.write('GJC_DESKTOP_UPDATE_INIT '+JSON.stringify({protocolVersion:1,socket:process.argv[1],secret:'a'.repeat(64),epoch:'b'.repeat(64)})+'\n');
+        "#;
+        let mut child = std::process::Command::new("node")
+            .args(["--import", "tsx", "--input-type=module", "--eval", script])
+            .arg(&socket_path)
+            .current_dir(repo)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut stream = None;
+        while Instant::now() < deadline {
+            if let Ok((accepted, _)) = listener.accept() {
+                stream = Some(accepted);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut auth = authority();
+        auth.pid = child.id();
+        auth.view = None;
+        let run = Run {
+            authority: Mutex::new(auth),
+            retired: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
+            socket: socket_path.clone(),
+            backend_claimed: AtomicBool::new(false),
+            backend: OnceLock::new(),
+        };
+        if let Some(stream) = stream {
+            serve_protocol(
+                stream,
+                &run,
+                |_, _| -> Result<crate::updater::Snapshot, &'static str> {
+                    panic!("backend attachment is not a UI command");
+                },
+            );
+        } else {
+            let _ = child.kill();
+        }
+        let transport = run
+            .backend
+            .get()
+            .expect("native authenticated backend attachment");
+        let status = transport
+            .request(Control::Status, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(status.state, State::Open);
+        let id = "c".repeat(64);
+        let prepared = transport
+            .request(
+                Control::Prepare {
+                    attempt_id: id.clone(),
+                    draft_epoch: 1,
+                    remaining_ms: 1000,
+                },
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(prepared.ok);
+        assert_eq!(prepared.state, State::Prepared);
+        let committed = transport
+            .request(
+                Control::Commit {
+                    attempt_id: id.clone(),
+                    token: prepared.token.unwrap(),
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(committed.ok);
+        assert_eq!(committed.state, State::Committed);
+        let cancelled = transport
+            .request(
+                Control::Cancel { attempt_id: id },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!cancelled.ok);
+        assert_eq!(cancelled.state, State::Committed);
+        run.retire();
+        let output = child.wait_with_output().unwrap();
+        drop(listener);
+        fs::remove_file(socket_path).unwrap();
+        fs::remove_dir(directory).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "committed fence retained"
+        );
     }
     #[test]
     fn replay_window_is_bounded_and_accepts_reordered_live_requests_only_once() {

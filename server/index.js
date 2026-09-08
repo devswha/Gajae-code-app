@@ -84,6 +84,7 @@ import settingsRoutes from './routes/settings.js';
 import { createGjcAppFactory } from './app-factory.js';
 import { DesktopUpdateRelay } from './services/desktop-update-relay.js';
 import { createDesktopRestartRuntime } from './services/desktop-restart-runtime.js';
+import { DesktopRestartBackend } from './services/desktop-restart-backend.js';
 import { getShellActivityGeneration, snapshotShellActivity } from './modules/websocket/services/shell-websocket.service.js';
 import { isWorkspaceRoot } from './modules/projects/index.js';
 import projectModuleRoutes from './modules/projects/projects.routes.js';
@@ -156,6 +157,7 @@ const gjcTerminalNotificationAdapter = createGjcTerminalNotificationAdapter({
 });
 // This is not exposed as a browser prepare/commit endpoint. Unimplemented
 // ownership readers remain explicit blockers; native install stays disabled.
+const desktopRestartBackend = new DesktopRestartBackend();
 const desktopRestartAdmission = createDesktopRestartRuntime({
     chat: { getGeneration: chatRunRegistry.getGeneration, read: chatRunRegistry.snapshotActivity },
     worktrees: createSessionWorktreeDesktopRestartReader(),
@@ -171,11 +173,13 @@ const desktopRestartAdmission = createDesktopRestartRuntime({
     notifications: { getGeneration: getNotificationActivityGeneration, read: snapshotNotificationActivity },
     'http-callbacks': { getGeneration: getHttpActivityGeneration, read: snapshotHttpActivity },
     'internal-producers': { getGeneration: getInternalActivityGeneration, read: snapshotInternalActivity },
+    'ui-drafts': desktopRestartBackend.draftReader,
 }, {
     owner: 'gjc-worker',
     close: (fenceId) => getGjcWorkerSupervisor().fenceForDesktopRestart(fenceId),
     release: (fenceId) => getGjcWorkerSupervisor().releaseDesktopRestartFence(fenceId),
 });
+desktopRestartBackend.attachAuthority(desktopRestartAdmission);
 // Install the same admission authority before startup catch-up, listeners, or
 // watcher initialization can accept work. Readers never perform configuration.
 configureGjcJobOrchestratorDesktopAdmission(desktopRestartAdmission);
@@ -211,7 +215,7 @@ function steerGjcChatRun(runId, message) {
 
 const { app, server, wss } = createGjcAppFactory({
     desktopRestartAdmission,
-    desktopUpdateRelay: new DesktopUpdateRelay(),
+    desktopUpdateRelay: new DesktopUpdateRelay({ restart: desktopRestartBackend }),
     authority: gjcJobAuthority,
     orchestrator: gjcJobOrchestrator,
     gitService: getProductionGjcJobGitService(
@@ -1746,9 +1750,12 @@ async function startServer() {
             // Persist interruption before any slower observer cleanup. Otherwise
             // a not-yet-started worker can cancel admission back to ready while
             // watcher shutdown awaits, erasing the interrupted-resume contract.
-            let gjcShutdownFenced = false;
+            // A committed native restart has already proved every durable job
+            // idle and closed all ingress. Do not start a fresh native mutation
+            // after that commit; normal Quit still records interruption first.
+            let gjcShutdownFenced = desktopRestartAdmission.state === 'committed';
             try {
-                await gjcJobOrchestrator.interruptForShutdown();
+                if (!gjcShutdownFenced) await gjcJobOrchestrator.interruptForShutdown();
                 gjcShutdownFenced = true;
             } catch (err) {
                 console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);

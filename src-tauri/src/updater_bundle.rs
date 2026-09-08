@@ -1147,7 +1147,13 @@ mod tests {
             PAYLOAD.into(),
             format!("{PAYLOAD}/server"),
             format!("{PAYLOAD}/node_modules"),
-            format!("{PAYLOAD}/node_modules/native"),
+            format!("{PAYLOAD}/node_modules/@gajae-code"),
+            format!("{PAYLOAD}/node_modules/@gajae-code/natives"),
+            format!("{PAYLOAD}/node_modules/@gajae-code/natives/native"),
+            format!("{PAYLOAD}/node_modules/@gajae-code/coding-agent"),
+            format!("{PAYLOAD}/node_modules/@gajae-code/coding-agent/src"),
+            format!("{PAYLOAD}/node_modules/@gajae-code/agent-core"),
+            format!("{PAYLOAD}/node_modules/@gajae-code/agent-core/src"),
         ] {
             fixture.directory(&dir);
         }
@@ -1159,13 +1165,28 @@ mod tests {
         .unwrap();
         fixture.file(&format!("{PAYLOAD}/package.json"), &package, 0o644);
         fixture.file(
-            &format!("{PAYLOAD}/node_modules/native/index.js"),
+            &format!("{PAYLOAD}/node_modules/@gajae-code/natives/native/index.js"),
             b"native",
             0o644,
         );
+        for package in ["coding-agent", "agent-core"] {
+            fixture.file(
+                &format!("{PAYLOAD}/node_modules/@gajae-code/{package}/src/index.ts"),
+                b"sdk",
+                0o644,
+            );
+        }
         let runtime = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1, "gjcSdk": "0.16.4", "bun": "1.4.0", "natives": "0.16.4",
-            "platforms": { "darwin-arm64": { "files": [{ "package": "native", "path": "index.js", "sha256": digest(b"native") }] } },
+            "schemaVersion": 2, "gjcSdk": "0.16.4", "bun": "1.4.0", "natives": "0.16.4",
+            "platforms": { "darwin-arm64": { "files": [{ "package": "@gajae-code/natives", "path": "native/index.js", "sha256": digest(b"native") }] } },
+            "sdkLifecycle": {
+                "id": "gjc-sdk-lifecycle-v1",
+                "packages": {"@gajae-code/coding-agent":"0.16.4", "@gajae-code/agent-core":"0.16.4"},
+                "files": [
+                    {"package":"@gajae-code/coding-agent", "path":"src/index.ts", "sha256":digest(b"sdk")},
+                    {"package":"@gajae-code/agent-core", "path":"src/index.ts", "sha256":digest(b"sdk")}
+                ]
+            },
         })).unwrap();
         fixture.file(
             &format!("{PAYLOAD}/server/gjc-runtime-manifest.json"),

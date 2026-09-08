@@ -5,7 +5,7 @@ import {
   type DesktopDraftFreezeRequest, type DesktopDraftFreezeReceipt, type DesktopDraftOwner, type DesktopUpdateBridge,
 } from '../../shared/desktopUpdateProtocol';
 
-import { cancelComposerFreeze, ComposerFreezeError, isComposerFreezeCurrent, prepareComposerFreeze } from './composerFreeze';
+import { cancelComposerFreeze, ComposerFreezeError, installComposerSealInputGuard, isComposerFreezeCurrent, isComposerSealed, prepareComposerFreeze, registerComposerSealRollbackOwner, sealComposerFreeze } from './composerFreeze';
 
 type Connection = { bridge: DesktopUpdateBridge; register: NonNullable<DesktopUpdateBridge['registerDraftOwner']> };
 type Registration = Connection & { retire(): void };
@@ -27,6 +27,7 @@ const sameConnection = (left: Connection | undefined, right: Connection | undefi
  * or restart. Capability presence neither authenticates native nor freezes input. */
 export function installComposerFreezeBridge(): () => void {
   if (typeof window === 'undefined') return () => {};
+  const releaseInput = installComposerSealInputGuard();
   let disposed = false;
   let current: Registration | undefined;
 
@@ -45,6 +46,7 @@ export function installComposerFreezeBridge(): () => void {
     const attempts = new Set<Attempt>();
     const registration: Registration = { ...next, retire };
     current = registration;
+    const rollback = registerComposerSealRollbackOwner(attached);
 
     function attached(): boolean {
       if (!active || disposed || current !== registration) return false;
@@ -54,6 +56,7 @@ export function installComposerFreezeBridge(): () => void {
     function retire() {
       if (!active) return;
       active = false;
+      rollback.unregister();
       for (const attempt of attempts) cancelComposerFreeze(attempt.source, attempt.source);
       attempts.clear();
       const stop = unsubscribe;
@@ -87,8 +90,15 @@ export function installComposerFreezeBridge(): () => void {
       isCurrent(receipt) {
         return attached() && [...attempts].some((attempt) => attempt.receipt === receipt) && isComposerFreezeCurrent(receipt);
       },
+      seal(receipt) {
+        return attached() && [...attempts].some((attempt) => attempt.receipt === receipt) && sealComposerFreeze(receipt);
+      },
       cancel(request) {
         if (!attached() || !request) return false;
+        // This explicit call is the authenticated native provider's confirmed
+        // pre-commit rollback, including recovery after bridge replacement.
+        // Retirement/unsubscribe/error cleanup never invokes it.
+        if (isComposerSealed()) return rollback.cancel(request);
         let cancelled = false;
         for (const attempt of attempts) if (attempt.source.token === request.token && attempt.source.epoch === request.epoch) {
           cancelled = cancelComposerFreeze(attempt.source, attempt.source) || cancelled;
@@ -117,6 +127,7 @@ export function installComposerFreezeBridge(): () => void {
     const previous = current;
     current = undefined;
     previous?.retire();
+    releaseInput();
   };
 }
 

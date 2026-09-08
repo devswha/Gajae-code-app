@@ -38,7 +38,7 @@ export const COMPOSER_STORAGE_LIMITS = {
 } as const;
 
 export class ComposerStorageError extends Error {
-  constructor(public readonly reason: 'unavailable' | 'quota' | 'limit' | 'invalid' | 'conflict' | 'timeout' | 'storage') {
+  constructor(public readonly reason: 'unavailable' | 'quota' | 'limit' | 'invalid' | 'conflict' | 'timeout' | 'storage', public readonly cause?: unknown) {
     super(`Composer draft storage: ${reason}`);
     this.name = 'ComposerStorageError';
   }
@@ -50,8 +50,20 @@ export function composerStorageReason(error: unknown): ComposerStorageError['rea
   return 'storage';
 }
 
-/** Validate and copy only the supported draft schema before structured cloning. */
-export function boundedComposerDraft(value: ComposerDraft): { draft: ComposerDraft; bytes: number } {
+export const normalizeComposerStorageError = (error: unknown): ComposerStorageError => error instanceof ComposerStorageError
+  ? error : new ComposerStorageError(composerStorageReason(error), error);
+
+type FileMetadata = Pick<File, 'name' | 'type' | 'size' | 'lastModified'>;
+type ByteFile = FileMetadata & { bytes: ArrayBuffer };
+type DraftWithFiles<T> = Omit<ComposerDraft, 'images' | 'queue'> & {
+  images: T[];
+  queue: Array<Omit<DurableQueuedDraft, 'images'> & { images: T[] }>;
+};
+type ByteDraft = DraftWithFiles<ByteFile> & { schemaVersion: 2 };
+
+/** One bound for both the live File schema and the persisted byte schema. On
+ * load this runs before constructing any Files or copying attachment buffers. */
+function boundDraft<T extends FileMetadata>(value: DraftWithFiles<T>, validateFile: (file: T) => void): { draft: DraftWithFiles<T>; bytes: number } {
   const limits = COMPOSER_STORAGE_LIMITS;
   let bytes = 0;
   const text = (item: unknown, max = limits.textLength): string => {
@@ -60,21 +72,25 @@ export function boundedComposerDraft(value: ComposerDraft): { draft: ComposerDra
     bytes += item.length * 2;
     return item;
   };
-  const files = (items: File[]): File[] => {
+  const files = (items: T[]): T[] => {
     if (!Array.isArray(items)) throw new ComposerStorageError('invalid');
     if (items.length > limits.filesPerIntent) throw new ComposerStorageError('limit');
     return items.map((file) => {
-      if (!(file instanceof File) || !file.type.startsWith('image/') || !Number.isSafeInteger(file.size) || file.size <= 0) throw new ComposerStorageError('invalid');
+      if (!file || typeof file !== 'object' || typeof file.type !== 'string' || !file.type.startsWith('image/')
+        || !Number.isSafeInteger(file.size) || file.size <= 0 || !Number.isSafeInteger(file.lastModified)) throw new ComposerStorageError('invalid');
       if (file.size > limits.fileBytes) throw new ComposerStorageError('limit');
       text(file.name, 1024);
+      text(file.type, 1024);
+      validateFile(file);
       bytes += file.size;
       return file;
     });
   };
+  if (!value || typeof value !== 'object') throw new ComposerStorageError('invalid');
   if (!Array.isArray(value.queue)) throw new ComposerStorageError('invalid');
   if (value.queue.length > limits.queueLength) throw new ComposerStorageError('limit');
   const ids = new Set<string>();
-  const draft: ComposerDraft = {
+  const draft: DraftWithFiles<T> = {
     projectId: text(value.projectId, 2048),
     conversation: value.conversation === null ? null : text(value.conversation, 2048),
     input: text(value.input),
@@ -102,13 +118,71 @@ export function boundedComposerDraft(value: ComposerDraft): { draft: ComposerDra
   return { draft, bytes };
 }
 
+/** Validate and copy only the supported draft schema before structured cloning. */
+export function boundedComposerDraft(value: ComposerDraft): { draft: ComposerDraft; bytes: number } {
+  return boundDraft(value, (file) => { if (!(file instanceof File)) throw new ComposerStorageError('invalid'); });
+}
+
+/** A metadata-only File is not durability evidence. Bound a stalled/unreadable
+ * browser Blob read too, and never accept truncated (including empty) bytes. */
+export function readComposerFileBytes(file: File): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    let finished = false;
+    const timer = setTimeout(() => { finished = true; reject(new ComposerStorageError('timeout')); }, COMPOSER_STORAGE_LIMITS.timeoutMs);
+    void Promise.resolve().then(() => file.arrayBuffer()).then((buffer) => {
+      if (finished) return;
+      if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== file.size) throw new ComposerStorageError('conflict');
+      const copy = buffer.slice(0);
+      finished = true;
+      clearTimeout(timer);
+      resolve(copy);
+    }).catch((error: unknown) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      reject(normalizeComposerStorageError(error));
+    });
+  });
+}
+
+async function encodeDraft(value: ComposerDraft): Promise<{ draft: ByteDraft; bytes: number }> {
+  const { draft, bytes } = boundedComposerDraft(value);
+  const encodeFiles = async (files: File[]): Promise<ByteFile[]> => {
+    const result: ByteFile[] = [];
+    for (const file of files) result.push({ name: file.name, type: file.type, size: file.size, lastModified: file.lastModified, bytes: await readComposerFileBytes(file) });
+    return result;
+  };
+  const images = await encodeFiles(draft.images);
+  const queue: ByteDraft['queue'] = [];
+  for (const item of draft.queue) queue.push({ ...item, images: await encodeFiles(item.images) });
+  return { draft: { ...draft, images, queue, schemaVersion: 2 }, bytes };
+}
+
+async function decodeRecord(value: unknown, route: ComposerRoute): Promise<StoredComposerDraft> {
+  if (!value || typeof value !== 'object') throw new ComposerStorageError('invalid');
+  const record = value as ByteDraft & { revision: number };
+  if (composerRouteKey(record) !== composerRouteKey(route) || !Number.isSafeInteger(record.revision) || record.revision < 1) throw new ComposerStorageError('invalid');
+  // Readable legacy Files are detached BEFORE any later save can overwrite
+  // their IDB record (WebKit can revoke those Blob backing resources on put).
+  // Loading never writes: the next successful CAS save migrates to v2. A
+  // failed legacy read leaves the original record and revision untouched.
+  if ('schemaVersion' in record && record.schemaVersion !== 2) throw new ComposerStorageError('invalid');
+  const encoded = 'schemaVersion' in record ? record : (await encodeDraft(value as ComposerDraft)).draft;
+  const { draft } = boundDraft(encoded, (file) => {
+    if (!(file.bytes instanceof ArrayBuffer) || file.bytes.byteLength !== file.size
+      || file.type !== file.type.toLowerCase() || /[^\x20-\x7e]/.test(file.type)) throw new ComposerStorageError('invalid');
+  });
+  const restoreFiles = (files: ByteFile[]) => files.map((file) => new File([file.bytes], file.name, { type: file.type, lastModified: file.lastModified }));
+  return { ...draft, images: restoreFiles(draft.images), queue: draft.queue.map((item) => ({ ...item, images: restoreFiles(item.images) })), revision: record.revision };
+}
+
 const DATABASE = 'gajae-composer-drafts-v1';
 const DRAFTS = 'drafts';
 const SIZES = 'sizes';
 const CLOCK = 'composer-clock';
 type SizeRecord = { bytes: number; revision: number; empty?: boolean };
 type StorageClock = { clock: number; absenceEpoch: number };
-const emptyDraft = (draft: ComposerDraft) => !draft.input.length && !draft.images.length && !draft.queue.length;
+const emptyDraft = (draft: Pick<ComposerDraft, 'input'> & { images: unknown[]; queue: unknown[] }) => !draft.input.length && !draft.images.length && !draft.queue.length;
 
 function validClock(value: StorageClock | undefined): StorageClock {
   if (value === undefined) return { clock: 0, absenceEpoch: 0 };
@@ -159,11 +233,12 @@ function transactionResult<T>(db: IDBDatabase, transaction: IDBTransaction, work
   });
 }
 
-export const browserComposerDraftRepository: ComposerDraftRepository = {
+const repository: ComposerDraftRepository = {
   async load(route) {
     const db = await openDatabase();
-    const transaction = db.transaction([DRAFTS, SIZES], 'readonly');
-    return transactionResult(db, transaction, (set, fail) => {
+    let transaction: IDBTransaction;
+    try { transaction = db.transaction([DRAFTS, SIZES], 'readonly'); } catch (error) { db.close(); throw error; }
+    const result = await transactionResult<{ record: unknown } | { empty: StoredComposerDraft }>(db, transaction, (set, fail) => {
       const key = composerRouteKey(route);
       const request = transaction.objectStore(DRAFTS).get(key);
       request.onsuccess = () => {
@@ -179,22 +254,22 @@ export const browserComposerDraftRepository: ComposerDraftRepository = {
                   const { absenceEpoch } = validClock(clockRequest.result);
                   // Missing records carry an epoch, so pruning a bounded
                   // tombstone can never resurrect an old revision-zero writer.
-                  set({ ...route, input: '', images: [], queue: [], revision: size?.revision ?? -absenceEpoch, ...(size ? {} : { absent: true as const }) });
+                  set({ empty: { ...route, input: '', images: [], queue: [], revision: size?.revision ?? -absenceEpoch, ...(size ? {} : { absent: true as const }) } });
                 } catch (error) { fail(error); }
               };
             };
             return;
           }
-          const record = request.result as StoredComposerDraft;
-          const { draft } = boundedComposerDraft(record);
-          if (composerRouteKey(draft) !== composerRouteKey(route) || !Number.isSafeInteger(record.revision) || record.revision < 1) throw new ComposerStorageError('invalid');
-          set({ ...draft, revision: record.revision });
+          set({ record: request.result });
         } catch (error) { fail(error); }
       };
     });
+    return 'empty' in result ? result.empty : decodeRecord(result.record, route);
   },
   async save(value, expectedRevision) {
-    const { draft, bytes } = boundedComposerDraft(value);
+    // No File/Blob reaches IDB, and no await occurs inside the write transaction.
+    // If ANY active/queued attachment cannot be copied, do not open a write at all.
+    const { draft, bytes } = await encodeDraft(value);
     const key = composerRouteKey(draft);
     const db = await openDatabase();
     let transaction: IDBTransaction;
@@ -259,5 +334,14 @@ export const browserComposerDraftRepository: ComposerDraftRepository = {
         } catch (error) { fail(error); }
       };
     });
+  },
+};
+
+export const browserComposerDraftRepository: ComposerDraftRepository = {
+  async load(route) {
+    try { return await repository.load(route); } catch (error) { throw normalizeComposerStorageError(error); }
+  },
+  async save(draft, expectedRevision) {
+    try { return await repository.save(draft, expectedRevision); } catch (error) { throw normalizeComposerStorageError(error); }
   },
 };

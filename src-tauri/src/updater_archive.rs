@@ -691,9 +691,7 @@ fn inventory_hash(entries: &[ArchiveEntry]) -> String {
 #[derive(Debug)]
 enum MetadataValue {
     String(String),
-    Integer(u64),
     Map(BTreeMap<String, MetadataValue>),
-    Array(Vec<MetadataValue>),
     Other,
 }
 struct Document(MetadataValue);
@@ -759,13 +757,11 @@ impl<'de> Visitor<'de> for MetadataSeed<'_> {
         self.charge(value.len())?;
         Ok(MetadataValue::String(value))
     }
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(MetadataValue::Integer(value))
+    fn visit_u64<E: de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(MetadataValue::Other)
     }
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(u64::try_from(value)
-            .map(MetadataValue::Integer)
-            .unwrap_or(MetadataValue::Other))
+    fn visit_i64<E: de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(MetadataValue::Other)
     }
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
         Ok(MetadataValue::Other)
@@ -799,14 +795,16 @@ impl<'de> Visitor<'de> for MetadataSeed<'_> {
         Ok(MetadataValue::Map(result))
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-        let mut result = Vec::new();
-        while let Some(value) = sequence.next_element_seed(MetadataSeed {
-            depth: self.depth + 1,
-            budget: self.budget,
-        })? {
-            result.push(value);
-        }
-        Ok(MetadataValue::Array(result))
+        while sequence
+            .next_element_seed(MetadataSeed {
+                depth: self.depth + 1,
+                budget: self.budget,
+            })?
+            .is_some()
+        {}
+        // Scalar identity reads do not need array storage. The recursive visit
+        // still enforces every node/depth/byte/duplicate limit before discarding.
+        Ok(MetadataValue::Other)
     }
 }
 
@@ -954,46 +952,13 @@ fn validate_runtime_manifest(
     entries: &BTreeMap<String, ArchiveEntry>,
     root: &str,
 ) -> Result<(), String> {
-    let value = json_metadata(bytes)?;
-    require(
-        matches!(value.field("schemaVersion")?, MetadataValue::Integer(1)),
-        "Unsupported runtime manifest schema",
-    )?;
-    for key in ["gjcSdk", "bun", "natives"] {
-        let version = value.field(key)?.string()?;
-        require(
-            version.len() <= 128 && semver::Version::parse(version).is_ok(),
-            "Invalid runtime manifest version",
-        )?;
-    }
-    let MetadataValue::Array(files) = value
-        .field("platforms")?
-        .field("darwin-arm64")?
-        .field("files")?
-    else {
-        return Err("Runtime manifest files must be an array".to_owned());
-    };
-    require(!files.is_empty(), "Runtime manifest closure is empty")?;
+    // Preserve the archive parser's node/depth/duplicate bounds, then use the
+    // same strict schema as native pre-server validation. Schema drift must not
+    // let a packaged payload boot but make its signed update archive unusable.
+    json_metadata(bytes)?;
+    let files = crate::expected_payload::runtime_manifest_files(bytes, "darwin-arm64")?;
     let mut seen = BTreeSet::new();
-    for file in files {
-        let package = file.field("package")?.string()?;
-        relative_components(package)?;
-        let parts: Vec<_> = package.split('/').collect();
-        require(
-            (parts.len() == 1 && !package.starts_with('@'))
-                || (parts.len() == 2 && parts[0].starts_with('@') && parts[0].len() > 1),
-            "Invalid runtime package name",
-        )?;
-        let relative = file.field("path")?.string()?;
-        relative_components(relative)?;
-        let digest = file.field("sha256")?.string()?;
-        require(
-            digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "Invalid runtime manifest hash",
-        )?;
+    for (package, relative, digest) in files {
         let path = format!("{root}/{PAYLOAD}/node_modules/{package}/{relative}");
         require(
             seen.insert(path.clone()),
@@ -1003,7 +968,7 @@ fn validate_runtime_manifest(
             .get(&path)
             .ok_or("Runtime manifest member is missing")?;
         require(
-            matches!(&entry.kind, ArchiveEntryKind::File { sha256, .. } if sha256 == digest),
+            matches!(&entry.kind, ArchiveEntryKind::File { sha256, .. } if sha256 == &digest),
             "Runtime manifest member hash/type mismatch",
         )?;
     }
@@ -1317,10 +1282,16 @@ mod tests {
         .unwrap();
         let native = b"export const fixture = true;\n";
         let runtime = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1, "gjcSdk": "0.16.4", "bun": "1.4.0", "natives": "0.16.4",
+            "schemaVersion": 2, "gjcSdk": "0.16.4", "bun": "1.4.0", "natives": "0.16.4",
             "platforms": { "darwin-arm64": { "files": [{
                 "package": "@gajae-code/natives", "path": "native/index.js", "sha256": hash_bytes(native)
-            }] } }
+            }] } },
+            "sdkLifecycle": {"id":"gjc-sdk-lifecycle-v1",
+                "packages":{"@gajae-code/coding-agent":"0.16.4","@gajae-code/agent-core":"0.16.4"},
+                "files":[
+                    {"package":"@gajae-code/coding-agent","path":"src/sdk/session.ts","sha256":hash_bytes(native)},
+                    {"package":"@gajae-code/agent-core","path":"src/agent-loop.ts","sha256":hash_bytes(native)}
+                ]}
         })).unwrap();
         let mut files = vec![
             Fixture::file(PLIST, &plist_bytes(&plist_value(), false)),
@@ -1331,6 +1302,16 @@ mod tests {
             Fixture::file(PACKAGE, &package),
             Fixture::file(RUNTIME, &runtime),
             Fixture::file(NATIVE, native),
+            Fixture::file(
+                &format!(
+                    "{ROOT}/{PAYLOAD}/node_modules/@gajae-code/coding-agent/src/sdk/session.ts"
+                ),
+                native,
+            ),
+            Fixture::file(
+                &format!("{ROOT}/{PAYLOAD}/node_modules/@gajae-code/agent-core/src/agent-loop.ts"),
+                native,
+            ),
         ];
         let mut parents = BTreeSet::new();
         for file in &files {
@@ -2067,7 +2048,7 @@ mod tests {
                         .unwrap()
                         .push(duplicate);
                 }
-                6 => value["schemaVersion"] = 2.into(),
+                6 => value["schemaVersion"] = 1.into(),
                 7 => value["platforms"]["darwin-arm64"]["files"] = serde_json::json!([]),
                 _ => value["platforms"] = serde_json::json!({ "linux-x64": {} }),
             }
@@ -2077,6 +2058,24 @@ mod tests {
         let mut fixtures = fixture();
         get(&mut fixtures, NATIVE).data.push(0);
         rejected(&fixtures, "hash/type mismatch");
+    }
+
+    #[test]
+    fn runtime_v2_sdk_members_are_verified_before_any_extraction() {
+        let path =
+            format!("{ROOT}/{PAYLOAD}/node_modules/@gajae-code/coding-agent/src/sdk/session.ts");
+        let mut fixtures = fixture();
+        get(&mut fixtures, &path).data.push(0);
+        rejected(&fixtures, "hash/type mismatch");
+        let mut fixtures = fixture();
+        fixtures.retain(|file| file.path != path);
+        rejected(&fixtures, "member is missing");
+        let mut fixtures = fixture();
+        let runtime = get(&mut fixtures, RUNTIME);
+        let mut metadata: serde_json::Value = serde_json::from_slice(&runtime.data).unwrap();
+        metadata.as_object_mut().unwrap().remove("sdkLifecycle");
+        runtime.data = serde_json::to_vec(&metadata).unwrap();
+        assert!(inspect(&fixtures).is_err());
     }
 
     #[test]

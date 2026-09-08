@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type {
   ChangeEvent,
   ClipboardEvent,
@@ -14,6 +14,7 @@ import type { DropzoneInputProps, DropzoneRootProps } from 'react-dropzone';
 import { PlusIcon, Loader2, ArrowUpIcon, ForwardIcon } from 'lucide-react';
 
 import { classifyCommandInput, isAutoSendable } from '../commandDispatchPolicy';
+import { isComposerSealed, registerComposerInputValue, subscribeComposerFreeze } from '../../../shared/composerFreeze';
 import { useVoiceInput } from '../hooks/useVoiceInput';
 import { useVoiceAvailable } from '../hooks/useVoiceAvailable';
 import type { PendingCommandGate, QueuedDraft } from '../hooks/useChatComposerState';
@@ -224,6 +225,13 @@ export default function ChatComposer({
   onPickWorkspaceTarget = () => {},
 }: ChatComposerProps) {
   const { t } = useTranslation('chat');
+  const sealed = useSyncExternalStore(subscribeComposerFreeze, isComposerSealed, () => false);
+  const attachInput = (inputElement: HTMLTextAreaElement | null) => {
+    textareaRef.current = inputElement;
+    if (!inputElement) return;
+    const unregister = registerComposerInputValue(inputElement, () => input);
+    return () => { unregister(); if (textareaRef.current === inputElement) textareaRef.current = null; };
+  };
   const commandMenuPosition = useMemo(() => {
     if (!isCommandMenuOpen) {
       return { top: 0, left: 16, bottom: 90 };
@@ -295,7 +303,7 @@ export default function ChatComposer({
   };
 
   return (
-    <div className="chat-composer-shell relative shrink-0 px-2 pt-0 pb-2 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
+    <div data-composer-root="" className="chat-composer-shell relative shrink-0 px-2 pt-0 pb-2 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
       {pendingPermissionRequests.length > 0 && (
         <div className="mx-auto mb-3 max-w-chat">
           <PermissionRequestsBanner
@@ -436,7 +444,8 @@ export default function ChatComposer({
             </div>
 
             <PromptInputTextarea
-              ref={textareaRef}
+              ref={attachInput}
+              readOnly={sealed}
               dir="auto"
               value={input}
               onChange={onInputChange}

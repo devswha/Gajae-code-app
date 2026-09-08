@@ -27,6 +27,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
   const process = { exitCode: 0, exit: (code: number) => events.push(`exit:${code}`) };
   const context = {
     shutdownStarted: false,
+    desktopRestartAdmission: { state: 'open' },
     markInternalActivityUncertain: () => events.push('shutdown'),
     gjcJobOrchestrator: { interruptForShutdown: async () => { events.push('durable-fence'); }, close: () => events.push('jobs-close') },
     closeSessionsWatcher: async () => { events.push('watcher-close'); },
@@ -80,4 +81,13 @@ test('unconfirmed watcher close retains the durable interruption and refuses nor
   await f.run();
   assert.deepEqual(f.events, ['shutdown', 'durable-fence', 'watcher-close']);
   assert.equal(f.process.exitCode, 1);
+});
+
+test('committed idle restart closes resources without admitting a new native job mutation', async () => {
+  const f = fixture({ desktopRestartAdmission: { state: 'committed' } });
+  f.context.gjcJobOrchestrator.interruptForShutdown = async () => { throw new Error('new work after commit'); };
+  await f.run();
+  assert.ok(!f.events.includes('durable-fence'));
+  assert.ok(f.events.includes('jobs-close'));
+  assert.equal(f.events.at(-1), 'exit:0');
 });

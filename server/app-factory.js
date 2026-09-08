@@ -4,7 +4,7 @@ import cors from 'cors';
 import express from 'express';
 
 import { parseAllowedHosts } from '../shared/networkHosts.js';
-import { isDesktopUpdateCommand } from '../shared/desktopUpdateProtocol.js';
+import { isDesktopNativeCommand } from '../shared/desktopRestartProtocol.js';
 
 import { createDesktopAuth, DESKTOP_BOOTSTRAP_PATH } from './middleware/desktop-auth.js';
 import { createWebSocketServer } from './modules/websocket/index.js';
@@ -101,10 +101,10 @@ export function createGjcAppFactory({
     if (!desktopAuth.enabled || !desktopUpdateRelay?.isAvailable()) return response.status(404).json({ error: 'updater_unavailable' });
     if (request.headers.origin !== desktopAuth.expectedOrigin()
       || typeof request.headers['x-gajae-update-view'] !== 'string') return response.status(403).json({ error: 'updater_unauthorized' });
-    if (!isDesktopUpdateCommand(request.body)) return response.status(400).json({ error: 'updater_invalid_command' });
+    if (!isDesktopNativeCommand(request.body)) return response.status(400).json({ error: 'updater_invalid_command' });
     void desktopUpdateRelay.request(request.body, request.headers['x-gajae-update-view'], request.headers.origin)
-      .then((snapshot) => response.json(snapshot))
-      .catch((error) => response.status(error.message === 'updater_unauthorized' ? 403 : 503).json({ error: /^[a-z_]{1,64}$/.test(error.message) ? error.message : 'updater_unavailable' }));
+      .then((snapshot) => { if (!response.destroyed) response.json(snapshot); })
+      .catch((error) => { if (!response.destroyed) response.status(error.message === 'updater_unauthorized' ? 403 : 503).json({ error: /^[a-z_]{1,64}$/.test(error.message) ? error.message : 'updater_unavailable' }); });
   });
   app.use('/api', validateApiKey);
   // Authentication may create the implicit owner. Acquire before downstream

@@ -1,6 +1,137 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
-## 2026-09-08 현재: SDK 패치 적용·source 검증·페이지 owner 등록
+## 2026-09-08 현재: 실제 버튼 A10 → B3 교체·재시작·첨부 보존 통과
+
+격리된 QA 앱에서 About의 `Update and restart`로 A10(product beta.10 / desktop
+0.2.4) → B3(beta.11 / 0.2.5)가 실제 교체되고 자동 실행됐다. 자동 확인 설정은
+false인 상태로 유지됐다. `A10-stderr.log`는 Applying → backend prepare/commit →
+서버/포착한 하위 process 종료 → manual intent → 다음 시작의 installer 호출/전체
+트리 검증 → 신버전 자동 재실행 → `successor-health-committed`를 기록한다.
+`A10-manual-cycle.jsonl`과 schema-2 완료 marker는 이전 native/server/core 종료 및
+후속 native 7560/server 7766을 확인한다. 실제 설치된 Info.plist는 0.2.5이며
+`codesign --verify --deep --strict`도 통과했다.
+
+`B3-after-update-ax.txt`/`.png`: beta.11 UI, Scratch 프로젝트, 동일 origin
+`http://127.0.0.1:50761/`, 미전송 초안과 SVG 미리보기 유지.
+`B3-after-update-bytes-ax.txt`: 실제 IndexedDB schema 2 / revision 51 / 초안 일치 /
+첨부 1개 / queue 0. 172-byte SVG SHA-256은 원본과 동일하다:
+`f744bd2e0ac70466bcd76177a22fb54cdbe87bf55b4540d5f7837d64d65c994e`.
+증거 root는 아래와 같은 `/private/tmp/gajae-native-restart.wupMI0/`다.
+
+이는 **debug/ad-hoc 앱 + 전용 QA updater 서명**의 incremental 실증이다.
+B3는 A10의 마지막 native 순서 변경 이전 빌드이므로 최종 same-source signed/
+notarized acceptance가 아니며, 공개 배포나 production 활성화도 하지 않았다.
+정상 Quit 후 `--qa-profile`만으로 재실행한 B3도 beta.11, 같은 origin/프로젝트,
+초안/미리보기를 유지했다(`B3-normal-reopen-ax.txt`, `.png`). 검증 후 QA 앱과
+임시 관측/피드는 정리하며 fixture/로그는 보존한다. 로그인/실제 transcript/대기열의
+폭넓은 데이터 보존, 전체 production 게이트와 공개 릴리즈는 남는다.
+자동업데이트와 배포 목표는 유지한다.
+
+## 이전 실패·수정 과정: native restart 거래 연결과 GUI QA
+
+부모 인계 기준 pushed HEAD는 `721806d`이며, 그 위 native restart 거래는
+**약 35개 파일의 미커밋 WIP**다(동시 작업으로 파일 수는 변할 수 있다).
+아래는 source/저장된 로그 checkpoint이지 배포 또는 수동 재시작 성공 기록이 아니다.
+자동 업데이트 완성과 공개 배포라는 전체 목표를 유지한다.
+
+- [native restart](../src-tauri/src/updater_restart.rs)는 native challenge →
+  현재 페이지의 draft 저장·seal ACK → Applying 표시/페이지 종료 → backend prepare →
+  owner 재검증/commit → owned server/tree 종료 확인 → 대상 archive에 결합된 durable manual
+  intent → 재시작을 연결한다. 실행은 **compile-bound QA 앱 + 정확한 QA profile만**
+  허용한다. 불명확한 commit/종료는 recovery이며 자동 재시도하지 않는다.
+- [native backend](../src-tauri/src/updater_backend.rs),
+  [Node channel](../server/services/desktop-restart-channel.ts),
+  [backend owner](../server/services/desktop-restart-backend.ts)는 인증된 별도
+  native 채널의 epoch/순번/attempt/token을 결합한다. browser prepare/commit
+  endpoint는 없다. `ui-drafts` reader도 연결됐지만 실제 seal이 없으면 blocker다.
+- [owner 관측](../src-tauri/src/updater_owners.rs)은 정확한 QA root의 packaged
+  owner만 격리하고 production은 기존 cross-installation 범위를 유지한다.
+  전체 PID 열거와 포착한 descendant tree의 종료 검사는 축소하지 않는다.
+  두 번의 bounded census는 atomic process history나 이미 이탈한 daemon의
+  종료 증명이 아니다. 이 source를 production owner qualification으로 세지 않는다.
+- [native payload](../src-tauri/src/expected_payload.rs)와
+  [archive 검사](../src-tauri/src/updater_archive.rs)가 runtime manifest schema 2의
+  같은 strict parser를 사용하도록 SSOT 불일치를 수정했다. archive는 native
+  closure와 SDK lifecycle post-hash의 실제 regular-file 멤버도 검사한다.
+  `VerifiedSdkPatch`는 source 무결성만 증명하며 full SDK quiescence가 아니다.
+
+증거 root: `/private/tmp/gajae-native-restart.wupMI0/`. 부모 실행 결과:
+
+- `verify-final.log`: 전체 `npm run verify` exit 0.
+- `native-tests-final-rerun2.log`: desktop Rust **307 pass / 5 ignored**, 별도
+  build-binding **10 pass**. ignored는 통과로 세지 않는다.
+- `native-clippy-final.log`: 통과. 이후의 소규모 QA 진단/테스트 fixture 변경
+  이전 결과이며 최종 작업 트리 전체의 재검증으로 확장하지 않는다.
+
+첨부가 있는 실제 GUI A4–A7은 File/Blob `NotFoundError`로 **backend prepare 이전**에 실패했다.
+각 `A4-stderr.log`–`A7-stderr.log`는 `draft-challenge`까지만 기록한다.
+**이 수동 재시작 거래의 실제 성공은 아직 없다.** 이전
+[next-launch A→B](DESKTOP-UPDATER-LAUNCH-QA.md)는 다른 경로의 격리 QA 증거다.
+
+원인 분리 증거는 `webkit-picker-reopen-ax.txt`와 `webkit-picker-reopen.png`다.
+격리 DB에 picker File·메모리 생성 File·ArrayBuffer를 저장하고 같은 QA 앱을
+정상 종료/재실행했다. 첫 조회는 셋 모두 172 bytes였다. 조회한 record를
+`durability: 'strict'` transaction으로 다시 쓴 뒤, 보유 중인 객체와 새 조회
+객체 **양쪽의 두 File 모두 `NotFoundError`**, ArrayBuffer는 계속 172 bytes였다.
+따라서 이 재현은 앱 교체 없이도 발생하는 record 재저장/Blob 수명 문제이며,
+단순 재실행만으로 File이 사라진다거나 backend prepare가 실패했다는 증거가 아니다.
+
+후속 text-only 시험: 부모는 실제 profile lease를 잡고 격리 home/browser를
+같은 증거 root의 `A7-profile-before-codec/`에 백업한 뒤 **현재 QA 초안의 fixture
+첨부만** 제거했다. 원본 fixture와 백업은 보존했다. `A7-reopen-stderr.log`는
+아래 재시작 경로를 기록한다. 주의: `home/browser` 백업에는 UUID로 격리된
+WKWebsiteDataStore가 포함되지 않는다. 그 디렉터리 복원만으로 IndexedDB 초안이나
+첨부가 복원됐다고 해석하지 않는다. 이전 형식 실증은 구버전 앱으로 다시 만든다.
+
+`A7-reopen-stderr.log`:
+`backend-prepare → backend-prepared → applying-visible → updater_restart_cancelled`
+를 기록한다. 첨부 없는 경로도 commit/재시작 성공은 아니다.
+예정된 Applying navigation의 fetch 거부 뒤 JS가 자동 cancel을 보내는 self-cancel
+race가 유력 원인이다. 부모의 [bridge 수정](../src-tauri/src/updater_bridge.js)과
+[회귀 테스트](../src/shared/nativeUpdateBridge.dom.bun.test.tsx)는 prepared ACK를
+보낸 뒤 응답이 유실돼도 자동 cancel을 보내지 않고 native abort 확인까지 seal을
+유지한다(native가 deadline 소유). 빌드/검증 진행 중이며 실제 성공은 미확인이다.
+
+[versioned byte-backed codec](../src/components/chat/utils/composerDraftStorage.ts)은
+File 대신 실제 bytes와 metadata를 저장하고 조회 시 독립 File을 만든다. 읽을 수
+있는 legacy File은 이후 CAS 저장 전에 복사한다. 읽기 실패는 원본을 덮어쓰거나
+saved로 표시하지 않는다. 부모의 `codec-parent-tests.log`는 실제 repository를
+구동하는 합성 IDB driver와 인접 DOM/bridge 5개 suite에서 **123 pass**다.
+WebKit 실증과는 구분한다. **위 verify 통과 로그는 codec/후속 bridge 변경 이전이다.**
+`native-clippy-qa-fixes.log`와 `native-tests-qa-fixes.log`는 후속 native 진단과
+fixture 수정까지 통과했다(307 + 10 pass, 5 ignored).
+
+A8 text-only 실제 버튼 시험은 `backend-prepared` 뒤 owner capture 또는 Applying
+뒤 owner revalidation에서 보류됐다(`A8-stderr.log`, `A8-manual-cycle.jsonl`).
+JS self-cancel 수정 후에도 commit/종료/교체 성공은 아직 입증되지 않았다.
+다음 빌드에는 native owner scanner의 정적 사유를 QA-only 로그에 남긴다.
+부모가 동일 소스 A/B payload 빌드, 합집합 검증과 실제 재시작·첨부 byte 보존을
+이어서 확인한다. 임시 QA 버전 변경은 배포 버전 변경이 아니며 빌드 후 복구한다.
+
+추가 실증: 구버전 A8 GUI에서 fixture를 다시 첨부·저장하고 정상 종료한 뒤 A9를
+실행했다. A9의 restart 준비는 첨부 byte 검증과 owner revalidation을 통과했지만
+Applying 후 backend commit의 `updater_runtime_changed`로 취소됐다.
+`A9-migrated-draft-ax.txt`는 그 뒤의 실제 IndexedDB read-only 조회다:
+schema 2, revision 50, 초안 일치, 첨부 1개(172 bytes), queue 0;
+SHA-256 `f744bd2e0ac70466bcd76177a22fb54cdbe87bf55b4540d5f7837d64d65c994e`가
+원본 fixture와 일치한다. 미리보기도 유지됐다. 이것은 실제 legacy 마이그레이션
+증거지만 자동 앱 교체 성공 증거는 아니다.
+
+`verify-codec-union.log`는 codec/bridge 합집합의 전체 verify exit 0이다.
+후속 A10은 sealed 페이지를 Applying으로 전환한 뒤 backend prepare를 요청한다.
+예정된 WebSocket/HTTP 종료를 generation 검사의 예외로 인정하지 않고, 페이지
+종료 뒤 새 runtime 증명을 얻는다. 바쁘거나 불명확하면 여전히 취소하며 설치와
+server 종료는 commit 이후다. 원래 5초 준비 예산도 유지한다.
+`native-clippy-handoff-order.log`와 `native-tests-handoff-order.log`는 통과했다
+(307 + 10 pass, 5 ignored). A10 → B3는 이 순서 수정 전후 native가 다른
+incremental QA 쌍이므로 최종 same-source signed qualification으로 세지 않는다.
+production 활성화/owner qualification, key custody와 backup, signed/notarized
+same-source A→B, 실제 macOS 13, G0 승인·취소 및 privileged writer 종료 증명,
+deep-link buffering, 미표현 SDK streaming/extension tails와 전체 G3/G5,
+최초/후속 공개 배포는 남아 있다. `/Applications`의 production 앱은 사용 중이며
+이 문서 sidecar는 앱·사용자 데이터·키를 조회하거나 변경하지 않았다.
+
+## 이전 checkpoint: 2026-09-08 SDK 패치 적용·source 검증·페이지 owner 등록
 
 최신 커밋 `06bbc51`은 Linux 패키지 데이터 보존 검증에서 확인된 종료 순서
 문제를 수정한다. watcher 정리를 기다리기 전에 native job interruption을

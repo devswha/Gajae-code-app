@@ -57,7 +57,7 @@ test('production connects ownership readers and the same admission before startu
     assert.ok(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name));
     return property.name.text;
   });
-  assert.deepEqual(names, DESKTOP_RESTART_REQUIRED_OWNERS.filter((name) => name !== 'ui-drafts'));
+  assert.deepEqual(names, DESKTOP_RESTART_REQUIRED_OWNERS);
   for (const name of [
     'configureGjcJobOrchestratorDesktopAdmission', 'configureSessionWorktreeDesktopAdmission',
     'configureNativeDesktopRestartAdmission', 'configureAutomationDesktopAdmission',

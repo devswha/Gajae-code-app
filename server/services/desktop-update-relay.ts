@@ -1,36 +1,27 @@
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { connect as connectSocket, type Socket } from 'node:net';
 import { performance } from 'node:perf_hooks';
 import type { Readable } from 'node:stream';
 
-import { isDesktopUpdateCommand, isDesktopUpdateSnapshot, type DesktopUpdateCommand, type DesktopUpdateSnapshot } from '../../shared/desktopUpdateProtocol.js';
+import { isDesktopNativeCommand, isDesktopNativeReply, type DesktopNativeCommand, type DesktopNativeReply } from '../../shared/desktopRestartProtocol.js';
+
+import { DesktopRestartChannel, type DesktopRestartHandler } from './desktop-restart-channel.js';
+import { authenticNativeChallenge, isNativeSecret, type DesktopNativeBinding } from './desktop-update-transport.js';
 
 const MAX_INIT_BYTES = 4096;
 const MAX_RESPONSE_BYTES = 32 * 1024;
 const REQUEST_TIMEOUT_MS = 2_000;
 const MAX_PENDING = 4;
-const secretPattern = /^[a-f0-9]{64}$/;
 const initPrefix = 'GJC_DESKTOP_UPDATE_INIT ';
-const CHALLENGE_DOMAIN = 'gajae-native-update-v1\0';
-
-type Binding = { protocolVersion: 1; socket: string; secret: string; epoch: string };
+type Binding = DesktopNativeBinding;
 type Options = {
   input?: Readable;
   env?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   pid?: number;
   connect?: typeof connectSocket;
+  restart?: DesktopRestartHandler;
 };
-
-function authenticChallenge(value: Record<string, unknown>, binding: Binding, nonce: string): boolean {
-  if (Object.keys(value).length !== 5 || value.protocolVersion !== 1 || value.kind !== 'challenge'
-    || value.epoch !== binding.epoch || value.nonce !== nonce
-    || typeof value.proof !== 'string' || !secretPattern.test(value.proof)) return false;
-  // The key is the UTF-8 initialization secret, NOT its hex-decoded bytes.
-  const expected = createHmac('sha256', binding.secret)
-    .update(`${CHALLENGE_DOMAIN}${binding.epoch}\0${nonce}`, 'utf8').digest();
-  return timingSafeEqual(expected, Buffer.from(value.proof, 'hex'));
-}
 
 /** A relay, not an updater: no downloads, lifecycle, installer or private key APIs. */
 export class DesktopUpdateRelay {
@@ -42,11 +33,14 @@ export class DesktopUpdateRelay {
   private readonly connect: typeof connectSocket;
   private readonly input: Readable;
   private inputBuffer = Buffer.alloc(0);
+  private readonly restart?: DesktopRestartHandler;
+  private restartChannel?: DesktopRestartChannel;
 
   constructor(options: Options = {}) {
     this.input = options.input ?? process.stdin;
     this.connect = options.connect ?? connectSocket;
     this.pid = options.pid ?? process.pid;
+    this.restart = options.restart;
     const env = options.env ?? process.env;
     if ((options.platform ?? process.platform) !== 'darwin' || env.GJC_DESKTOP !== '1' || env.GJC_DESKTOP_UPDATE_PIPE !== '1') {
       this.retired = true;
@@ -73,11 +67,11 @@ export class DesktopUpdateRelay {
       const value = JSON.parse(line.slice(initPrefix.length)) as Record<string, unknown>;
       if (Object.keys(value).length !== 4 || value.protocolVersion !== 1
         || typeof value.socket !== 'string' || !value.socket.startsWith('/') || value.socket.length > 1024
-        || typeof value.secret !== 'string' || !secretPattern.test(value.secret)
-        || typeof value.epoch !== 'string' || !secretPattern.test(value.epoch)) throw new Error();
+        || !isNativeSecret(value.secret) || !isNativeSecret(value.epoch)) throw new Error();
       this.binding = value as Binding;
       this.inputBuffer.fill(0);
       this.inputBuffer = Buffer.alloc(0);
+      if (this.restart) this.restartChannel = new DesktopRestartChannel({ binding: this.binding, pid: this.pid, handler: this.restart, connect: this.connect });
     } catch {
       this.retire();
     }
@@ -87,6 +81,7 @@ export class DesktopUpdateRelay {
 
   retire(): void {
     this.retired = true;
+    this.restartChannel?.close();
     this.binding = null;
     this.inputBuffer.fill(0);
     this.inputBuffer = Buffer.alloc(0);
@@ -96,15 +91,15 @@ export class DesktopUpdateRelay {
     for (const socket of this.pending) socket.destroy();
   }
 
-  request(command: DesktopUpdateCommand, view: string, origin: string): Promise<DesktopUpdateSnapshot> {
+  request(command: DesktopNativeCommand, view: string, origin: string): Promise<DesktopNativeReply> {
     const binding = this.binding;
-    if (this.retired || !binding || !isDesktopUpdateCommand(command)) return Promise.reject(new Error('updater_unavailable'));
-    if (typeof view !== 'string' || !secretPattern.test(view) || typeof origin !== 'string'
+    if (this.retired || !binding || !isDesktopNativeCommand(command)) return Promise.reject(new Error('updater_unavailable'));
+    if (!isNativeSecret(view) || typeof origin !== 'string'
       || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(origin)) return Promise.reject(new Error('updater_unauthorized'));
     if (this.pending.size >= MAX_PENDING) return Promise.reject(new Error('updater_busy'));
     const sequence = ++this.sequence;
-    const acceptedCommand: DesktopUpdateCommand = command.action === 'setAutomatic'
-      ? { action: command.action, automatic: command.automatic } : { action: command.action };
+    const acceptedCommand: DesktopNativeCommand = { ...command };
+    const timeoutMs = command.action === 'restartPrepared' ? 20_000 : command.action === 'restartCancel' ? 10_000 : REQUEST_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
       let settled = false;
       let bytes = Buffer.alloc(0);
@@ -112,8 +107,8 @@ export class DesktopUpdateRelay {
       let phase: 'connecting' | 'challenge' | 'response' = 'connecting';
       let nonce = '';
       let socket: Socket | undefined;
-      const deadline = performance.now() + REQUEST_TIMEOUT_MS;
-      const finish = (error?: string, value?: DesktopUpdateSnapshot) => {
+      const deadline = performance.now() + timeoutMs;
+      const finish = (error?: string, value?: DesktopNativeReply) => {
         if (settled) return;
         if (!error && performance.now() >= deadline) error = 'updater_timeout';
         settled = true;
@@ -128,7 +123,7 @@ export class DesktopUpdateRelay {
       };
       // One deadline covers connect, proof verification AND the command reply.
       // Neither authentication nor partial data renews the budget.
-      const timer = setTimeout(() => finish('updater_timeout'), REQUEST_TIMEOUT_MS);
+      const timer = setTimeout(() => finish('updater_timeout'), timeoutMs);
       try { socket = this.connect(binding.socket); }
       catch { finish('updater_unavailable'); return; }
       const connectedSocket = socket;
@@ -161,7 +156,7 @@ export class DesktopUpdateRelay {
             || this.retired || this.binding !== binding) throw new Error();
           const frame = response as Record<string, unknown>;
           if (phase === 'challenge') {
-            if (!authenticChallenge(frame, binding, nonce)) { finish('updater_unauthorized'); return; }
+            if (!authenticNativeChallenge(frame, binding, nonce)) { finish('updater_unauthorized'); return; }
             if (performance.now() >= deadline) { finish('updater_timeout'); return; }
             bytes.fill(0);
             bytes = Buffer.alloc(0);
@@ -172,7 +167,14 @@ export class DesktopUpdateRelay {
             return;
           }
           if (phase !== 'response' || frame.protocolVersion !== 1 || frame.sequence !== sequence) throw new Error();
-          if (frame.ok === true && isDesktopUpdateSnapshot(frame.snapshot)) finish(undefined, frame.snapshot);
+          if (frame.ok === true && isDesktopNativeReply(frame.snapshot)) {
+            const reply = frame.snapshot;
+            if ('kind' in reply) {
+              if (reply.kind === 'restartChallenge' ? acceptedCommand.action !== 'restart'
+                : !('attemptId' in acceptedCommand) || reply.attemptId !== acceptedCommand.attemptId || reply.draftEpoch !== acceptedCommand.draftEpoch) throw new Error();
+            }
+            finish(undefined, reply);
+          }
           else if (frame.ok === false && typeof frame.error === 'string' && /^[a-z_]{1,64}$/.test(frame.error)) finish(frame.error);
           else throw new Error();
         } catch { finish('updater_protocol_error'); }

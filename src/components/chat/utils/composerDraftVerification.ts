@@ -1,10 +1,14 @@
 import type { ComposerDraftReceipt } from '../../../shared/composerFreeze';
 
-import { boundedComposerDraft, composerRouteKey, ComposerStorageError, type ComposerDraft, type ComposerDraftRepository } from './composerDraftStorage';
+import { boundedComposerDraft, composerRouteKey, ComposerStorageError, normalizeComposerStorageError, readComposerFileBytes, type ComposerDraft, type ComposerDraftRepository } from './composerDraftStorage';
 
 /** Read committed data back, including every File byte (metadata alone is not
  * attachment durability). Never use localStorage as a durability receipt. */
 export async function verifyCommittedComposerDraft(repository: ComposerDraftRepository, expected: ComposerDraft, revision: number) {
+  try { await verifyDraft(repository, expected, revision); } catch (error) { throw normalizeComposerStorageError(error); }
+}
+
+async function verifyDraft(repository: ComposerDraftRepository, expected: ComposerDraft, revision: number) {
   const record = await repository.load(expected);
   if (!record) {
     if (revision === 0 && !expected.input && !expected.images.length && !expected.queue.length) return;
@@ -19,8 +23,8 @@ export async function verifyCommittedComposerDraft(repository: ComposerDraftRepo
   const originals = files(expected);
   const stored = files(actual);
   for (let index = 0; index < originals.length; index += 1) {
-    const left = new Uint8Array(await originals[index].arrayBuffer());
-    const right = new Uint8Array(await stored[index].arrayBuffer());
+    const left = new Uint8Array(await readComposerFileBytes(originals[index]));
+    const right = new Uint8Array(await readComposerFileBytes(stored[index]));
     if (left.length !== right.length || left.some((byte, offset) => byte !== right[offset])) throw new ComposerStorageError('conflict');
   }
 }

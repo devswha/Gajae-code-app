@@ -26,6 +26,8 @@ mod updater_archive;
 #[cfg(target_os = "macos")]
 mod updater_attempt;
 #[cfg(target_os = "macos")]
+mod updater_backend;
+#[cfg(target_os = "macos")]
 mod updater_binding;
 #[cfg(target_os = "macos")]
 mod updater_bridge;
@@ -41,6 +43,10 @@ mod updater_launch;
 mod updater_location;
 #[cfg(target_os = "macos")]
 mod updater_manifest;
+#[cfg(target_os = "macos")]
+mod updater_owners;
+#[cfg(target_os = "macos")]
+mod updater_restart;
 #[cfg(target_os = "macos")]
 mod updater_screen;
 #[cfg(target_os = "macos")]
@@ -425,6 +431,8 @@ fn main() {
         app.manage(updater::Preparation::default());
         #[cfg(target_os = "macos")]
         app.manage(updater_bridge::Bridge::default());
+        #[cfg(target_os = "macos")]
+        app.manage(updater_restart::Restarts::default());
         #[cfg(target_os = "macos")]
         if let Some(profile) = app.try_state::<qa_profile::QaProfile>() {
             profile.create_windows(app, &qa_windows)?;

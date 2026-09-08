@@ -105,7 +105,7 @@ impl SidecarLifecycle {
         }
     }
 
-    async fn wait_for_exit(&self) -> Result<(), String> {
+    pub(crate) async fn wait_for_exit(&self) -> Result<(), String> {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 // Register before checking the durable state: exit can happen

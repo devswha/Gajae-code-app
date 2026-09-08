@@ -44,6 +44,9 @@ pub enum Phase {
     Ready,
     Deferred,
     Error,
+    Applying,
+    Restarting,
+    Recovery,
 }
 
 #[derive(Clone, Debug, Serialize)]

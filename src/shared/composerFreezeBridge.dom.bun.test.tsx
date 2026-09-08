@@ -12,7 +12,7 @@ import App from '../App';
 import { useDurableComposerDraft } from '../components/chat/hooks/useDurableComposerDraft';
 import { boundedComposerDraft, composerRouteKey, type ComposerDraftRepository, type StoredComposerDraft } from '../components/chat/utils/composerDraftStorage';
 
-import { beginComposerOperation, cancelComposerFreeze, isComposerFreezeCurrent, isComposerFrozen, prepareComposerFreeze, registerComposerFreezeParticipant, resetComposerFreezeForTests } from './composerFreeze';
+import { beginComposerOperation, cancelComposerFreeze, invalidateComposerFreeze, isComposerFreezeCurrent, isComposerFrozen, isComposerSealed, prepareComposerFreeze, registerComposerFreezeParticipant, registerComposerSealRollbackOwner, resetComposerFreezeForTests, sealComposerFreeze } from './composerFreeze';
 import { installComposerFreezeBridge, useComposerFreezeBridge } from './composerFreezeBridge';
 
 const globals = window as unknown as Record<string, unknown>;
@@ -235,4 +235,64 @@ test('App installs the owner before authentication or settings/About surfaces mo
 test('service teardown is idempotent', () => {
   const native = provider(); inject(native.bridge); const stop = installComposerFreezeBridge();
   stop(); stop(); announce(); assert.equal(native.owners.length, 1); assert.equal(native.unsubscribed, 1);
+});
+
+test('seal takes only the owned actual receipt and survives retirement, TTL and same-document provider replacement', async () => {
+  const native = provider(); inject(native.bridge); const view = renderHook(useComposerFreezeBridge);
+  const old = native.current; const key = request(30); const receipt = await old.prepare(key);
+  assert.equal(old.seal({ ...receipt }), false); assert.equal(old.seal(receipt), true); assert.equal(isComposerSealed(), true);
+  await new Promise((resolve) => setTimeout(resolve, 45));
+  assert.equal(old.isCurrent(receipt), false); assert.equal(isComposerFrozen(), true); assert.equal(isComposerSealed(), true);
+  invalidateComposerFreeze(); assert.equal(cancelComposerFreeze(key), false);
+  view.unmount(); assert.equal(isComposerSealed(), true); assert.equal(old.cancel(key), false);
+  inject({ protocolVersion: 1, request: native.bridge.request });
+  const nextView = renderHook(useComposerFreezeBridge); assert.equal(isComposerSealed(), true);
+  const next = provider(); inject(next.bridge); announce();
+  await assert.rejects(next.current.prepare(request()), rejects('sealed'));
+  assert.equal(old.seal(receipt), false); assert.equal(old.cancel(key), false);
+  assert.equal(next.current.cancel({ ...key, epoch: key.epoch + 1 }), false);
+  assert.equal(next.current.cancel(key), true, 'current provider can perform authenticated native recovery of the old sealed token');
+  assert.equal(isComposerFrozen(), false); assert.equal(isComposerSealed(), false);
+  const fresh = await next.current.prepare(request()); assert.equal(next.current.isCurrent(fresh), true);
+  assert.equal(old.cancel(fresh), false); assert.equal(next.current.isCurrent(fresh), true); nextView.unmount();
+});
+
+test('sealed Window input capture remains installed even with no mounted bridge provider', async () => {
+  const native = provider(); inject(native.bridge); const view = renderHook(useComposerFreezeBridge);
+  const receipt = await native.current.prepare(request()); assert.equal(native.current.seal(receipt), true);
+  view.unmount();
+  const root = document.createElement('div'); root.dataset.composerRoot = '';
+  const textarea = document.createElement('textarea'); textarea.defaultValue = 'committed draft'; root.append(textarea); document.body.append(root);
+  try {
+    textarea.value = 'post-retirement input'; const event = new Event('input', { bubbles: true, cancelable: true }); textarea.dispatchEvent(event);
+    assert.equal(event.defaultPrevented, true); assert.equal(textarea.value, 'committed draft'); assert.equal(isComposerSealed(), true);
+  } finally { root.remove(); }
+});
+
+test('stale rollback registration/nonce and matching-value source copies cannot release a newer sealed lease', async () => {
+  const old = registerComposerSealRollbackOwner(() => true);
+  const first = await prepareComposerFreeze(request()); assert.equal(sealComposerFreeze(first), true);
+  const current = registerComposerSealRollbackOwner(() => true);
+  old.unregister(); assert.equal(old.cancel(first), false);
+  assert.equal(current.cancel(first), true);
+  const source = request(); const second = await prepareComposerFreeze(source); assert.equal(sealComposerFreeze(second), true);
+  assert.equal(cancelComposerFreeze(source, { ...source }), false);
+  assert.equal(cancelComposerFreeze(source, source), false, 'even exact preparation identity does not make cleanup a rollback');
+  assert.equal(old.cancel(source), false); assert.equal(current.cancel(first), false); assert.equal(isComposerSealed(), true);
+  assert.equal(current.cancel(source), true); current.unregister();
+});
+
+test('failed replacement registration and stale unsubscribe cancellation preserve an uncertain sealed commit', async () => {
+  const first = provider(); const register = first.bridge.registerDraftOwner!; let old!: DesktopDraftOwner;
+  const key = request();
+  first.bridge.registerDraftOwner = function (owner) {
+    old = owner; const stop = register.call(this, owner);
+    return () => { assert.equal(owner.cancel(key), false); stop(); };
+  };
+  inject(first.bridge); renderHook(useComposerFreezeBridge);
+  const receipt = await old.prepare(key); assert.equal(old.seal(receipt), true);
+  const failed = provider(); failed.bridge.registerDraftOwner = () => { throw new Error('native registration unavailable'); };
+  inject(failed.bridge); announce(); assert.equal(isComposerSealed(), true); assert.equal(isComposerFrozen(), true);
+  const recovered = provider(); inject(recovered.bridge); announce();
+  assert.equal(old.cancel(key), false); assert.equal(recovered.current.cancel(key), true);
 });

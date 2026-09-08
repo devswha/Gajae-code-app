@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 import type { SetStateAction } from 'react';
 
-import { invalidateComposerFreeze, registerComposerFreezeParticipant, type ComposerDraftReceipt } from '../../../shared/composerFreeze';
+import { invalidateComposerFreeze, isComposerSealed, registerComposerFreezeParticipant, subscribeComposerFreeze, type ComposerDraftReceipt } from '../../../shared/composerFreeze';
 import { draftInputKey, notifyQueuedMessages, queuedMessageKey, subscribeQueuedMessages } from '../utils/chatStorage';
 import { composerQueueOwnerKey, readComposerQueueProjection } from '../utils/composerQueueProjection';
 import { verifyCommittedComposerDraft } from '../utils/composerDraftVerification';
 import {
   boundedComposerDraft, browserComposerDraftRepository, COMPOSER_STORAGE_LIMITS,
-  composerRouteKey, composerStorageReason, ComposerStorageError,
+  composerRouteKey, composerStorageReason, ComposerStorageError, normalizeComposerStorageError,
   type ComposerDraft, type ComposerDraftRepository, type ComposerRoute, type DurableQueuedDraft,
 } from '../utils/composerDraftStorage';
 
@@ -62,6 +62,7 @@ class ComposerDraftController {
   private listeners = new Set<() => void>();
   private publishing = false;
   private mounted = false;
+  private activeRoute?: string;
   private unregister?: () => void;
   private disconnect?: () => void;
   constructor(private repository: ComposerDraftRepository) {}
@@ -145,6 +146,7 @@ class ComposerDraftController {
     this.status(entry, { phase: 'error', reason: composerStorageReason(error) });
   }
   settleSteer(sessionId: string, content: string, accepted: boolean): DurableQueuedDraft | undefined {
+    if (isComposerSealed()) return;
     for (const entry of this.entries.values()) {
       if (entry.snapshot.conversation !== sessionId) continue;
       const draft = entry.snapshot.queue.find((item) => item.pendingSteer && item.content === content);
@@ -157,6 +159,7 @@ class ComposerDraftController {
   }
   /** The legacy consumer can retire a cached queue while another route is open. */
   private reconcile(entry: Entry): boolean {
+    if (isComposerSealed()) return false;
     if (entry.migrationBlocked) return false;
     const projection = readComposerQueueProjection(entry.snapshot);
     if (projection.foreign || projection.raw === entry.queueRaw) return false;
@@ -174,6 +177,9 @@ class ComposerDraftController {
     return true;
   }
   activate(route: ComposerRoute) {
+    const changed = this.activeRoute !== composerRouteKey(route);
+    this.activeRoute = composerRouteKey(route);
+    if (isComposerSealed()) { if (changed) invalidateComposerFreeze(); return; }
     invalidateComposerFreeze();
     this.retireSettledOwner(route);
     const entry = this.entry(route);
@@ -181,6 +187,7 @@ class ComposerDraftController {
     void this.load(route);
   }
   load(route: ComposerRoute): Promise<void> {
+    if (isComposerSealed()) return Promise.resolve();
     const entry = this.entry(route);
     if (entry.loading) return entry.loading;
     if (entry.loaded || entry.migrationBlocked || !route.projectId) return Promise.resolve();
@@ -216,6 +223,7 @@ class ComposerDraftController {
   }
   /** Compatibility projection only: never evict another draft to make room. */
   private mirror(entry: Entry) {
+    if (isComposerSealed()) return;
     const state = entry.snapshot;
     if (!state.projectId || typeof localStorage === 'undefined') return;
     if (entry.migrationBlocked) throw new ComposerStorageError(entry.snapshot.persistence.reason ?? 'invalid');
@@ -251,6 +259,7 @@ class ComposerDraftController {
     }
   }
   change<K extends 'input' | 'images' | 'queue'>(route: ComposerRoute, field: K, action: SetStateAction<ComposerDraft[K]>) {
+    if (isComposerSealed()) return;
     invalidateComposerFreeze();
     this.retain();
     const entry = this.entry(route);
@@ -273,10 +282,12 @@ class ComposerDraftController {
     if (!entry.loaded) void this.load(route);
   }
   private schedule(entry: Entry) {
+    if (isComposerSealed()) return;
     if (!entry.writable || !entry.loaded || entry.loadFailed || entry.writing || !entry.snapshot.projectId) return;
     // Coalesce same-event text/files/queue mutations; never create an unbounded
     // promise backlog while typing. At most one write and one latest snapshot.
     entry.writing = Promise.resolve().then(async () => {
+      if (isComposerSealed()) return;
       let savedGeneration: number;
       do {
         this.reconcile(entry);
@@ -317,7 +328,17 @@ class ComposerDraftController {
       const { draft } = boundedComposerDraft(entry.snapshot);
       const generation = entry.generation;
       const revision = entry.revision;
-      await verifyCommittedComposerDraft(this.repository, draft, revision);
+      try { await verifyCommittedComposerDraft(this.repository, draft, revision); } catch (error) {
+        const failure = normalizeComposerStorageError(error);
+        // A successful put is not proof that every committed attachment can be
+        // read. Do not leave a failed restart verification displaying 'saved',
+        // or let a stale verifier change a newer write/lease's status.
+        if (isCurrent() && generation === entry.generation && revision === entry.revision) {
+          if (failure.reason === 'conflict') entry.loadFailed = true;
+          this.status(entry, { phase: 'error', reason: failure.reason });
+        }
+        throw failure;
+      }
       if (!isCurrent()) return [];
       if (generation !== entry.generation || revision !== entry.revision) throw new ComposerStorageError('conflict');
       receipts.push({ routeKey: composerRouteKey(draft), revision, generation,
@@ -327,6 +348,7 @@ class ComposerDraftController {
   };
   /** Explicit user retry, not a restart receipt. Rebase against the current CAS revision. */
   retry(route: ComposerRoute): Promise<boolean> {
+    if (isComposerSealed()) return Promise.resolve(false);
     invalidateComposerFreeze();
     this.retain();
     const entry = this.entry(route);
@@ -385,17 +407,19 @@ class ComposerDraftController {
  */
 export function useDurableComposerDraft(projectId: string | undefined, conversation: string | null, repository = browserComposerDraftRepository) {
   const [controller] = useState(() => new ComposerDraftController(repository));
+  const sealed = useSyncExternalStore(subscribeComposerFreeze, isComposerSealed, () => false);
   const routeProject = projectId ?? '';
   const snapshot = useSyncExternalStore(controller.subscribe,
     () => controller.entry({ projectId: routeProject, conversation }).snapshot,
     () => controller.entry({ projectId: routeProject, conversation }).snapshot);
   useEffect(() => controller.connect(), [controller]);
-  useEffect(() => { controller.activate({ projectId: routeProject, conversation }); }, [controller, conversation, routeProject]);
+  useEffect(() => { controller.activate({ projectId: routeProject, conversation }); }, [controller, conversation, routeProject, sealed]);
   const setInput = useCallback((action: SetStateAction<string>) => controller.change({ projectId: routeProject, conversation }, 'input', action), [controller, conversation, routeProject]);
   const setImages = useCallback((action: SetStateAction<File[]>) => controller.change({ projectId: routeProject, conversation }, 'images', action), [controller, conversation, routeProject]);
   const setQueue = useCallback((action: SetStateAction<DurableQueuedDraft[]>) => controller.change({ projectId: routeProject, conversation }, 'queue', action), [controller, conversation, routeProject]);
   const getQueue = useCallback((route: ComposerRoute) => controller.entry(route).snapshot.queue, [controller]);
   const updateQueue = useCallback((route: ComposerRoute, action: SetStateAction<DurableQueuedDraft[]>) => {
+    if (isComposerSealed()) return;
     invalidateComposerFreeze();
     const entry = controller.entry(route);
     if (entry.loaded) controller.change(route, 'queue', action);

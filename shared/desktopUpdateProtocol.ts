@@ -68,6 +68,10 @@ export type DesktopDraftFreezeReceipt = Readonly<{
 export type DesktopDraftOwner = {
   prepare(request: DesktopDraftFreezeRequest): Promise<DesktopDraftFreezeReceipt>;
   isCurrent(receipt: DesktopDraftFreezeReceipt): boolean;
+  /** Final synchronous input seal. The receipt must be the actual fresh object. */
+  seal(receipt: DesktopDraftFreezeReceipt): boolean;
+  /** Explicit native rollback only after a confirmed pre-commit abort. A sealed
+   * hold otherwise survives expiry, retirement and same-document replacement. */
   cancel(request: Pick<DesktopDraftFreezeRequest, 'token' | 'epoch'>): boolean;
 };
 

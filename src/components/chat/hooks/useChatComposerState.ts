@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 
 import { useAppShellStore } from '../../../stores/useAppShellStore';
 import { usePaletteOps } from '../../../stores/usePaletteOpsStore';
-import { beginComposerOperation, finishComposerOperation, invalidateComposerFreeze, isComposerFrozen, subscribeComposerFreeze } from '../../../shared/composerFreeze';
+import { beginComposerOperation, finishComposerOperation, invalidateComposerFreeze, isComposerFrozen, isComposerSealed, subscribeComposerFreeze } from '../../../shared/composerFreeze';
 import type { MarkSessionProcessing } from '../../../hooks/useSessionProtection';
 import type { ChatMessage, PendingPermissionRequest, PermissionDecision, SessionEstablishedContext  } from '../types/types';
 import type { LLMProvider, Project, ProjectSession, ProviderModelsCacheInfo } from '../../../types/app';
@@ -41,7 +41,7 @@ const syntheticSubmit = () => ({ preventDefault() {} }) as unknown as FormEvent<
 const steerKey = (sessionId: string, content: string) => JSON.stringify([sessionId, content]);
 const shorten = (text: string) => { const compact = text.replace(/\s+/g, ' ').trim(); return compact ? (compact.length > 80 ? `${compact.slice(0, 77)}...` : compact) : null; };
 const sessionLabel = (session: ProjectSession | null, input: string) => shorten(String(session?.summary || session?.name || session?.title || '')) || shorten(input);
-const resetBox = (setInput: (value: string) => void, value: MutableRefObject<string>, setImages: (files: File[]) => void, setUploads: (items: Map<string, number>) => void, setErrors: (items: Map<string, string>) => void, resetCommands: () => void, setExpanded: (open: boolean) => void, area: RefObject<HTMLTextAreaElement | null>) => { setInput(''); value.current = ''; setImages([]); setUploads(new Map()); setErrors(new Map()); resetCommands(); setExpanded(false); if (area.current) area.current.style.height = 'auto'; };
+const resetBox = (setInput: (value: string) => void, value: MutableRefObject<string>, setImages: (files: File[]) => void, setUploads: (items: Map<string, number>) => void, setErrors: (items: Map<string, string>) => void, resetCommands: () => void, setExpanded: (open: boolean) => void, area: RefObject<HTMLTextAreaElement | null>) => { if (isComposerSealed()) return; setInput(''); value.current = ''; setImages([]); setUploads(new Map()); setErrors(new Map()); resetCommands(); setExpanded(false); if (area.current) area.current.style.height = 'auto'; };
 
 export function useChatComposerState(args: UseChatComposerStateArgs) {
   const { t } = useTranslation('chat');
@@ -126,10 +126,10 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     gateChangeRef.current?.(null);
     bypassGate.current = false;
   }, [conversation, projectId]);
-  const login = useCallback((provider?: string) => { resetBox(setInput, inputRef, setAttachedImages, setUploadingImages, setImageErrors, () => undefined, setExpanded, textareaRef); eraseDraft(); onLogin?.(provider); }, [eraseDraft, onLogin, setAttachedImages, setInput]);
+  const login = useCallback((provider?: string) => { if (isComposerSealed()) return; resetBox(setInput, inputRef, setAttachedImages, setUploadingImages, setImageErrors, () => undefined, setExpanded, textareaRef); eraseDraft(); onLogin?.(provider); }, [eraseDraft, onLogin, setAttachedImages, setInput]);
   const palette = usePaletteOps();
   const showCostModal = useCallback(() => { const parts = tokenBudget?.breakdown && typeof tokenBudget.breakdown === 'object' ? tokenBudget.breakdown as Record<string, unknown> : {}; const inTokens = Number(tokenBudget?.inputTokens ?? parts.input); const outTokens = Number(tokenBudget?.outputTokens ?? parts.output); const used = Number(tokenBudget?.used); const total = Number(tokenBudget?.total); setModal({ kind: 'cost', data: { tokenUsage: { used: Number.isFinite(used) ? used : (Number.isFinite(inTokens) ? inTokens : 0) + (Number.isFinite(outTokens) ? outTokens : 0), total: Number.isFinite(total) ? total : 0 }, ...(Number.isFinite(inTokens) || Number.isFinite(outTokens) ? { tokenBreakdown: { input: Number.isFinite(inTokens) ? inTokens : 0, output: Number.isFinite(outTokens) ? outTokens : 0 } } : {}), provider: typeof tokenBudget?.provider === 'string' ? tokenBudget.provider : 'gjc', model: typeof tokenBudget?.model === 'string' ? tokenBudget.model : gjcModel } }); }, [gjcModel, tokenBudget]);
-  const applyAppCommand = useCallback((command: AppUiCommand) => runAppUiCommand(command, { openSessionPicker: palette.openSessionPicker, startNewChat: palette.startNewChat, openSettings: () => onShowSettings ? onShowSettings() : palette.openSettings(), openModelPicker: () => setModelPickerTrigger((n) => n + 1), openCostModal: showCostModal }), [onShowSettings, palette, showCostModal]);
+  const applyAppCommand = useCallback((command: AppUiCommand) => { if (isComposerSealed()) return; return runAppUiCommand(command, { openSessionPicker: palette.openSessionPicker, startNewChat: palette.startNewChat, openSettings: () => onShowSettings ? onShowSettings() : palette.openSettings(), openModelPicker: () => setModelPickerTrigger((n) => n + 1), openCostModal: showCostModal }); }, [onShowSettings, palette, showCostModal]);
 
   const { slashCommands, slashCommandsCount, filteredCommands, frequentCommands, commandQuery, showCommandMenu, selectedCommandIndex, resetCommandMenuState, handleCommandSelect, handleToggleCommandMenu, handleCommandInputChange, handleCommandMenuKeyDown } = useSlashCommands({ selectedProject, executionCwd, provider: 'gjc', sessionId: conversation, input, setInput, textareaRef, onLoginCommand: login, onAppCommand: (command) => { const app = findAppUiCommand(command.name); if (app) applyAppCommand(app); } });
   const { showFileDropdown, filteredFiles, selectedFileIndex, renderInputWithMentions, selectFile, setCursorPosition, handleFileMentionsKeyDown } = useFileMentions({ selectedProject, executionCwd, sessionId: conversation, input, setInput, textareaRef });
@@ -317,7 +317,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
 
   const resize = useCallback((target: HTMLTextAreaElement) => { target.style.height = 'auto'; const height = Math.max(22, target.scrollHeight); target.style.height = `${height}px`; if (!lineHeight.current) { const parsed = parseInt(window.getComputedStyle(target).lineHeight); lineHeight.current = Number.isFinite(parsed) ? parsed : 24; } setExpanded(height > lineHeight.current * 2); resized.current = target.value; }, []);
   useEffect(() => { if (textareaRef.current && resized.current !== input) resize(textareaRef.current); }, [input, resize]);
-  const handleImageFiles = useCallback((files: File[]) => { const accepted = files.filter((file) => { try { if (!file || typeof file !== 'object') { console.warn('Invalid file object:', file); return false; } if (!file.type?.startsWith('image/')) return false; if (!file.size || file.size > 5 * 1024 * 1024) { setImageErrors((old) => new Map(old).set(file.name || 'Unknown file', 'File too large (max 5MB)')); return false; } return true; } catch (error) { console.error('Error validating file:', error, file); return false; } }); if (accepted.length) setAttachedImages((old) => [...old, ...accepted].slice(0, 5)); }, [setAttachedImages]);
+  const handleImageFiles = useCallback((files: File[]) => { if (isComposerSealed()) return; const accepted = files.filter((file) => { try { if (!file || typeof file !== 'object') { console.warn('Invalid file object:', file); return false; } if (!file.type?.startsWith('image/')) return false; if (!file.size || file.size > 5 * 1024 * 1024) { setImageErrors((old) => new Map(old).set(file.name || 'Unknown file', 'File too large (max 5MB)')); return false; } return true; } catch (error) { console.error('Error validating file:', error, file); return false; } }); if (accepted.length) setAttachedImages((old) => [...old, ...accepted].slice(0, 5)); }, [setAttachedImages]);
   const attachmentError = (error: Error) => {
     if (queueOwner.current === composerOwner && submissionOwner.current) setImageErrors((old) => new Map(old).set('attachment', error.message));
   };
@@ -327,6 +327,7 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     handleImageFiles(accepted);
   };
   const getFilesFromEvent = async (event: DropEvent) => {
+    if (isComposerSealed()) return [];
     if (!Array.isArray(event) && event.type !== 'drop' && event.type !== 'change') return composerFilesFromEvent(event);
     // Dropped/pasted input revokes a freeze rather than discarding the Files.
     invalidateComposerFreeze();
@@ -340,12 +341,13 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
   };
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'] }, maxSize: 5 * 1024 * 1024, maxFiles: 5, getFilesFromEvent, onError: attachmentError, noClick: true, noKeyboard: true });
   const open = () => chooseComposerAttachments(acceptSelectedImages, attachmentError);
-  const handleInputChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => { const value = event.target.value; const position = event.target.selectionStart; setInput(value); inputRef.current = value; setCursorPosition(position); if (!value.trim()) { event.target.style.height = 'auto'; setExpanded(false); resetCommandMenuState(); } else handleCommandInputChange(value, position); }, [handleCommandInputChange, resetCommandMenuState, setCursorPosition, setInput]);
-  const handlePaste = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => { const items = Array.from(event.clipboardData.items); items.forEach((item) => { if (item.type.startsWith('image/')) { const file = item.getAsFile(); if (file) handleImageFiles([file]); } }); if (!items.length && event.clipboardData.files.length) handleImageFiles(Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/'))); }, [handleImageFiles]);
+  const handleInputChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => { if (isComposerSealed()) { event.preventDefault?.(); event.target.value = inputRef.current; return; } const value = event.target.value; const position = event.target.selectionStart; setInput(value); inputRef.current = value; setCursorPosition(position); if (!value.trim()) { event.target.style.height = 'auto'; setExpanded(false); resetCommandMenuState(); } else handleCommandInputChange(value, position); }, [handleCommandInputChange, resetCommandMenuState, setCursorPosition, setInput]);
+  const handlePaste = useCallback((event: ClipboardEvent<HTMLTextAreaElement>) => { if (isComposerSealed()) { event.preventDefault?.(); return; } const items = Array.from(event.clipboardData.items); items.forEach((item) => { if (item.type.startsWith('image/')) { const file = item.getAsFile(); if (file) handleImageFiles([file]); } }); if (!items.length && event.clipboardData.files.length) handleImageFiles(Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/'))); }, [handleImageFiles]);
   const syncInputOverlayScroll = useCallback((target: HTMLTextAreaElement) => { if (inputHighlightRef.current) { inputHighlightRef.current.scrollTop = target.scrollTop; inputHighlightRef.current.scrollLeft = target.scrollLeft; } }, []);
-  const handleTextareaInput = useCallback((event: FormEvent<HTMLTextAreaElement>) => { resize(event.currentTarget); setCursorPosition(event.currentTarget.selectionStart); syncInputOverlayScroll(event.currentTarget); }, [resize, setCursorPosition, syncInputOverlayScroll]);
-  const handleKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => { if (handleCommandMenuKeyDown(event) || handleFileMentionsKeyDown(event) || event.key !== 'Enter' || event.nativeEvent.isComposing) return; if ((event.ctrlKey || event.metaKey) && !event.shiftKey || (!event.shiftKey && !event.ctrlKey && !event.metaKey && !sendByCtrlEnter)) { event.preventDefault(); void handleSubmit(event); } }, [handleCommandMenuKeyDown, handleFileMentionsKeyDown, handleSubmit, sendByCtrlEnter]);
+  const handleTextareaInput = useCallback((event: FormEvent<HTMLTextAreaElement>) => { if (isComposerSealed()) { event.preventDefault?.(); event.currentTarget.value = inputRef.current; return; } resize(event.currentTarget); setCursorPosition(event.currentTarget.selectionStart); syncInputOverlayScroll(event.currentTarget); }, [resize, setCursorPosition, syncInputOverlayScroll]);
+  const handleKeyDown = useCallback((event: KeyboardEvent<HTMLTextAreaElement>) => { if (isComposerSealed()) { event.preventDefault(); return; } if (handleCommandMenuKeyDown(event) || handleFileMentionsKeyDown(event) || event.key !== 'Enter' || event.nativeEvent.isComposing) return; if ((event.ctrlKey || event.metaKey) && !event.shiftKey || (!event.shiftKey && !event.ctrlKey && !event.metaKey && !sendByCtrlEnter)) { event.preventDefault(); void handleSubmit(event); } }, [handleCommandMenuKeyDown, handleFileMentionsKeyDown, handleSubmit, sendByCtrlEnter]);
   const handleVoiceTranscript = useCallback((text: string, send?: boolean) => {
+    if (isComposerSealed()) return;
     const isCurrent = queueOwner.current === composerOwner && submissionOwner.current !== null;
     const shouldSend = send && isCurrent && !isComposerFrozen();
     setInput((previous) => {
@@ -356,27 +358,27 @@ export function useChatComposerState(args: UseChatComposerStateArgs) {
     if (shouldSend) void submitRef.current?.(syntheticSubmit());
   }, [composerOwner, setInput]);
   const editQueuedDraft = useCallback((index: number) => {
-    if (!draftReady) return;
+    if (!draftReady || isComposerSealed()) return;
     const item = queuedDrafts[index];
     if (!item) return;
     // Keep an unrelated active draft instead of replacing it during queue edit.
     setQueuedDrafts((q) => [...q.filter((_, position) => position !== index), ...(inputRef.current || attachedImages.length ? [{ id: newQueuedDraftId(), content: inputRef.current, images: attachedImages, requiresReview: true }] : [])]);
     setInput(item.content); inputRef.current = item.content; setAttachedImages(item.images); textareaRef.current?.focus();
   }, [attachedImages, draftReady, queuedDrafts, setAttachedImages, setInput, setQueuedDrafts]);
-  const deleteQueuedDraft = useCallback((index: number) => { if (draftReady) setQueuedDrafts((q) => q.filter((_, position) => position !== index)); }, [draftReady, setQueuedDrafts]);
-  const moveQueuedDraft = useCallback((from: number, to: number) => { if (draftReady) setQueuedDrafts((q) => reorderQueue(q, from, to)); }, [draftReady, setQueuedDrafts]);
+  const deleteQueuedDraft = useCallback((index: number) => { if (draftReady && !isComposerSealed()) setQueuedDrafts((q) => q.filter((_, position) => position !== index)); }, [draftReady, setQueuedDrafts]);
+  const moveQueuedDraft = useCallback((from: number, to: number) => { if (draftReady && !isComposerSealed()) setQueuedDrafts((q) => reorderQueue(q, from, to)); }, [draftReady, setQueuedDrafts]);
   const confirmCommandGate = useCallback(() => { const gate = gateRef.current; if (!gate || isComposerFrozen() || inputRef.current.trimEnd() !== gate.text) return; announceGate(null); bypassGate.current = true;
     // A confirmed handoff moves the runtime to a fresh session; the next
     // session_upserted for a new id in this project is it, and the app should
     // follow instead of staying on the old session (issue #6).
     if (/^\/handoff\b/.test(gate.text.trim())) useAppShellStore.getState().setPendingHandoff({ fromSessionId: conversation, projectId, at: Date.now() });
     setInput(gate.text); inputRef.current = gate.text; void handleSubmit(syntheticSubmit()); }, [announceGate, conversation, handleSubmit, projectId, setInput]);
-  const cancelCommandGate = useCallback(() => { announceGate(null); bypassGate.current = false; }, [announceGate]);
+  const cancelCommandGate = useCallback(() => { if (isComposerSealed()) return; announceGate(null); bypassGate.current = false; }, [announceGate]);
   const handleClearInput = useCallback(() => { clearComposer(); textareaRef.current?.focus(); }, [clearComposer]);
   // The Changes tab's line comments arrive here: one new paragraph with the
   // reference and the quote, focus moved to the composer, ready to send.
-  const insertAtEnd = useCallback((text: string) => { if (!text.trim()) return; const next = inputRef.current.trim() ? `${inputRef.current.trimEnd()}\n\n${text}` : text; setInput(next); inputRef.current = next; textareaRef.current?.focus(); }, [setInput]);
-  const handleAbortSession = useCallback(() => { if (!canAbortSession) return; const id = selectedSession?.id || currentSessionId; if (!id) { console.warn('Abort requested but no session ID is available.'); return; } sendMessage({ type: 'chat.abort', sessionId: id }); }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
+  const insertAtEnd = useCallback((text: string) => { if (isComposerSealed() || !text.trim()) return; const next = inputRef.current.trim() ? `${inputRef.current.trimEnd()}\n\n${text}` : text; setInput(next); inputRef.current = next; textareaRef.current?.focus(); }, [setInput]);
+  const handleAbortSession = useCallback(() => { if (isComposerSealed() || !canAbortSession) return; const id = selectedSession?.id || currentSessionId; if (!id) { console.warn('Abort requested but no session ID is available.'); return; } sendMessage({ type: 'chat.abort', sessionId: id }); }, [canAbortSession, currentSessionId, selectedSession?.id, sendMessage]);
   const handlePermissionDecision = useCallback((requestIds: string | string[], decision: PermissionDecision) => {
     const finishOperation = beginComposerOperation('send');
     if (!finishOperation) return;

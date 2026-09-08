@@ -232,9 +232,10 @@ export class DesktopRestartAuthority {
     return { state: this.attempt?.phase ?? 'open', revision: this.revision, ingress: this.ingress, complete, idle: complete && blockers.length === 0, owners, blockers };
   }
 
-  prepare(input: { attemptId: string; epoch: string }): Promise<DesktopRestartPrepareResult> {
+  prepare(input: { attemptId: string; epoch: string; budgetMs?: number }): Promise<DesktopRestartPrepareResult> {
     this.expire();
     if (!input || !identifier(input.attemptId) || !identifier(input.epoch)) return Promise.resolve(failure('invalid_attempt'));
+    if (input.budgetMs !== undefined && (!Number.isSafeInteger(input.budgetMs) || input.budgetMs < 1 || input.budgetMs > this.readTimeoutMs)) return Promise.resolve(failure('invalid_attempt'));
     if (this.lostEpochs.has(input.epoch)) return Promise.resolve(failure('stale_epoch'));
     const current = this.attempt;
     if (current?.phase === 'committed') return Promise.resolve(failure('committed'));
@@ -244,7 +245,8 @@ export class DesktopRestartAuthority {
     if (this.ingress > 0) return Promise.resolve(failure('busy', [{ kind: 'busy', code: 'ingress_busy' }]));
     let resolvePrepare!: Attempt['resolvePrepare'];
     const prepared = new Promise<DesktopRestartPrepareResult>((resolve) => { resolvePrepare = resolve; });
-    const attempt: Attempt = { ...input, sequence: ++this.sequence, prepareDeadline: this.now() + this.readTimeoutMs, phase: 'preparing', prepared, resolvePrepare };
+    const attempt: Attempt = { attemptId: input.attemptId, epoch: input.epoch, sequence: ++this.sequence,
+      prepareDeadline: this.now() + (input.budgetMs ?? this.readTimeoutMs), phase: 'preparing', prepared, resolvePrepare };
     this.attempt = attempt; // synchronous fence BEFORE any reader or await
     this.revision += 1;
     void this.prepareInner(attempt).then(resolvePrepare, () => {

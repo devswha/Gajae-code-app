@@ -29,6 +29,15 @@ pub struct Preferences {
     pub automatic: bool,
 }
 
+/// Durable user intent only. It never proves owner absence or authorizes an
+/// installer; the next launch must independently reverify every native gate.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManualIntent {
+    schema: u8,
+    archive_sha256: String,
+}
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -208,7 +217,7 @@ impl Store {
         self.atomic_json("preferences.json", &value, MAX_PREFERENCES_BYTES)
     }
 
-    pub fn load(&self) -> Result<Option<(PreparedRecord, Vec<u8>)>, String> {
+    fn selected_record(&self) -> Result<Option<(Pointer, PreparedRecord)>, String> {
         let Some(pointer) = self.pointer()? else {
             return Ok(None);
         };
@@ -218,6 +227,58 @@ impl Store {
         let record: PreparedRecord =
             serde_json::from_slice(&record).map_err(|_| "Invalid prepared update metadata.")?;
         record.validate()?;
+        Ok(Some((pointer, record)))
+    }
+
+    pub(crate) fn prepared_record(&self) -> Result<Option<PreparedRecord>, String> {
+        Ok(self.selected_record()?.map(|(_, record)| record))
+    }
+
+    pub(crate) fn request_manual(&self, archive_sha256: &str) -> Result<(), String> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "Update cache lock failed.")?;
+        if self
+            .prepared_record()?
+            .as_ref()
+            .map(|record| record.archive_sha256.as_str())
+            != Some(archive_sha256)
+        {
+            return Err("Prepared update changed before recording manual intent.".into());
+        }
+        self.atomic_json(
+            "manual-intent.json",
+            &ManualIntent {
+                schema: 1,
+                archive_sha256: archive_sha256.to_owned(),
+            },
+            MAX_PREFERENCES_BYTES,
+        )
+    }
+
+    pub(crate) fn manual_requested(&self, archive_sha256: &str) -> Result<bool, String> {
+        let Some(bytes) = self.read("manual-intent.json", MAX_PREFERENCES_BYTES)? else {
+            return Ok(false);
+        };
+        let intent: ManualIntent =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid manual update intent.")?;
+        if intent.schema != 1
+            || intent.archive_sha256.len() != 64
+            || !intent
+                .archive_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("Invalid manual update intent.".into());
+        }
+        Ok(intent.archive_sha256 == archive_sha256)
+    }
+
+    pub fn load(&self) -> Result<Option<(PreparedRecord, Vec<u8>)>, String> {
+        let Some((pointer, record)) = self.selected_record()? else {
+            return Ok(None);
+        };
         let archive = self
             .read(&format!("archive-{}", pointer.id), MAX_ARCHIVE_BYTES)?
             .ok_or("Prepared update archive is missing.")?;
@@ -705,6 +766,25 @@ mod tests {
             manifest: "{}".into(),
             inventory: serde_json::json!({"entries":[]}),
         }
+    }
+
+    #[test]
+    fn manual_intent_is_target_specific_without_changing_automatic_consent() {
+        let root = Temp::new();
+        let store = Store::open(&root.0).unwrap();
+        let first = record();
+        store.commit(store.stage(&first, b"data").unwrap()).unwrap();
+        store.set_automatic(false).unwrap();
+        assert!(!store.manual_requested(&first.archive_sha256).unwrap());
+        store.request_manual(&first.archive_sha256).unwrap();
+        assert!(store.manual_requested(&first.archive_sha256).unwrap());
+        assert!(!store.preferences().unwrap().automatic);
+        assert!(store.request_manual(&"b".repeat(64)).is_err());
+        let mut next = record();
+        next.archive_sha256 = "b".repeat(64);
+        store.commit(store.stage(&next, b"next").unwrap()).unwrap();
+        assert!(!store.manual_requested(&next.archive_sha256).unwrap());
+        assert!(!store.preferences().unwrap().automatic);
     }
 
     #[test]
