@@ -5,6 +5,8 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isBrowserSessionState } from '../../../shared/browserSessionState.js';
+
 import {
   BROWSER_PROTOCOL_VERSION,
   BrowserNdjsonDecoder,
@@ -86,6 +88,14 @@ export class BrowserSidecarClient {
 
   state(sessionId: string, signal?: AbortSignal): Promise<unknown> {
     return this.request('session.state', sessionId, {}, 10_000, signal);
+  }
+
+  /** Reads the recovery snapshot without starting a sidecar or creating a session. */
+  cachedState(sessionId: string): BrowserSessionState {
+    const state = this.sessions.get(sessionId)?.state;
+    return state
+      ? { sessionId: state.sessionId, activeTabId: state.activeTabId, tabs: state.tabs.map((tab) => ({ ...tab })) }
+      : { sessionId, activeTabId: null, tabs: [] };
   }
 
   close(sessionId: string, signal?: AbortSignal): Promise<unknown> {
@@ -319,22 +329,8 @@ export class BrowserSidecarClient {
   }
 
   private browserState(value: unknown, sessionId: string): BrowserSessionState | null {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-    const record = value as Record<string, unknown>;
-    if (record.sessionId !== sessionId || !Array.isArray(record.tabs)) return null;
-    const tabs = record.tabs.filter((tab): tab is BrowserSessionState['tabs'][number] => {
-      if (!tab || typeof tab !== 'object' || Array.isArray(tab)) return false;
-      const candidate = tab as Record<string, unknown>;
-      return typeof candidate.id === 'string'
-        && typeof candidate.title === 'string'
-        && typeof candidate.url === 'string'
-        && typeof candidate.loading === 'boolean'
-        && typeof candidate.canGoBack === 'boolean'
-        && typeof candidate.canGoForward === 'boolean';
-    });
-    if (tabs.length !== record.tabs.length) return null;
-    const activeTabId = typeof record.activeTabId === 'string' ? record.activeTabId : null;
-    return { sessionId, activeTabId, tabs: tabs.map((tab) => ({ ...tab })) };
+    if (!isBrowserSessionState(value, sessionId)) return null;
+    return { sessionId, activeTabId: value.activeTabId, tabs: value.tabs.map((tab) => ({ ...tab })) };
   }
 
   private emit(event: BrowserEventFrame): void {

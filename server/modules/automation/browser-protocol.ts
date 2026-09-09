@@ -1,3 +1,5 @@
+export type { BrowserTabState, BrowserSessionState } from '../../../shared/browserSessionState.js';
+
 export const BROWSER_PROTOCOL_VERSION = 1 as const;
 
 export type BrowserCommand =
@@ -28,21 +30,6 @@ export type BrowserInput =
   | { kind: 'key'; event: 'down' | 'up'; key: string; code?: string; modifiers?: number }
   | { kind: 'text'; text: string }
   | { kind: 'viewport'; width: number; height: number };
-
-export type BrowserTabState = {
-  id: string;
-  title: string;
-  url: string;
-  loading: boolean;
-  canGoBack: boolean;
-  canGoForward: boolean;
-};
-
-export type BrowserSessionState = {
-  sessionId: string;
-  activeTabId: string | null;
-  tabs: BrowserTabState[];
-};
 
 export type BrowserRequestMethod =
   | 'initialize'
