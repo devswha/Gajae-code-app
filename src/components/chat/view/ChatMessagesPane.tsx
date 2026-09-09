@@ -165,8 +165,8 @@ function ChatMessagesPane({
               />
             ) : (
               <>
-                {!hasMoreMessages && chatMessages.length > visibleMessageCount ? (
-                  <div className="border-b border-border py-2 text-center text-sm text-muted-foreground">
+                {(hasMoreMessages || chatMessages.length > visibleMessageCount) && !isLoadingAllMessages && !historyLoadError ? (
+                  <div data-history-controls className="border-b border-border py-2 text-center text-sm text-muted-foreground">
                     <button className="text-primary underline hover:text-primary" onClick={loadEarlierMessages}>
                       {t('session.messages.loadEarlier')}
                     </button>

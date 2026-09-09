@@ -273,7 +273,10 @@ export function useChatSessionState({
     try {
       const page = await sessionStore.fetchMore(requestId, { limit: PAGE_SIZE, includeImages: showImagePreviews });
       if (requestViewRef.current !== requestView) return false;
-      if (!page || (page.addedCount === 0 && page.hasMore)) {
+      // A superseded or no-op page is not a failure; a reconcile after a live
+      // turn may discard an in-flight page and the next scroll asks again.
+      if (!page) return false;
+      if (page.failed || (page.addedCount === 0 && page.hasMore)) {
         // Never spin at one offset or pretend unreachable history is complete.
         historyLoadErrorRef.current = true;
         setHistoryLoadError(true);
@@ -555,8 +558,12 @@ export function useChatSessionState({
       const window = await sessionStore.fetchFromServer(requestId, { limit: null, offset: 0, includeImages: showImagePreviews });
       if (requestViewRef.current !== requestView) return;
       if (!window) {
+        // Too large to serve at once, or otherwise refused: say so and offer
+        // the paged path instead of quietly dropping the request.
         loadedAllRef.current = false;
         setShowLoadAllOverlay(false);
+        historyLoadErrorRef.current = true;
+        setHistoryLoadError(true);
         return;
       }
       setHasMoreMessages(false);
@@ -576,6 +583,8 @@ export function useChatSessionState({
       console.error('Error loading all messages:', error);
       loadedAllRef.current = false;
       setShowLoadAllOverlay(false);
+      historyLoadErrorRef.current = true;
+      setHistoryLoadError(true);
     } finally {
       if (requestViewRef.current === requestView) {
         loadingMoreRef.current = false;
@@ -583,7 +592,15 @@ export function useChatSessionState({
       }
     }
   }, [isLoadingAllMessages, selectedProject, selectedSession, sessionStore, setFollowing, showImagePreviews]);
-  const loadEarlierMessages = useCallback(() => setVisibleMessageCount(count => count + 100), []);
+  // Reveals rows already loaded first; once the loaded window is fully shown,
+  // the same control pages further back so every history state has a click path.
+  const loadEarlierMessages = useCallback(() => {
+    if (visibleMessageCount < chatMessages.length) {
+      setVisibleMessageCount(count => count + 100);
+      return;
+    }
+    void loadOlderMessages();
+  }, [chatMessages.length, loadOlderMessages, visibleMessageCount]);
 
   return {
     chatMessages,

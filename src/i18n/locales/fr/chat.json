@@ -133,10 +133,6 @@
       "sessionMessages": "Récupération des messages de conversation…"
     },
     "messages": {
-      "showingOf": "Affichage des messages {{shown}} sur {{total}}",
-      "loadedCount": "Messages chargés : {{shown}}",
-      "scrollToLoad": "Faites défiler vers le haut pour en savoir plus",
-      "showingLast": "Affichage des derniers messages {{count}} de {{total}}",
       "loadEarlier": "Recevez des messages plus tôt",
       "loadAll": "Recevez tous les messages",
       "loadFullToolOutput": "Obtenez une sortie complète",

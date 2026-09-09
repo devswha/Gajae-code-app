@@ -224,7 +224,7 @@ test('fetchMore serializes a captured offset and deduplicates only matching mess
       hasMore: false,
     }));
     const [accepted, duplicate] = await Promise.all([firstPage, duplicatePage]);
-    assert.deepEqual(accepted, { addedCount: 1, hasMore: false, total: 4 });
+    assert.deepEqual(accepted, { failed: false, addedCount: 1, hasMore: false, total: 4 });
     assert.equal(duplicate, null);
 
     const slot = store.getSessionSlot('session')!;
@@ -247,7 +247,7 @@ test('failed, empty and superseded older pages never report an insertion', async
     await initial;
     const failed = store.fetchMore('session');
     pending.shift()!.resolve(new Response('', { status: 500 }));
-    assert.equal(await failed, null);
+    assert.deepEqual(await failed, { failed: true }, 'a failed request is distinguishable from a superseded one');
     assert.equal(store.getSessionSlot('session')!.offset, 1);
 
     const obsolete = store.fetchMore('session');
@@ -260,7 +260,7 @@ test('failed, empty and superseded older pages never report an insertion', async
 
     const empty = store.fetchMore('session');
     pending.shift()!.resolve(response({ messages: [], total: 1, hasMore: false }));
-    assert.deepEqual(await empty, { addedCount: 0, hasMore: false, total: 1 });
+    assert.deepEqual(await empty, { failed: false, addedCount: 0, hasMore: false, total: 1 });
     assert.deepEqual(store.getMessages('session').map(row => row.id), ['saved']);
   } finally {
     globalThis.fetch = originalFetch;

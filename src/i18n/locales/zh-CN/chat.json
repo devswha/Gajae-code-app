@@ -133,10 +133,6 @@
       "sessionMessages": "正在检索对话消息……"
     },
     "messages": {
-      "showingOf": "正在显示 {{shown}} / {{total}} 条消息",
-      "loadedCount": "已加载消息：{{shown}} 条",
-      "scrollToLoad": "向上滚动以查看更多",
-      "showingLast": "正在显示最新的{{count}}条消息，共{{total}}条",
       "loadEarlier": "获取更早的消息",
       "loadAll": "获取所有消息",
       "loadFullToolOutput": "获取完整输出",

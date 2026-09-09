@@ -64,7 +64,6 @@
     "stopSpeaking": "Fermati",
     "loading": "Caricamento…"
   },
-
   "input": {
     "placeholder": "Chiedi {{provider}}, usa / per i comandi o @ per aggiungere file...",
     "modelReasoning": {
@@ -134,10 +133,6 @@
       "sessionMessages": "Recupero dei messaggi di conversazione…"
     },
     "messages": {
-      "showingOf": "Visualizzazione di {{shown}} di messaggi {{total}}",
-      "loadedCount": "Messaggi caricati: {{shown}}",
-      "scrollToLoad": "Scorri verso l'alto per ulteriori informazioni",
-      "showingLast": "Visualizzazione degli ultimi messaggi {{count}} di {{total}}",
       "loadEarlier": "Ricevi messaggi precedenti",
       "loadAll": "Ricevi tutti i messaggi",
       "loadFullToolOutput": "Ottieni l'output completo",

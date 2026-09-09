@@ -12,6 +12,7 @@ const PROVIDER = 'gjc';
 const MAX_JSONL_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_BUFFERED_HISTORY_RECORDS = 5_000;
 const MAX_BUFFERED_HISTORY_BYTES = 64 * 1024 * 1024;
+const HISTORY_READ_ATTEMPTS = 3;
 type HistoryRow = { ordinal: number; time: number; kind: NormalizedMessage['kind']; toolId?: string };
 
 /**
@@ -413,9 +414,27 @@ export class GjcSessionsProvider implements IProviderSessions {
     const normalizedOffset = Math.max(0, offset);
     const normalizedLimit = limit === null ? null : Math.max(0, limit);
     const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
-    if (!sessionFilePath) {
-      return { messages: [], total: 0, hasMore: false, offset: normalizedOffset, limit: normalizedLimit };
+    const empty = { messages: [], total: 0, hasMore: false, offset: normalizedOffset, limit: normalizedLimit };
+    if (!sessionFilePath) return empty;
+    // A live writer appends between the index and payload passes often enough
+    // that one changed revision is routine, not a client-visible failure.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.readHistoryPage(sessionFilePath, sessionId, normalizedLimit, normalizedOffset);
+      } catch (error) {
+        if (error instanceof AppError && error.code === 'HISTORY_CHANGED' && attempt < HISTORY_READ_ATTEMPTS) continue;
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return empty;
+        throw error;
+      }
     }
+  }
+
+  private async readHistoryPage(
+    sessionFilePath: string,
+    sessionId: string,
+    normalizedLimit: number | null,
+    normalizedOffset: number,
+  ): Promise<FetchHistoryResult> {
     const revision = await fsSync.promises.stat(sessionFilePath);
     const turns = assignTranscriptTurns(await readTranscriptLineage(sessionFilePath));
     // Index only small descriptors. Tool-result rows must not consume visible

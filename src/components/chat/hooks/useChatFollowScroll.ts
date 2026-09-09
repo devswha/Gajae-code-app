@@ -51,7 +51,9 @@ export function useChatFollowScroll({ scrollContainerRef, enabled }: UseChatFoll
       if (touchStartY !== null && touchY !== undefined && touchY > touchStartY) stopFollowing();
     };
     const onPointerDown = (event: PointerEvent) => {
-      if (event.target === node) stopFollowing();
+      // Only a grab of the vertical scrollbar track (past the client box) is a
+      // scroll intent; the pane's own gutter and padding also report the node.
+      if (event.target === node && event.offsetX >= node.clientWidth) stopFollowing();
     };
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target;

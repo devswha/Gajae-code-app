@@ -28,6 +28,7 @@ export interface SessionSlot {
   total: number; hasMore: boolean; offset: number; tokenUsage: unknown;
 }
 export type MessagesWindow = { messages: NormalizedMessage[]; total: number; hasMore: boolean; offset: number; tokenUsage?: unknown };
+export type FetchMoreResult = { failed: false; addedCount: number; hasMore: boolean; total: number } | { failed: true } | null;
 export type JobProjectionSlot = { snapshot: JobSnapshot | null; lastAppliedSequence: number; eventsBySequence: Map<number, JobProjectionEvent>; orderedTail: JobProjectionEvent[]; status: 'idle' | 'subscribed' | 'error'; error: JobProjectionErrorCode | 'protocol_violation' | null };
 
 const EMPTY: NormalizedMessage[] = [];
@@ -344,7 +345,9 @@ export function useSessionStore() {
     } finally { slot._pendingRequests -= 1; if (slot._loadingTicket === ticket) slot._loadingTicket = null; evict(); }
   }, [begin, emitSession, evict, queryClient]);
 
-  const fetchMore = useCallback(async (id: string, options: { limit?: number; includeImages?: boolean } = {}) => {
+  // `null` means nothing happened (no older rows, a page already in flight, or
+  // a newer fetch superseded this one); only a failed request reports `failed`.
+  const fetchMore = useCallback(async (id: string, options: { limit?: number; includeImages?: boolean } = {}): Promise<FetchMoreResult> => {
     const slot = slots.current.get(id) ?? newSlot(id, queryClient); if (typeof options.includeImages === 'boolean') slot._includeImages = options.includeImages;
     if (!slot.hasMore || slot._fetchMoreTicket !== null) { remember(id, slot); return null; }
     const offset = slot.offset; const ticket = ++slot._fetchSeq; slot._fetchMoreTicket = ticket; slot._pendingRequests += 1; remember(id, slot); if (slot.status === 'loading') slot._loadingTicket = ticket;
@@ -359,9 +362,9 @@ export function useSessionStore() {
       if (slot.status === 'loading' && slot._loadingTicket === ticket) slot.status = 'idle';
       refreshMerged(slot);
       emitSession(id);
-      return { addedCount: messages.length - beforeCount, hasMore: slot.hasMore, total: slot.total };
+      return { failed: false, addedCount: messages.length - beforeCount, hasMore: slot.hasMore, total: slot.total };
     } catch (error) {
-      console.error(`[SessionStore] fetchMore failed for ${id}:`, error); if (ticket === slot._fetchSeq && slot.status === 'loading' && slot._loadingTicket === ticket) { slot.status = 'idle'; emitSession(id); } return null;
+      console.error(`[SessionStore] fetchMore failed for ${id}:`, error); if (ticket === slot._fetchSeq && slot.status === 'loading' && slot._loadingTicket === ticket) { slot.status = 'idle'; emitSession(id); } return { failed: true };
     } finally { slot._pendingRequests -= 1; if (slot._fetchMoreTicket === ticket) slot._fetchMoreTicket = null; if (slot._loadingTicket === ticket) slot._loadingTicket = null; evict(); }
   }, [emitSession, evict, queryClient, remember]);
 

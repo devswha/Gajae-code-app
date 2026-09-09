@@ -44,6 +44,40 @@ export function prepareHistoryMessagesForTransport(messages: NormalizedMessage[]
   return prepareMessagesForTransport(messages, includeImages);
 }
 
+export const COMPLETE_HISTORY_PAGE_SIZE = 500;
+
+/**
+ * Walks a transcript newest-first in bounded pages. Unbounded provider reads
+ * are rejected past the page cap, so in-server consumers that need the whole
+ * conversation, or one row somewhere in it, page instead. A tail that grows
+ * between pages only shifts later offsets forward; the rows it re-serves are
+ * already known and skipped, so nothing is dropped.
+ *
+ * `until` stops the walk early once the newest pages already satisfy the caller.
+ */
+export async function fetchCompleteHistory(
+  sessionId: string,
+  options: Omit<FetchHistoryOptions, 'limit' | 'offset'> & { providerSessionId: string; provider: LLMProvider },
+  until?: (page: NormalizedMessage[]) => boolean,
+): Promise<FetchHistoryResult> {
+  const { provider: providerName, ...providerOptions } = options;
+  const provider = providerRegistry.resolveProvider(providerName);
+  const messages: NormalizedMessage[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  let last: FetchHistoryResult | null = null;
+  for (;;) {
+    const page = await provider.sessions.fetchHistory(sessionId, { ...providerOptions, limit: COMPLETE_HISTORY_PAGE_SIZE, offset });
+    last = page;
+    const fresh = page.messages.filter((message) => !seen.has(message.id));
+    for (const message of fresh) seen.add(message.id);
+    messages.unshift(...fresh);
+    if (!page.hasMore || page.messages.length === 0 || until?.(fresh)) break;
+    offset += page.messages.length;
+  }
+  return { ...last, messages, total: last.total, hasMore: false, offset: 0, limit: null };
+}
+
 export const sessionsService = {
   listProviderIds(): LLMProvider[] {
     return providerRegistry.listProviders().map(({ id }) => id);
@@ -84,14 +118,15 @@ export const sessionsService = {
   async fetchToolResult(sessionId: string, toolId: string): Promise<{ toolId: string; toolResult: NonNullable<NormalizedMessage['toolResult']>; toolDetailsOmitted?: boolean }> {
     const row = sessionsDb.getSessionById(sessionId);
     if (!row?.provider_session_id) throw sessionNotFound(sessionId);
-    const history = await providerRegistry.resolveProvider(row.provider as LLMProvider).sessions.fetchHistory(sessionId, {
-      limit: null,
-      offset: 0,
+    const embeddedResult = (message: NormalizedMessage) => (message.kind === 'tool_use' && message.toolId === toolId ? message.toolResult : undefined);
+    const independentResult = (message: NormalizedMessage) => (message.kind === 'tool_result' && message.toolId === toolId ? message : undefined);
+    const history = await fetchCompleteHistory(sessionId, {
+      provider: row.provider as LLMProvider,
       projectPath: sessionTranscriptWorkspace(sessionId, row.project_path ?? ''),
       providerSessionId: row.provider_session_id,
-    });
-    const embedded = history.messages.find((message) => message.kind === 'tool_use' && message.toolId === toolId && message.toolResult)?.toolResult;
-    const independent = history.messages.find((message) => message.kind === 'tool_result' && message.toolId === toolId);
+    }, (page) => page.some((message) => embeddedResult(message) || independentResult(message)));
+    const embedded = history.messages.map(embeddedResult).find(Boolean);
+    const independent = history.messages.map(independentResult).find(Boolean);
     const result = embedded ?? (independent ? {
       content: independent.content,
       isError: independent.isError,

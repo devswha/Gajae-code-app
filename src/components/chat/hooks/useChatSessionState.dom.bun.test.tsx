@@ -5,7 +5,7 @@ import { act, cleanup, render, renderHook } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 
-import { useSessionStore, type NormalizedMessage, type SessionSlot, type SessionStore } from '../../../stores/useSessionStore';
+import { useSessionStore, type FetchMoreResult, type NormalizedMessage, type SessionSlot, type SessionStore } from '../../../stores/useSessionStore';
 import type { Project, ProjectSession } from '../../../types/app';
 
 import { useChatSessionState } from './useChatSessionState';
@@ -169,7 +169,7 @@ async function setup() {
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as typeof fetch;
   let rows = [message('first', 20), message('latest', 30)];
   let pageRequests = 0;
-  let pageResolve: ((value: { addedCount: number; hasMore: boolean; total: number }) => void) | undefined;
+  let pageResolve: ((value: FetchMoreResult) => void) | undefined;
   let allResolve: ((value: unknown) => void) | undefined;
   let state: ReturnType<typeof useChatSessionState> | undefined;
   const store = {
@@ -212,23 +212,29 @@ async function setup() {
       await act(async () => {
         const addedCount = next.length - rows.length;
         rows = next;
-        pageResolve!({ addedCount, hasMore, total: next.length });
+        pageResolve!({ failed: false, addedCount, hasMore, total: next.length });
         await request!;
       });
+    },
+    async pageOutcome(outcome: { failed: true } | null) {
+      let request: Promise<void>;
+      act(() => { request = state!.handleScroll(); });
+      assert.ok(pageResolve);
+      await act(async () => { pageResolve!(outcome); await request!; });
     },
     async retry(next: NormalizedMessage[]) {
       act(() => state!.retryOlderMessages());
       const addedCount = next.length - rows.length;
       rows = next;
-      await act(async () => { pageResolve!({ addedCount, hasMore: false, total: next.length }); });
+      await act(async () => { pageResolve!({ failed: false, addedCount, hasMore: false, total: next.length }); });
     },
-    async all(next: NormalizedMessage[]) {
+    async all(next: NormalizedMessage[] | null) {
       let request: Promise<void>;
       act(() => { request = state!.loadAllMessages(); });
       assert.ok(allResolve);
       await act(async () => {
-        rows = next;
-        allResolve!({ serverMessages: rows, hasMore: false, total: rows.length });
+        if (next) rows = next;
+        allResolve!(next ? { serverMessages: rows, hasMore: false, total: rows.length } : null);
         await request!;
       });
     },
@@ -256,6 +262,47 @@ test('an empty page claiming more history stops automatic retries without hiding
     assert.equal(harness.pageRequests(), 2);
     assert.equal(harness.state().historyLoadError, false);
     assert.equal(harness.state().allMessagesLoaded, true);
+  } finally { harness.close(); }
+});
+
+test('a superseded page stays quiet while a failed request raises the retry banner', async () => {
+  const harness = await setup();
+  try {
+    // A reconcile after a live turn discards the in-flight page: not an error.
+    await harness.pageOutcome(null);
+    assert.equal(harness.state().historyLoadError, false);
+    assert.equal(harness.state().hasMoreMessages, true);
+    await harness.pageOutcome({ failed: true });
+    assert.equal(harness.state().historyLoadError, true);
+    assert.equal(harness.pageRequests(), 2);
+    await act(async () => { await harness.state().handleScroll(); });
+    assert.equal(harness.pageRequests(), 2, 'a failed page is not retried automatically');
+    await harness.retry([message('recovered', 0), ...harness.rows()]);
+    assert.equal(harness.state().historyLoadError, false);
+  } finally { harness.close(); }
+});
+
+test('a refused load-all surfaces the retry banner and the paged path still works', async () => {
+  const harness = await setup();
+  try {
+    await harness.all(null);
+    assert.equal(harness.state().historyLoadError, true);
+    assert.equal(harness.state().allMessagesLoaded, false);
+    assert.equal(harness.state().isLoadingAllMessages, false);
+    await act(async () => { await harness.state().handleScroll(); });
+    assert.equal(harness.pageRequests(), 0, 'no automatic paging behind an unresolved error');
+    await harness.retry([message('recovered', 0), ...harness.rows()]);
+    assert.equal(harness.state().historyLoadError, false);
+    assert.equal(harness.pageRequests(), 1);
+  } finally { harness.close(); }
+});
+
+test('load earlier pages further back once the loaded window is fully visible', async () => {
+  const harness = await setup();
+  try {
+    assert.equal(harness.state().hasMoreMessages, true);
+    act(() => harness.state().loadEarlierMessages());
+    assert.equal(harness.pageRequests(), 1, 'nothing hidden locally, so the control fetches a page');
   } finally { harness.close(); }
 });
 

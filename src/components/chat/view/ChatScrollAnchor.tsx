@@ -17,6 +17,7 @@ export default class ChatScrollAnchor extends Component<Props, Record<string, ne
   private anchor: Anchor | null = null;
   private frame: number | null = null;
   private previousOverflowAnchor = '';
+  private observed = new Set<Element>();
 
   componentDidMount() {
     this.connect();
@@ -36,7 +37,6 @@ export default class ChatScrollAnchor extends Component<Props, Record<string, ne
 
   componentDidUpdate(previous: Props, _state: Record<string, never>, snapshot: Anchor | null) {
     this.connect();
-    if (previous.sessionKey !== this.props.sessionKey || !this.props.enabled) this.anchor = null;
     this.anchor = snapshot ? this.restore(snapshot) : this.props.enabled ? this.capture() : null;
   }
 
@@ -48,6 +48,7 @@ export default class ChatScrollAnchor extends Component<Props, Record<string, ne
   private disconnect() {
     this.observer?.disconnect();
     this.observer = null;
+    this.observed.clear();
     if (this.node) {
       this.node.removeEventListener('scroll', this.onScroll);
       this.node.style.overflowAnchor = this.previousOverflowAnchor;
@@ -75,11 +76,20 @@ export default class ChatScrollAnchor extends Component<Props, Record<string, ne
   }
 
   private observeContent() {
-    this.observer?.disconnect();
-    if (!this.node || !this.observer || !this.props.enabled) return;
-    this.observer.observe(this.node);
-    if (this.node.firstElementChild) this.observer.observe(this.node.firstElementChild);
-    for (const row of this.node.querySelectorAll('[data-scroll-anchor]')) this.observer.observe(row);
+    if (!this.node || !this.observer || !this.props.enabled) {
+      this.observer?.disconnect();
+      this.observed.clear();
+      return;
+    }
+    // Every commit passes through here; only a changed row set re-registers,
+    // since each fresh observe also schedules an initial notification.
+    const targets = new Set<Element>([this.node]);
+    if (this.node.firstElementChild) targets.add(this.node.firstElementChild);
+    for (const row of this.node.querySelectorAll('[data-scroll-anchor]')) targets.add(row);
+    if (targets.size === this.observed.size && [...targets].every((target) => this.observed.has(target))) return;
+    this.observer.disconnect();
+    for (const target of targets) this.observer.observe(target);
+    this.observed = targets;
   }
 
   private capture(): Anchor | null {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { appendFile, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +8,8 @@ import test from 'node:test';
 import { appConfigDb, closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { GjcSessionSynchronizer } from '@/modules/providers/list/gjc/gjc-session-synchronizer.provider.js';
 import { GjcSessionsProvider } from '@/modules/providers/list/gjc/gjc-sessions.provider.js';
-import { sessionsService } from '@/modules/providers/services/sessions.service.js';
+import { exportSessionTranscript } from '@/modules/providers/services/session-export.service.js';
+import { fetchCompleteHistory, sessionsService } from '@/modules/providers/services/sessions.service.js';
 
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
@@ -458,6 +460,15 @@ test('gjc sessions provider bounds page payloads without hiding older history', 
     const lines = [
       JSON.stringify({ type: 'session', version: 3, id: 'gjc-ring-history', timestamp: '2026-07-09T00:00:00.000Z', cwd: workspacePath }),
     ];
+    // The oldest visible row is a tool call whose result only the paged walk can reach.
+    lines.push(JSON.stringify({
+      type: 'message', id: 'oldest-call', timestamp: new Date(startTime - 2).toISOString(),
+      message: { role: 'assistant', content: [{ type: 'toolCall', toolName: 'read', toolInput: { path: 'a.ts' }, toolCallId: 'call-oldest' }] },
+    }));
+    lines.push(JSON.stringify({
+      type: 'message', id: 'oldest-result', timestamp: new Date(startTime - 1).toISOString(),
+      message: { role: 'toolResult', toolCallId: 'call-oldest', toolName: 'read', content: [{ type: 'text', text: 'oldest output' }], isError: false },
+    }));
     for (let index = 0; index < messageCount; index += 1) {
       lines.push(JSON.stringify({
         type: 'message',
@@ -466,26 +477,43 @@ test('gjc sessions provider bounds page payloads without hiding older history', 
         message: { role: 'user', content: [{ type: 'text', text: `message-${index}` }] },
       }));
     }
-    await writeFile(
-      path.join(sessionsDir, '2026-07-09T00-00-00_gjc-ring-history.jsonl'),
-      `${lines.join('\n')}\n`,
-      'utf8',
-    );
+    const transcriptPath = path.join(sessionsDir, '2026-07-09T00-00-00_gjc-ring-history.jsonl');
+    await writeFile(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
 
     await withIsolatedDatabase(async () => {
       await new GjcSessionSynchronizer().synchronize();
 
       const provider = new GjcSessionsProvider();
       await assert.rejects(provider.fetchHistory('gjc-ring-history'), { code: 'HISTORY_PAGE_TOO_LARGE' });
+      // In-server consumers never issue the unbounded read; they page instead.
+      const complete = await fetchCompleteHistory('gjc-ring-history', { provider: 'gjc', providerSessionId: 'gjc-ring-history' });
+      assert.equal(complete.messages.length, 5_002);
+      assert.equal(complete.total, 5_002);
+      assert.equal(complete.hasMore, false);
+      assert.equal(complete.messages[0]?.toolId, 'call-oldest');
+      assert.equal(complete.messages[0]?.toolResult?.content, 'oldest output');
+      assert.equal(complete.messages.at(-1)?.content, 'message-5000');
+      assert.equal(new Set(complete.messages.map((message) => message.id)).size, 5_002, 'pages overlap only by identity');
+      const oldestResult = await sessionsService.fetchToolResult('gjc-ring-history', 'call-oldest');
+      assert.equal(oldestResult.toolResult.content, 'oldest output');
+      await assert.rejects(sessionsService.fetchToolResult('gjc-ring-history', 'call-missing'), { code: 'TOOL_RESULT_NOT_FOUND' });
+      const exported = await exportSessionTranscript('gjc-ring-history');
+      assert.ok(exported.body.includes('message-0\n'), 'export reaches the oldest prompt');
+      assert.ok(exported.body.includes('message-5000'));
+      await rm(transcriptPath);
+      const gone = await provider.fetchHistory('gjc-ring-history', { limit: 20 });
+      assert.deepEqual({ total: gone.total, hasMore: gone.hasMore, messages: gone.messages }, { total: 0, hasMore: false, messages: [] }, 'a removed transcript is an empty window, not a 500');
+      await writeFile(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
       const history = await provider.fetchHistory('gjc-ring-history', { limit: 5_000 });
-      assert.equal(history.total, 5_001);
+      assert.equal(history.total, 5_002);
       assert.equal(history.messages.length, 5_000);
       assert.equal(history.messages[0]?.content, 'message-1');
       assert.equal(history.messages.at(-1)?.content, 'message-5000');
       assert.equal(history.hasMore, true);
       const oldest = await provider.fetchHistory('gjc-ring-history', { limit: 20, offset: 5_000 });
-      assert.equal(oldest.messages[0]?.content, 'message-0');
-      assert.equal(oldest.total, 5_001);
+      assert.equal(oldest.messages[0]?.toolId, 'call-oldest');
+      assert.equal(oldest.messages[1]?.content, 'message-0');
+      assert.equal(oldest.total, 5_002);
       assert.equal(oldest.hasMore, false);
     });
   } finally {
@@ -821,6 +849,31 @@ test('GJC pages count visible rows, preserve results and reach history beyond th
       assert.equal(oldest.hasMore, false);
       assert.equal(oldest.messages[0]?.content, 'oldest prompt');
       await assert.rejects(provider.fetchHistory(sessionId), { code: 'HISTORY_PAGE_TOO_LARGE' });
+
+      // A live writer appending mid-read is absorbed by re-reading; only a
+      // transcript that keeps changing on every attempt surfaces as 409.
+      const originalStat = fs.promises.stat;
+      let stats = 0;
+      let appendsPerRead = 1;
+      (fs.promises as { stat: unknown }).stat = async (...args: Parameters<typeof fs.promises.stat>) => {
+        stats += 1;
+        // Even calls are the post-read revision check; grow the file just before it.
+        if (stats % 2 === 0 && appendsPerRead > 0) {
+          appendsPerRead -= 1;
+          await appendFile(filePath, `${JSON.stringify({ type: 'message', id: `live-${stats}`, parentId: 'msg-1',
+            timestamp: new Date(Date.UTC(2026, 6, 11, 0, 0, stats)).toISOString(), message: { role: 'user', content: [{ type: 'text', text: `live ${stats}` }] } })}\n`, 'utf8');
+        }
+        return originalStat(...args);
+      };
+      try {
+        const settled = await provider.fetchHistory(sessionId, { limit: 20 });
+        assert.equal(settled.total, 5402, 'the retry sees the row appended during the first attempt');
+        assert.equal(settled.messages.at(-1)?.content, 'live 2');
+        appendsPerRead = Number.POSITIVE_INFINITY;
+        await assert.rejects(provider.fetchHistory(sessionId, { limit: 20 }), { code: 'HISTORY_CHANGED', statusCode: 409 });
+      } finally {
+        (fs.promises as { stat: unknown }).stat = originalStat;
+      }
     });
   } finally {
     restoreLiveSessionDir();
