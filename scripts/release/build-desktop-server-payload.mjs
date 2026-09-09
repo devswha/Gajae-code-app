@@ -102,7 +102,7 @@ export async function restrictRuntimeDependencies(directory = payloadDir) {
   delete packageJson.devDependencies;
   delete packageJson.optionalDependencies;
   // Keep exactly the reviewed install hooks; never stage dev/prepare hooks.
-  packageJson.scripts = Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch'].map(name => {
+  packageJson.scripts = Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch', 'apply:extract-zip-patch', 'check:extract-zip-patch'].map(name => {
     const command = packageJson.scripts?.[name];
     if (typeof command !== 'string' || !command) throw new Error(`Missing required SDK installation script: ${name}`);
     return [name, command];
@@ -118,6 +118,7 @@ export async function installDesktopPayloadDependencies(payloadNode, npmCli, npm
   // Resolve the CLI from its stage cwd (as npm does), including /var ->
   // /private/var aliases on macOS; never invoke a checkout-relative fallback.
   await execute(payloadNode, ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], { cwd: directory, env: npmEnvironment });
+  await execute(payloadNode, ['scripts/apply-extract-zip-patch.mjs', '--check'], { cwd: directory, env: npmEnvironment });
   await execute(payloadNode, [npmCli, 'rebuild', '--omit=dev', '--build-from-source', ...NATIVE_MODULES], { cwd: directory, env: { ...npmEnvironment, npm_config_build_from_source: 'true' } });
   await execute(payloadNode, [path.join(directory, 'scripts', 'fix-node-pty.js')], { cwd: directory, env: npmEnvironment });
 }
@@ -129,7 +130,10 @@ export async function finalizeDesktopPayloadMetadata(directory = payloadDir) {
   const packageJson = JSON.parse(await fs.readFile(packagePath, 'utf8'));
   // The immutable payload has no lockfile/reinstall entrypoint. Retain the
   // verifier and evidence, not postinstall hooks pointing at removed tools.
-  packageJson.scripts = { 'check:sdk-patch': packageJson.scripts['check:sdk-patch'] };
+  packageJson.scripts = {
+    'check:sdk-patch': packageJson.scripts['check:sdk-patch'],
+    'check:extract-zip-patch': packageJson.scripts['check:extract-zip-patch'],
+  };
   await fs.writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
 }
 
@@ -269,6 +273,7 @@ async function smoke(payloadNode) {
       }
       await fs.symlink(payloadNode, path.join(smokeHome, 'bin', 'node'));
       await run(payloadNode, ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], { cwd: copyDir, env });
+      await run(payloadNode, ['scripts/apply-extract-zip-patch.mjs', '--check'], { cwd: copyDir, env });
       await run(payloadNode, ['--input-type=module', '--eval', smoke], {
         cwd: copyDir,
         env,
@@ -283,13 +288,15 @@ export const DESKTOP_PAYLOAD_INPUTS = [
   'dist', 'dist-server', 'shared', 'public', 'server/gjc-runtime-manifest.json',
   'scripts/fix-node-pty.js', 'scripts/gajae-app-runtime.mjs', 'scripts/apply-sdk-lifecycle-patch.mjs',
   'patches/gjc-sdk-lifecycle/manifest.json',
+  'scripts/apply-extract-zip-patch.mjs', 'patches/extract-zip-symlink-leaf/manifest.json',
   'package.json', 'package-lock.json', 'dist-native', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md',
 ];
 
 export async function stageDesktopPayloadFiles(sourceRoot = rootDir, directory = payloadDir) {
   for (const input of DESKTOP_PAYLOAD_INPUTS) await copy(input, sourceRoot, directory);
-  const readme = 'patches/gjc-sdk-lifecycle/README.md';
-  if (await exists(path.join(sourceRoot, readme))) await copy(readme, sourceRoot, directory);
+  for (const readme of ['patches/gjc-sdk-lifecycle/README.md', 'patches/extract-zip-symlink-leaf/README.md']) {
+    if (await exists(path.join(sourceRoot, readme))) await copy(readme, sourceRoot, directory);
+  }
 }
 
 export async function buildDesktopServerPayload() {

@@ -9522,7 +9522,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### js-yaml 3.15.1
+### js-yaml 3.15.2
 
 License: MIT
 Copyright holder: Vladimir Zapparov <dervus.grim@gmail.com>
@@ -17235,7 +17235,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### multer 2.2.0
+### multer 2.3.0
 
 License: MIT
 Copyright holder: Hage Yaapa <captain@hacksparrow.com> (http://www.hacksparrow.com)

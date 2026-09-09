@@ -170,6 +170,14 @@ is `.ts`/`.tsx`. Routing is react-router-dom 7.
   reapply it through a clean install and explicitly regenerate tracked runtime
   hashes with `npm run fill:runtime-manifest -- --update` before verification;
   normal dev/build gates only check the manifest and do not bless changed hashes.
+- **Browser archive security backport**: `patches/extract-zip-symlink-leaf/manifest.json`
+  owns the exact extract-zip 2.0.1 upstream PR160 transform. Postinstall applies
+  it; `npm run check:extract-zip-patch` verifies canonical source/package hashes
+  and rejects nested, aliased or modified installations. Server/desktop staging
+  must carry and verify this independent patch. Do not put it in the SDK32
+  lifecycle manifest or hand-edit node_modules. Audit recognition is conditional
+  on the actual patch and a current review, not an unconditional advisory skip.
+  Its archive-only protection is not a sandbox against concurrent local writers.
 - **Chat tool cards follow the runtime, not Claude**: `src/components/chat/tools/configs/toolConfigs.ts`
   is keyed by the tool's own lowercase name (`bash`, `read`, `edit`, `todo_write`), and
   its accessors read the runtime's parameter schema. `server/gjc-tool-configs.bun.test.ts`

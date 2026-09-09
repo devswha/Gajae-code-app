@@ -271,7 +271,7 @@ async function pruneSourceMaps(directory) {
 export async function writeInstallPackageJson(stageDir, packageJson) {
   const installManifest = {
     ...packageJson,
-    scripts: Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch'].map(name => {
+    scripts: Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch', 'apply:extract-zip-patch', 'check:extract-zip-patch'].map(name => {
       const command = packageJson.scripts?.[name];
       if (typeof command !== 'string' || !command) throw new Error(`Missing required SDK installation script: ${name}`);
       return [name, command];
@@ -302,6 +302,7 @@ export async function writeRuntimePackageJson(stageDir, packageJson) {
     scripts: {
       start: 'node scripts/gajae-app-runtime.mjs start',
       'check:sdk-patch': packageJson.scripts['check:sdk-patch'],
+      'check:extract-zip-patch': packageJson.scripts['check:extract-zip-patch'],
     },
     dependencies: packageJson.dependencies,
     license: packageJson.license,
@@ -459,6 +460,7 @@ async function smokeNativeRuntime(stageDir) {
     await fs.mkdir(qaHome, { recursive: true });
     const env = isolatedQaEnvironment({ parentEnv: process.env, qaHome, host: '127.0.0.1', serverPort: 3001, vitePort: 5173, remote: false });
     await execute(process.execPath, ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], { cwd: copyDir, env });
+    await execute(process.execPath, ['scripts/apply-extract-zip-patch.mjs', '--check'], { cwd: copyDir, env });
     await execute(process.execPath, ['--input-type=module', '--eval', smokeSource], { cwd: copyDir, env });
   });
 }
@@ -496,6 +498,8 @@ export const SERVER_BUNDLE_INPUTS = [
   'scripts/gajae-app-runtime.mjs',
   'scripts/apply-sdk-lifecycle-patch.mjs',
   'patches/gjc-sdk-lifecycle/manifest.json',
+  'scripts/apply-extract-zip-patch.mjs',
+  'patches/extract-zip-symlink-leaf/manifest.json',
   'packaging/systemd/gajae-app.service',
   'docs/SELF-HOST.md',
   'docs/INSTALL.md',
@@ -546,8 +550,9 @@ export async function stageBundleFiles(stageDir, packageJson, sourceRoot = rootD
   for (const relativePath of SERVER_BUNDLE_INPUTS) {
     await stageRequiredInput(stageDir, relativePath, sourceRoot);
   }
-  const readme = 'patches/gjc-sdk-lifecycle/README.md';
-  if (await canAccess(path.join(sourceRoot, readme))) await stageRequiredInput(stageDir, readme, sourceRoot);
+  for (const readme of ['patches/gjc-sdk-lifecycle/README.md', 'patches/extract-zip-symlink-leaf/README.md']) {
+    if (await canAccess(path.join(sourceRoot, readme))) await stageRequiredInput(stageDir, readme, sourceRoot);
+  }
   const prunedSourceMaps = await pruneSourceMaps(path.join(stageDir, 'dist-server'));
   console.log(`Pruned ${prunedSourceMaps} source map files from dist-server.`);
   await writeInstallPackageJson(stageDir, packageJson);
@@ -560,6 +565,7 @@ export async function installStageDependencies(stageDir, { run = execute, verify
     env: npmEnvironment(),
   });
   await run(process.execPath, ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], { cwd: stageDir, env: npmEnvironment() });
+  await run(process.execPath, ['scripts/apply-extract-zip-patch.mjs', '--check'], { cwd: stageDir, env: npmEnvironment() });
   await verifyVersions(stageDir);
 }
 

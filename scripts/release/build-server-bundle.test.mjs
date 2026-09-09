@@ -27,6 +27,9 @@ async function fixture(t, { readme = true } = {}) {
   const applier = await readFile(path.join(repository, 'scripts/apply-sdk-lifecycle-patch.mjs'));
   await writeFile(path.join(source, patchDirectory, 'manifest.json'), manifest);
   await writeFile(path.join(source, 'scripts/apply-sdk-lifecycle-patch.mjs'), applier);
+  for (const input of ['scripts/apply-extract-zip-patch.mjs', 'patches/extract-zip-symlink-leaf/manifest.json']) {
+    await copyFile(path.join(repository, input), path.join(source, input));
+  }
   await copyFile(path.join(repository, 'shared/sdkLifecyclePolicy.json'), path.join(source, 'shared/sdkLifecyclePolicy.json'));
   await copyFile(path.join(repository, 'scripts/fix-node-pty.js'), path.join(source, 'scripts/fix-node-pty.js'));
   await writeFile(path.join(source, patchDirectory, 'manifest.test.mjs'), 'must not ship');
@@ -38,12 +41,13 @@ async function fixture(t, { readme = true } = {}) {
 }
 
 test('root npm ci preserves node-pty repair and runs the canonical SDK applier without ancestry lookup', () => {
-  assert.equal(sourcePackage.scripts.postinstall, 'node scripts/fix-node-pty.js && node scripts/apply-sdk-lifecycle-patch.mjs');
+  assert.equal(sourcePackage.scripts.postinstall, 'node scripts/fix-node-pty.js && node scripts/apply-sdk-lifecycle-patch.mjs && node scripts/apply-extract-zip-patch.mjs');
   assert.equal(sourcePackage.scripts['apply:sdk-patch'], 'node scripts/apply-sdk-lifecycle-patch.mjs');
   assert.equal(sourcePackage.scripts['check:sdk-patch'], 'node scripts/apply-sdk-lifecycle-patch.mjs --check');
   assert.ok(sourcePackage.files.includes(`${patchDirectory}/manifest.json`));
   assert.ok(sourcePackage.files.includes(`${patchDirectory}/README.md`));
   assert.deepEqual(sourcePackage.files.filter(input => input.startsWith('patches/')).sort(), [
+    'patches/extract-zip-symlink-leaf/README.md', 'patches/extract-zip-symlink-leaf/manifest.json',
     `${patchDirectory}/README.md`, `${patchDirectory}/manifest.json`,
   ]);
 });
@@ -51,6 +55,8 @@ test('root npm ci preserves node-pty repair and runs the canonical SDK applier w
 test('verify, npm test, direct e2e scripts and server builds reject an unapplied SDK before work', () => {
   for (const name of ['verify', 'pretest', 'test:e2e:gjc', 'test:e2e:browser', 'prebuild:server']) {
     assert.ok(sourcePackage.scripts[name].startsWith('npm run check:sdk-patch && '), name);
+    assert.ok(sourcePackage.scripts[name].includes('npm run check:extract-zip-patch && '), name);
+    assert.equal(sourcePackage.scripts[name].includes('npm run apply:extract-zip-patch'), false);
     assert.equal(sourcePackage.scripts[name].includes('npm run apply:sdk-patch'), false, `${name} must verify, not modify installed dependencies`);
   }
   for (const gate of ['audit', 'check:licenses', 'check:notices', 'typecheck', 'check:core', 'lint', 'check:identity', 'build']) {
@@ -69,12 +75,15 @@ test('server stage ships the exact patch manifest/applier and optional README, n
     assert.deepEqual((await readdir(path.join(f.stage, patchDirectory))).sort(), readme ? ['README.md', 'manifest.json'] : ['manifest.json']);
     await assert.rejects(stat(path.join(f.stage, 'dist-server/index.js.map')), { code: 'ENOENT' });
     const install = JSON.parse(await readFile(path.join(f.stage, 'package.json'), 'utf8'));
-    assert.deepEqual(install.scripts, Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch'].map(name => [name, sourcePackage.scripts[name]])));
+    assert.deepEqual(install.scripts, Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch', 'apply:extract-zip-patch', 'check:extract-zip-patch'].map(name => [name, sourcePackage.scripts[name]])));
     assert.equal(install.scripts.prepare, undefined);
     assert.deepEqual(install.dependencies, sourcePackage.dependencies);
     await writeRuntimePackageJson(f.stage, sourcePackage);
     const runtime = JSON.parse(await readFile(path.join(f.stage, 'package.json'), 'utf8'));
-    assert.deepEqual(runtime.scripts, { start: 'node scripts/gajae-app-runtime.mjs start', 'check:sdk-patch': sourcePackage.scripts['check:sdk-patch'] });
+    assert.deepEqual(runtime.scripts, { start: 'node scripts/gajae-app-runtime.mjs start', 'check:sdk-patch': sourcePackage.scripts['check:sdk-patch'], 'check:extract-zip-patch': sourcePackage.scripts['check:extract-zip-patch'] });
+    for (const input of ['scripts/apply-extract-zip-patch.mjs', 'patches/extract-zip-symlink-leaf/manifest.json']) {
+      assert.deepEqual(await readFile(path.join(f.stage, input)), await readFile(path.join(repository, input)));
+    }
     assert.equal(runtime.engines.node, '>=22.22.2 <23');
     assert.deepEqual(await readFile(path.join(f.stage, patchDirectory, 'manifest.json')), f.manifest);
   }
@@ -96,6 +105,7 @@ test('server npm ci retains the root hook and runs check-only before accepting r
   assert.deepEqual(calls, [
     { command: 'npm', args: ['ci', '--omit=dev'], cwd: f.stage },
     { command: process.execPath, args: ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'], cwd: f.stage },
+    { command: process.execPath, args: ['scripts/apply-extract-zip-patch.mjs', '--check'], cwd: f.stage },
     { versions: f.stage },
   ]);
   await assert.rejects(stat(path.join(f.stage, 'node_modules')), { code: 'ENOENT' });
@@ -153,6 +163,7 @@ test('both packaging smokes verify the staged patch out of tree without weakenin
   assert.match(desktop, /withOutOfTreeCopy\(payloadDir[\s\S]*?\['scripts\/apply-sdk-lifecycle-patch\.mjs', '--check'\], \{ cwd: copyDir, env \}/);
   assert.match(server, /withOutOfTreeCopy\(stageDir[\s\S]*?\['scripts\/apply-sdk-lifecycle-patch\.mjs', '--check'\], \{ cwd: copyDir, env \}/);
   for (const source of [desktop, server]) {
+    assert.match(source, /\['scripts\/apply-extract-zip-patch\.mjs', '--check'\], \{ cwd: copyDir, env \}/);
     assert.match(source, /const BUN_VERSION = '1\.4\.0'/);
     assert.match(source, /'better-sqlite3', 'node-pty'/);
     assert.match(source, /removeExcludedDistributionPackages/);
@@ -166,4 +177,22 @@ test('both packaging smokes verify the staged patch out of tree without weakenin
   assert.match(server, /TARGET_NODE_VERSION = \[22, 22, 2\]/);
   assert.match(server, /TARGET_GLIBC_VERSION = \[2, 35, 0\]/);
   assert.match(server, /await auditGlibcRequirements\(stageDir\)/);
+});
+
+test('missing or unpatched ZIP evidence stops server stage acceptance', async t => {
+  const f = await fixture(t); await stageBundleFiles(f.stage, sourcePackage, f.source);
+  const calls = [];
+  await assert.rejects(installStageDependencies(f.stage, {
+    run: async (_command, args) => {
+      calls.push(args);
+      if (args[0] === 'scripts/apply-extract-zip-patch.mjs') throw new Error('ZIP patch missing');
+    },
+    verifyVersions: async () => assert.fail('ZIP patch verification must finish first'),
+  }), /ZIP patch missing/);
+  assert.equal(calls.length, 3);
+  const result = spawnSync(process.execPath, [path.join(f.stage, 'scripts/apply-extract-zip-patch.mjs'), '--check'], { cwd: repository, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.ok(result.stderr.includes(path.join(f.stage, 'node_modules')));
+  await rm(path.join(f.source, 'patches/extract-zip-symlink-leaf/manifest.json'));
+  await assert.rejects(stageBundleFiles(f.stage, sourcePackage, f.source), { code: 'ENOENT' });
 });

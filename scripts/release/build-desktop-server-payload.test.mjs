@@ -18,7 +18,7 @@ test('a rejected Node archive cleans the download, incomplete payload and sideca
         await copyFile(new URL(file, import.meta.url), path.join(root, 'scripts/release', file));
       }
       for (const directory of ['dist', 'dist-server', 'shared', 'public', 'tmp', 'src-tauri/binaries']) await mkdir(path.join(root, directory), { recursive: true });
-      for (const file of ['package.json', 'package-lock.json', 'server/gjc-runtime-manifest.json', 'scripts/fix-node-pty.js', 'scripts/gajae-app-runtime.mjs', 'scripts/apply-sdk-lifecycle-patch.mjs', 'patches/gjc-sdk-lifecycle/manifest.json', 'dist-native/bun', 'dist-native/gajae-core', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']) {
+      for (const file of ['package.json', 'package-lock.json', 'server/gjc-runtime-manifest.json', 'scripts/fix-node-pty.js', 'scripts/gajae-app-runtime.mjs', 'scripts/apply-sdk-lifecycle-patch.mjs', 'patches/gjc-sdk-lifecycle/manifest.json', 'scripts/apply-extract-zip-patch.mjs', 'patches/extract-zip-symlink-leaf/manifest.json', 'dist-native/bun', 'dist-native/gajae-core', 'LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md']) {
         await mkdir(path.dirname(path.join(root, file)), { recursive: true });
         await writeFile(path.join(root, file), '{}');
       }
@@ -72,6 +72,9 @@ async function fixture(t, { readme = true } = {}) {
   const applier = await readFile(new URL('../apply-sdk-lifecycle-patch.mjs', import.meta.url));
   await writeFile(path.join(source, patch, 'manifest.json'), manifest);
   await writeFile(path.join(source, 'scripts/apply-sdk-lifecycle-patch.mjs'), applier);
+  for (const input of ['scripts/apply-extract-zip-patch.mjs', 'patches/extract-zip-symlink-leaf/manifest.json']) {
+    await copyFile(new URL(`../../${input}`, import.meta.url), path.join(source, input));
+  }
   await writeFile(path.join(source, patch, 'lifecycle.bun.test.ts'), 'must not ship');
   await writeFile(path.join(source, patch, 'manifest.test.mjs'), 'must not ship');
   if (readme) await writeFile(path.join(source, patch, 'README.md'), 'app-owned patch evidence');
@@ -88,14 +91,17 @@ test('desktop stage copies only canonical patch inputs, retaining evidence witho
     assert.deepEqual((await readdir(path.join(f.stage, f.patch))).sort(), readme ? ['README.md', 'manifest.json'] : ['manifest.json']);
     await restrictRuntimeDependencies(f.stage);
     const install = JSON.parse(await readFile(path.join(f.stage, 'package.json'), 'utf8'));
-    assert.deepEqual(install.scripts, Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch'].map(name => [name, f.packageJson.scripts[name]])));
+    assert.deepEqual(install.scripts, Object.fromEntries(['postinstall', 'apply:sdk-patch', 'check:sdk-patch', 'apply:extract-zip-patch', 'check:extract-zip-patch'].map(name => [name, f.packageJson.scripts[name]])));
     assert.equal(install.dependencies['@gajae-code/coding-agent'], f.packageJson.dependencies['@gajae-code/coding-agent']);
     assert.equal(install.devDependencies, undefined);
     assert.equal(install.optionalDependencies, undefined);
     assert.equal(install.scripts.prepare, undefined);
     await finalizeDesktopPayloadMetadata(f.stage);
     const runtime = JSON.parse(await readFile(path.join(f.stage, 'package.json'), 'utf8'));
-    assert.deepEqual(runtime.scripts, { 'check:sdk-patch': f.packageJson.scripts['check:sdk-patch'] });
+    assert.deepEqual(runtime.scripts, { 'check:sdk-patch': f.packageJson.scripts['check:sdk-patch'], 'check:extract-zip-patch': f.packageJson.scripts['check:extract-zip-patch'] });
+    for (const input of ['scripts/apply-extract-zip-patch.mjs', 'patches/extract-zip-symlink-leaf/manifest.json']) {
+      assert.deepEqual(await readFile(path.join(f.stage, input)), await readFile(new URL(`../../${input}`, import.meta.url)));
+    }
     await assert.rejects(stat(path.join(f.stage, 'scripts/fix-node-pty.js')), { code: 'ENOENT' });
     assert.deepEqual(await readFile(path.join(f.stage, f.patch, 'manifest.json')), f.manifest);
   }
@@ -118,11 +124,25 @@ test('desktop npm ci uses the source postinstall then verifies before rebuilding
     [npm, 'install', '--package-lock-only', '--ignore-scripts', '--omit=dev'],
     [npm, 'ci', '--omit=dev'],
     ['scripts/apply-sdk-lifecycle-patch.mjs', '--check'],
+    ['scripts/apply-extract-zip-patch.mjs', '--check'],
     [npm, 'rebuild', '--omit=dev', '--build-from-source', 'better-sqlite3', 'node-pty'],
     [path.join(f.stage, 'scripts/fix-node-pty.js')],
   ]);
-  assert.equal(calls[3].options.env.npm_config_build_from_source, 'true');
+  assert.equal(calls[4].options.env.npm_config_build_from_source, 'true');
   await assert.rejects(stat(path.join(f.stage, 'node_modules')), { code: 'ENOENT' });
+});
+
+test('unverified ZIP patch stops desktop staging before native rebuilding', async t => {
+  const f = await fixture(t); await stageDesktopPayloadFiles(f.source, f.stage);
+  const calls = [];
+  await assert.rejects(installDesktopPayloadDependencies('/fixture/node', '/fixture/npm', {}, f.stage, async (_command, args) => {
+    calls.push(args);
+    if (args[0] === 'scripts/apply-extract-zip-patch.mjs') throw new Error('ZIP patch missing');
+  }), /ZIP patch missing/);
+  assert.equal(calls.length, 4);
+  assert.equal(calls.some(args => args.includes('rebuild')), false);
+  await rm(path.join(f.source, 'patches/extract-zip-symlink-leaf/manifest.json'));
+  await assert.rejects(stageDesktopPayloadFiles(f.source, f.stage), { code: 'ENOENT' });
 });
 
 test('an unapplied desktop SDK stops before native rebuilding instead of applying outside postinstall', async t => {
