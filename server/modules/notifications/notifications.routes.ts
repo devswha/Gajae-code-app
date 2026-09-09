@@ -1,6 +1,7 @@
 import express from 'express';
 
 import { notificationChannelEndpointsDb, notificationPreferencesDb } from '@/modules/database/index.js';
+import { asyncHandler } from '@/shared/utils.js';
 
 const router = express.Router();
 
@@ -65,7 +66,7 @@ function guardEndpointRoute(
   }
 }
 
-router.get('/endpoints', (request, response) => {
+router.get('/endpoints', asyncHandler((request, response) => {
   const channel = requiredText(request.query.channel);
   if (!channel) return response.status(400).json({ error: 'channel is required' });
 
@@ -77,9 +78,9 @@ router.get('/endpoints', (request, response) => {
       return response.json({ success: true, endpoints });
     },
   );
-});
+}));
 
-router.post('/endpoints/current', (request, response) => {
+router.post('/endpoints/current', asyncHandler((request, response) => {
   const input = request.body || {};
   const channel = requiredText(input.channel);
   const endpointId = requiredText(input.endpointId);
@@ -106,9 +107,9 @@ router.post('/endpoints/current', (request, response) => {
       });
     },
   );
-});
+}));
 
-router.patch('/endpoints/:channel/:endpointId', (request, response) => {
+router.patch('/endpoints/:channel/:endpointId', asyncHandler((request, response) => {
   if (typeof request.body?.enabled !== 'boolean') {
     return response.status(400).json({ error: 'enabled must be a boolean' });
   }
@@ -130,9 +131,9 @@ router.patch('/endpoints/:channel/:endpointId', (request, response) => {
       });
     },
   );
-});
+}));
 
-router.delete('/endpoints/:channel/:endpointId', (request, response) => {
+router.delete('/endpoints/:channel/:endpointId', asyncHandler((request, response) => {
   return guardEndpointRoute(
     response,
     { log: 'Error removing notification endpoint:', body: 'Failed to remove notification endpoint' },
@@ -145,6 +146,6 @@ router.delete('/endpoints/:channel/:endpointId', (request, response) => {
       return response.json({ success: true, preferences: syncChannelPreference(userId, channel) });
     },
   );
-});
+}));
 
 export default router;

@@ -25,14 +25,14 @@ function request(method: typeof GJC_WORKER_REQUEST_METHODS[number], id = 'reques
     kind: 'request' as const,
     id,
     method,
-    payload: { input: 'hello' },
+    payload: method === 'worker.activity' ? {} : method === 'worker.admission' ? { fenceId: 'fence-1', closed: true } : { input: 'hello' },
   };
   if (scopedMethods.has(method)) {
     return {
       ...base,
       method: method as Exclude<typeof method, 'worker.initialize' | 'worker.shutdown'>,
       sessionId: 'session-1',
-    };
+    } as GjcWorkerRequestFrame;
   }
   return base as GjcWorkerRequestFrame;
 }
@@ -44,7 +44,7 @@ function protocolError(action: () => unknown, code?: string): void {
 test('declares the independent worker protocol v1 surface', () => {
   assert.equal(GJC_WORKER_PROTOCOL_VERSION, 1);
   assert.equal(GJC_WORKER_MAX_FRAME_BYTES, 64 * 1024 * 1024);
-  assert.deepEqual(GJC_WORKER_REQUEST_METHODS, ['worker.initialize', 'session.start', 'session.resume', 'turn.start', 'turn.abort', 'turn.steer', 'goal.inspect', 'goal.control', 'ask.reply', 'models.catalog', 'oauth.providers', 'oauth.status', 'oauth.start', 'oauth.submit', 'oauth.cancel', 'worker.shutdown']);
+  assert.deepEqual(GJC_WORKER_REQUEST_METHODS, ['worker.initialize', 'worker.activity', 'worker.admission', 'session.start', 'session.resume', 'turn.start', 'turn.abort', 'turn.steer', 'goal.inspect', 'goal.control', 'ask.reply', 'models.catalog', 'oauth.providers', 'oauth.status', 'oauth.start', 'oauth.submit', 'oauth.cancel', 'worker.shutdown']);
   assert.deepEqual(GJC_WORKER_EVENT_METHODS, ['session.created', 'message.delta', 'message.completed', 'tool.started', 'tool.completed', 'ask.presented', 'usage.updated', 'turn.completed', 'turn.failed', 'worker.status', 'oauth.phase', 'oauth.providers.updated', 'provider.auth.updated']);
 });
 
@@ -76,6 +76,25 @@ test('validates response success and failure payloads with exact scope', () => {
   protocolError(() => parseGjcWorkerFrame(JSON.stringify({ protocolVersion: 1, kind: 'response', id: 'request-4', method: 'turn.start', sessionId: 'session-1', payload: { ok: false, error: { code: 1, message: 'bad' } } })), 'invalid_response_payload');
 });
 
+test('ownership RPCs reject loose payloads, unsafe counters and unbounded evidence', () => {
+  for (const payload of [{ fenceId: 'f1' }, { fenceId: '', closed: true }, { fenceId: 'f1', closed: 1 },
+    { fenceId: 'f1', closed: true, ignored: true }]) {
+    protocolError(() => parseGjcWorkerFrame(JSON.stringify({ ...request('worker.admission'), payload })), 'invalid_payload');
+  }
+  protocolError(() => parseGjcWorkerFrame(JSON.stringify({ ...request('worker.activity'), payload: { spawn: true } })), 'invalid_payload');
+  const activity = { fenceId: 'f1', generation: 'generation-1', complete: true,
+    starting: 0, queued: 0, running: 0, settling: 0, approvals: 0, retained: 0, unknown: [] };
+  const response = (result: unknown) => JSON.stringify({ protocolVersion: 1, kind: 'response', id: 'observation',
+    method: 'worker.activity', payload: { ok: true, result } });
+  assert.equal(parseGjcWorkerFrame(response(activity)).method, 'worker.activity');
+  for (const result of [undefined, {}, { ...activity, ignored: true }, { ...activity, starting: -1 },
+    { ...activity, running: 0.1 }, { ...activity, retained: Number.MAX_SAFE_INTEGER + 1 },
+    { ...activity, generation: 'x'.repeat(129) }, { ...activity, unknown: Array(33).fill('unknown') },
+    { ...activity, unknown: ['secret with spaces'] }]) {
+    protocolError(() => parseGjcWorkerFrame(response(result)), 'invalid_response_payload');
+  }
+});
+
 test('fails closed on malformed JSON, methods, invalid JSON values, and direct byte bounds', () => {
   protocolError(() => parseGjcWorkerFrame('{'), 'malformed_frame');
   protocolError(() => parseGjcWorkerFrame(JSON.stringify({ ...request('turn.start'), method: 'provider.run' })), 'unknown_method');
@@ -98,7 +117,7 @@ test('serializes compact LF NDJSON and recursively redacts supplied secrets', ()
       token: secret,
       nested: [secret, { [`prefix-${secret}`]: `x${secret}y` }],
     },
-  }, [secret]);
+  } as GjcWorkerRequestFrame, [secret]);
   assert.ok(serialized.endsWith('\n'));
   assert.equal(serialized.slice(0, -1).includes('\n'), false);
   assert.equal(serialized.includes(secret), false);

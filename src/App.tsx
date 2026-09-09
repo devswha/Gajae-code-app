@@ -9,6 +9,7 @@ import AppContent from './components/app/AppContent';
 import DesktopDeepLinkBridge from './components/app/DesktopDeepLinkBridge';
 import { appShellRoutePaths, rootFallbackRoutePath } from './components/app/appRoutes';
 import i18n from './i18n/config.js';
+import { useComposerFreezeBridge } from './shared/composerFreezeBridge';
 
 
 const DEPLOYMENT_ASSET_DIRECTORIES = new Set(['assets', 'static', 'icons', 'images']);
@@ -104,5 +105,6 @@ function ApplicationLayout({ routerBasename }: ApplicationLayoutProps) {
 }
 
 export default function App() {
+  useComposerFreezeBridge();
   return <ApplicationLayout routerBasename={deriveRouterBasename()} />;
 }

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "extract-zip-symlink-leaf-v1",
+  "package": "extract-zip",
+  "version": "2.0.1",
+  "upstream": {
+    "pr": "https://github.com/max-mapper/extract-zip/pull/160",
+    "commit": "148750acb10c574818906de2a99aa13d457d5329"
+  },
+  "packageJsonSha256": "3e8737deb0089259f282f6a0d625175ac8eb2b06cc8ce67a2956e3f6ec5cca07",
+  "path": "index.js",
+  "beforeSha256": "1073ca8196d3c9ae51b0de41df9d7c347957c8501d0749d852b4994789cddd78",
+  "afterSha256": "b15baee7015fe18cb290bd94c3512278c4eb6bd2dac585cfdafaa5b7cedcf4eb",
+  "replacement": {
+    "before": "      await pipeline(readStream, createWriteStream(dest, { mode: procMode }))",
+    "after": "      const existing = await fs.lstat(dest).catch(() => null)\n      if (existing && existing.isSymbolicLink()) {\n        throw new Error(\u0060Out of bound path \"\u0024{dest}\" found while processing file \u0024{entry.fileName}\u0060)\n      }\n\n      await pipeline(readStream, createWriteStream(dest, { mode: procMode }))"
+  }
+}

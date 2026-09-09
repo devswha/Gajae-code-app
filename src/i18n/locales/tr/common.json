@@ -116,7 +116,13 @@
     "tasks": {
       "empty": "Henüz planlanan bir şey yok",
       "emptyHint": "Aracı bu oturumda bir yapılacaklar listesi tutarsa burada görünür.",
-      "progress": "{{total}} görevden {{done}} tanesi tamam"
+      "progress": "{{total}} görevden {{done}} tanesi tamam",
+      "status": {
+        "pending": "Bekliyor",
+        "in_progress": "Devam ediyor",
+        "completed": "Tamamlandı",
+        "abandoned": "Vazgeçildi"
+      }
     },
     "browser": {
       "address": "Web adresi",

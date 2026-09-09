@@ -1,6 +1,8 @@
 import { Settings, PanelLeftOpen, Bug } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
+import SidebarDesktopUpdate from './SidebarDesktopUpdate';
+
 const DISCORD_INVITE_URL = 'https://discord.gg/dskZax5JPh';
 const GITHUB_ISSUES_URL = 'https://github.com/devswha/gajae-code-app/issues/new';
 
@@ -35,41 +37,45 @@ export default function SidebarCollapsed({
         <PanelLeftOpen className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
       </button>
 
-      <div className="my-1 nav-divider w-6" />
+      <div className="mt-auto flex flex-col items-center gap-1">
+        <div className="my-1 nav-divider w-6" />
 
-      {/* Settings */}
-      <button
-        onClick={onShowSettings}
-        className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
-        aria-label={t('actions.settings')}
-        title={t('actions.settings')}
-      >
-        <Settings className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
-      </button>
+        <SidebarDesktopUpdate collapsed onExpand={onExpand} />
 
-      {/* Report Issue */}
-      <a
-        href={GITHUB_ISSUES_URL}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
-        aria-label={t('actions.reportIssue')}
-        title={t('actions.reportIssue')}
-      >
-        <Bug className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
-      </a>
+        {/* Settings */}
+        <button
+          onClick={onShowSettings}
+          className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
+          aria-label={t('actions.settings')}
+          title={t('actions.settings')}
+        >
+          <Settings className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
+        </button>
 
-      {/* Discord */}
-      <a
-        href={DISCORD_INVITE_URL}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
-        aria-label={t('actions.joinCommunity')}
-        title={t('actions.joinCommunity')}
-      >
-        <DiscordIcon className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
-      </a>
+        {/* Report Issue */}
+        <a
+          href={GITHUB_ISSUES_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
+          aria-label={t('actions.reportIssue')}
+          title={t('actions.reportIssue')}
+        >
+          <Bug className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
+        </a>
+
+        {/* Discord */}
+        <a
+          href={DISCORD_INVITE_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="group flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-accent/80"
+          aria-label={t('actions.joinCommunity')}
+          title={t('actions.joinCommunity')}
+        >
+          <DiscordIcon className="h-4 w-4 text-muted-foreground transition-colors group-hover:text-foreground" />
+        </a>
+      </div>
 
     </div>
   );

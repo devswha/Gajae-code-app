@@ -37,6 +37,11 @@ export function useWorkspacePanel({ isMobile }: UseWorkspacePanelOptions) {
   const [expanded, setExpanded] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const [containerElement, setContainerElement] = useState<HTMLDivElement | null>(null);
+  const attachContainer = useCallback((element: HTMLDivElement | null) => {
+    containerRef.current = element;
+    setContainerElement(element);
+  }, []);
   const resizeHandleRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -83,6 +88,24 @@ export function useWorkspacePanel({ isMobile }: UseWorkspacePanelOptions) {
     event.preventDefault();
     setIsResizing(true);
   }, [expanded, isMobile]);
+
+  // Saved widths must also fit a smaller window or the space left by the sidebar.
+  useEffect(() => {
+    const container = containerElement;
+    if (!container || isMobile || !state.open) return undefined;
+    const syncWidth = () => {
+      const bounds = container.getBoundingClientRect();
+      if (bounds.width <= 0) return;
+      setState((previous) => {
+        const width = clampWorkspacePanelWidth(previous.width, bounds.width);
+        return width === previous.width ? previous : { ...previous, width };
+      });
+    };
+    syncWidth();
+    const observer = new ResizeObserver(syncWidth);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [containerElement, isMobile, state.open]);
 
   const handleResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (isMobile || expanded) {
@@ -135,7 +158,7 @@ export function useWorkspacePanel({ isMobile }: UseWorkspacePanelOptions) {
     width: isMobile ? DEFAULT_WORKSPACE_PANEL_STATE.width : state.width,
     expanded: expanded && !isMobile,
     isResizing,
-    containerRef,
+    containerRef: attachContainer,
     resizeHandleRef,
     openPanel,
     closePanel,

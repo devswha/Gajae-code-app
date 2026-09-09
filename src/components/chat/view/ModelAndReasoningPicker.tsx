@@ -340,26 +340,26 @@ export default function ModelAndReasoningPicker({
   };
 
   return (
-    <div ref={rootRef} className="relative w-40 max-w-full shrink-0 sm:w-56">
+    <div ref={rootRef} className="relative w-fit max-w-full shrink-0 sm:max-w-56">
       <button
         ref={triggerRef}
         type="button"
         onClick={() => setOpen((current) => !current)}
         disabled={loading || selecting || groups.length === 0}
-        className="flex h-8 w-full min-w-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+        className="flex h-8 w-fit max-w-full min-w-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
         aria-label={t('input.modelReasoning.label')}
         aria-busy={loading || selecting}
         aria-expanded={open}
         title={`${displayModel ?? t('input.modelReasoning.defaultModel')} · ${reasoningLabel}`}
       >
         {(loading || selecting) && <Loader2 className="size-3 shrink-0 animate-spin" aria-hidden />}
-        <span className="min-w-0 flex-1 truncate text-left">
+        <span className="min-w-0 truncate text-left">
           {loading && !displayModelLabel ? (
-            <span className="block h-3 w-full max-w-24 rounded bg-muted" aria-hidden />
+            <span className="block h-3 w-24 rounded bg-muted" aria-hidden />
           ) : displayModelLabel ?? t('input.modelReasoning.defaultModel')}
         </span>
         <span className="shrink-0 text-border" aria-hidden>·</span>
-        <span className="shrink-0">{reasoningLabel}</span>
+        <span className="shrink-0 whitespace-nowrap">{reasoningLabel}</span>
         <ChevronDown className={cn('size-3 shrink-0 transition-transform', open && 'rotate-180')} aria-hidden />
       </button>
 

@@ -40,6 +40,11 @@ test('a container too narrow to honor the ratio still yields the minimum width',
   assert.equal(clampWorkspacePanelWidth(500, 200), MIN_WORKSPACE_PANEL_WIDTH);
 });
 
+test('a narrow desktop row preserves the chat minimum instead of clipping the right edge', () => {
+  assert.equal(clampWorkspacePanelWidth(900, 768), 568);
+  assert.equal(clampWorkspacePanelWidth(900, 488), 288);
+});
+
 test('a non-finite width falls back to the default rather than styling NaN', () => {
   assert.equal(clampWorkspacePanelWidth(Number.NaN), DEFAULT_WORKSPACE_PANEL_WIDTH);
 });
@@ -55,15 +60,15 @@ test('only the declared tabs are accepted', () => {
 test('a tab retired with its panel degrades to the default instead of sticking', () => {
   assert.equal(normalizeWorkspaceTab('files'), null);
   assert.equal(normalizeWorkspaceTab('editor'), null);
+  assert.equal(normalizeWorkspaceTab('tasks'), null);
 });
 
 test('tablist keys move across tabs and wrap in both directions', () => {
   assert.equal(workspaceTabForKey('status', 'ArrowRight'), 'changes');
-  assert.equal(workspaceTabForKey('changes', 'ArrowRight'), 'tasks');
-  assert.equal(workspaceTabForKey('tasks', 'ArrowRight'), 'browser');
+  assert.equal(workspaceTabForKey('changes', 'ArrowRight'), 'browser');
   assert.equal(workspaceTabForKey('browser', 'ArrowRight'), 'status');
   assert.equal(workspaceTabForKey('status', 'ArrowLeft'), 'browser');
-  assert.equal(workspaceTabForKey('browser', 'ArrowLeft'), 'tasks');
+  assert.equal(workspaceTabForKey('browser', 'ArrowLeft'), 'changes');
   assert.equal(workspaceTabForKey('browser', 'Home'), 'status');
   assert.equal(workspaceTabForKey('status', 'End'), 'browser');
 });
@@ -99,6 +104,16 @@ test('a state persisted against a retired tab reopens on the default tab', () =>
     tab: DEFAULT_WORKSPACE_PANEL_STATE.tab,
     width: 420,
   });
+});
+
+test('the retired Tasks tab moves out of the rail without losing the saved width', () => {
+  const storage = createStorage({
+    [WORKSPACE_PANEL_STORAGE_KEY]: JSON.stringify({ open: true, tab: 'tasks', width: 420 }),
+  });
+  const state = readWorkspacePanelState(storage);
+  assert.deepEqual(state, { open: false, tab: 'status', width: 420 });
+  writeWorkspacePanelState(storage, state);
+  assert.deepEqual(readWorkspacePanelState(storage), state);
 });
 
 test('a corrupt or foreign payload degrades to the default instead of rendering garbage', () => {

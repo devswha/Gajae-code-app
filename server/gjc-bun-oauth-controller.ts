@@ -51,6 +51,16 @@ export type GjcBunOAuthControllerOptions = {
   timeoutMs?: number;
 };
 
+/** Actual task ownership, not the last phase shown by the login dialog. */
+export type GjcOAuthActivitySnapshot = Readonly<{
+  generation: string;
+  revision: number;
+  starting: number;
+  running: number;
+  settling: number;
+  approvals: number;
+}>;
+
 type PendingInput = {
   resolve(value: string): void;
   reject(reason: Error): void;
@@ -60,6 +70,7 @@ type AttemptState = GjcOAuthAttempt & {
   abortController: AbortController;
   input?: PendingInput;
   timeout: ReturnType<typeof setTimeout>;
+  taskStarted: boolean;
 };
 
 const terminalPhases = new Set<GjcOAuthAttemptPhase>(['completed', 'cancelled', 'timed_out', 'failed']);
@@ -91,6 +102,12 @@ function isPasswordPrompt(prompt: { message: string; placeholder?: string }): bo
 export class GjcBunOAuthController {
   readonly #listeners = new Set<(event: GjcOAuthEvent) => void>();
   readonly #timeoutMs: number;
+  readonly #generation = randomUUID();
+  #revision = 0;
+  // A cancelled attempt may still be persisting credentials or refreshing
+  // models while a new attempt owns the dialog. Never transfer these tasks
+  // to #lastAttempt or release them on abort/timeout/close notification.
+  readonly #tasks = new Set<AttemptState>();
   #active: AttemptState | undefined;
   #lastAttempt: AttemptState | undefined;
 
@@ -107,6 +124,25 @@ export class GjcBunOAuthController {
 
   providers(): { providers: GjcOAuthProviderDescriptor[] } {
     return { providers: this.#providerDescriptors() };
+  }
+
+  getGeneration(): string {
+    return `${this.#generation}:${this.#revision}`;
+  }
+
+  /** Pure in-memory read: no auth snapshot, tokens, URLs, inputs or task IDs. */
+  snapshotActivity(): GjcOAuthActivitySnapshot {
+    let starting = 0;
+    let running = 0;
+    let settling = 0;
+    let approvals = 0;
+    for (const attempt of this.#tasks) {
+      if (!this.#isActive(attempt)) settling += 1;
+      else if (!attempt.taskStarted) starting += 1;
+      else running += 1;
+      if (attempt.input) approvals += 1;
+    }
+    return { generation: this.getGeneration(), revision: this.#revision, starting, running, settling, approvals };
   }
 
   status(): { providers: GjcOAuthProviderDescriptor[]; attempt?: GjcOAuthAttempt } {
@@ -130,10 +166,13 @@ export class GjcBunOAuthController {
       expiresAt: Date.now() + this.#timeoutMs,
       abortController: new AbortController(),
       timeout: undefined as unknown as ReturnType<typeof setTimeout>,
+      taskStarted: false,
     };
     attempt.timeout = setTimeout(() => this.#timeout(attempt), this.#timeoutMs);
     this.#active = attempt;
     this.#lastAttempt = attempt;
+    this.#tasks.add(attempt);
+    this.#revision += 1;
     this.#emitPhase(attempt);
     void Promise.resolve().then(() => this.#run(attempt));
     return this.#snapshot(attempt);
@@ -147,6 +186,7 @@ export class GjcBunOAuthController {
     if (!input) error('oauth_input_not_requested');
 
     attempt.input = undefined;
+    this.#revision += 1;
     try {
       input.resolve(value);
     } finally {
@@ -210,7 +250,10 @@ export class GjcBunOAuthController {
   }
 
   #emit(event: GjcOAuthEvent): void {
-    for (const listener of this.#listeners) listener(event);
+    for (const listener of this.#listeners) {
+      try { listener(event); }
+      catch { /* A UI observer cannot abandon the underlying login owner. */ }
+    }
   }
 
   #emitPhase(attempt: AttemptState): void {
@@ -223,24 +266,28 @@ export class GjcBunOAuthController {
     delete attempt.valueKind;
     delete attempt.password;
     Object.assign(attempt, fields);
+    this.#revision += 1;
     this.#emitPhase(attempt);
   }
 
   #requestInput(attempt: AttemptState, valueKind: GjcOAuthInputValueKind, password?: true): Promise<string> {
     if (!this.#isActive(attempt)) return Promise.reject(new GjcOAuthControllerError('oauth_attempt_not_active'));
-    this.#transition(attempt, 'awaiting_input', { valueKind, ...(password ? { password } : {}) });
     return new Promise((resolve, reject) => {
       attempt.input = { resolve, reject };
+      // Register before notifying: a synchronous subscriber may submit/cancel.
+      this.#transition(attempt, 'awaiting_input', { valueKind, ...(password ? { password } : {}) });
     });
   }
 
   #terminate(attempt: AttemptState, phase: Extract<GjcOAuthAttemptPhase, 'cancelled' | 'timed_out'>): void {
     if (!this.#isActive(attempt)) return;
     this.#active = undefined;
+    this.#revision += 1;
     clearTimeout(attempt.timeout);
     attempt.abortController.abort();
     const input = attempt.input;
     attempt.input = undefined;
+    if (input) this.#revision += 1;
     input?.reject(new GjcOAuthControllerError(phase === 'timed_out' ? 'oauth_timed_out' : 'oauth_cancelled'));
     this.#transition(attempt, phase, { errorCode: phase === 'timed_out' ? 'oauth_timed_out' : 'oauth_cancelled' });
   }
@@ -250,6 +297,28 @@ export class GjcBunOAuthController {
   }
 
   async #run(attempt: AttemptState): Promise<void> {
+    try {
+      // A same-stack cancellation must not start a new login in a microtask.
+      if (!this.#isActive(attempt)) return;
+      attempt.taskStarted = true;
+      this.#revision += 1;
+      await this.#runAttempt(attempt);
+    } catch {
+      if (this.#isActive(attempt)) {
+        this.#active = undefined;
+        this.#revision += 1;
+        clearTimeout(attempt.timeout);
+        this.#transition(attempt, 'failed', { errorCode: 'oauth_login_failed' });
+      }
+    } finally {
+      // Only the underlying login/refresh chain reaching settlement releases
+      // this task. Neither #terminate nor close is a completion proof.
+      this.#tasks.delete(attempt);
+      this.#revision += 1;
+    }
+  }
+
+  async #runAttempt(attempt: AttemptState): Promise<void> {
     try {
       await this.authStorage.login(attempt.providerId, {
         onAuth: (info: OAuthAuthInfo) => {
@@ -275,6 +344,7 @@ export class GjcBunOAuthController {
       if (!this.#isActive(attempt)) return;
       clearTimeout(attempt.timeout);
       this.#active = undefined;
+      this.#revision += 1;
       // The runtime's callback listener rejects a callback whose `state` is
       // not this attempt's: the browser finished a link from an earlier
       // attempt (a retry issues a new one). Named so the dialog can say
@@ -288,6 +358,7 @@ export class GjcBunOAuthController {
 
     if (!this.#isActive(attempt)) return;
     this.#transition(attempt, 'refreshing');
+    if (!this.#isActive(attempt)) return;
 
     let refreshFailed = false;
     try {
@@ -300,9 +371,12 @@ export class GjcBunOAuthController {
     const providers = this.#providerDescriptors();
     const provider = providers.find((candidate) => candidate.id === attempt.providerId);
     if (provider) this.#emit({ method: 'provider.auth.updated', payload: provider });
+    if (!this.#isActive(attempt)) return;
     this.#emit({ method: 'oauth.providers.updated', payload: { providers } });
+    if (!this.#isActive(attempt)) return;
     clearTimeout(attempt.timeout);
     this.#active = undefined;
+    this.#revision += 1;
     this.#transition(
       attempt,
       refreshFailed ? 'failed' : 'completed',

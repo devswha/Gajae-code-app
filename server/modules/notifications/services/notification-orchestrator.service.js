@@ -1,5 +1,6 @@
 import { notificationPreferencesDb, sessionsDb } from '@/modules/database/index.js';
-import { sendDesktopNotification } from '@/modules/notifications/services/desktop-notification-clients.service.js';
+import { sendDesktopNotificationAndWait } from '@/modules/notifications/services/desktop-notification-clients.service.js';
+import { enterNotificationActivity } from '@/modules/notifications/services/desktop-update-activity.service.js';
 
 const eventPreferences = new Map([
   ['action_required', 'actionRequired'],
@@ -105,14 +106,20 @@ function reportDesktopFailure(error) {
 
 function notifyUserIfEnabled({ userId, event }) {
   if (!userId || !event) return;
+  const release = enterNotificationActivity();
+  let pending;
+  try {
+    const current = canonicalSession(event);
+    const preferences = notificationPreferencesDb.getPreferences(userId);
+    if (!eventIsAllowed(preferences, current) || wasDelivered(current)) return;
+    if (!preferences?.channels?.desktop) return;
 
-  const current = canonicalSession(event);
-  const preferences = notificationPreferencesDb.getPreferences(userId);
-  if (!eventIsAllowed(preferences, current) || wasDelivered(current)) return;
-  if (!preferences?.channels?.desktop) return;
-
-  const payload = buildNotificationPayload(current);
-  Promise.resolve(sendDesktopNotification(userId, payload)).catch(reportDesktopFailure);
+    const payload = buildNotificationPayload(current);
+    pending = Promise.resolve(sendDesktopNotificationAndWait(userId, payload)).catch(reportDesktopFailure).finally(release);
+    return pending;
+  } finally {
+    if (!pending) release();
+  }
 }
 
 function errorText(error) {
@@ -122,7 +129,7 @@ function errorText(error) {
 }
 
 function notifyRunStopped({ userId, provider, sessionId = null, stopReason = 'completed', sessionName = null }) {
-  notifyUserIfEnabled({
+  return notifyUserIfEnabled({
     userId,
     event: createNotificationEvent({
       provider, sessionId, kind: 'stop', code: 'run.stopped', meta: { stopReason, sessionName }, severity: 'info',
@@ -133,7 +140,7 @@ function notifyRunStopped({ userId, provider, sessionId = null, stopReason = 'co
 
 function notifyRunFailed({ userId, provider, sessionId = null, error, sessionName = null }) {
   const message = errorText(error);
-  notifyUserIfEnabled({
+  return notifyUserIfEnabled({
     userId,
     event: createNotificationEvent({
       provider, sessionId, kind: 'error', code: 'run.failed', meta: { error: message, sessionName }, severity: 'error',

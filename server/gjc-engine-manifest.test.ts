@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -31,13 +32,19 @@ for (const [group, entries] of Object.entries(manifest)) {
   }
 }
 
-const tracked = execFileSync('git', ['ls-files', 'server/gjc-*'], { cwd: REPOSITORY_ROOT, encoding: 'utf8' })
-  .trim()
-  .split('\n')
-  .filter(Boolean);
+function inventoryEngineFiles(repositoryRoot: string): string[] {
+  // Verify authored files before git add, but keep ignored build/runtime output
+  // out and retain the same server/gjc-* namespace as the extraction manifest.
+  const files = execFileSync('git', [
+    'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', 'server/gjc-*',
+  ], { cwd: repositoryRoot, encoding: 'utf8' });
+  return [...new Set(files.split('\0').filter(Boolean))].sort();
+}
+
+const inventory = inventoryEngineFiles(REPOSITORY_ROOT);
 
 test('every file in the engine namespace has a recorded side', () => {
-  const undeclared = tracked.filter((file) => !declared.has(file));
+  const undeclared = inventory.filter((file) => !declared.has(file));
   assert.deepEqual(
     undeclared,
     [],
@@ -48,8 +55,8 @@ test('every file in the engine namespace has a recorded side', () => {
 });
 
 test('the manifest describes no file that does not exist', () => {
-  const trackedSet = new Set(tracked);
-  const missing = [...declared.keys()].filter((file) => !trackedSet.has(file));
+  const inventorySet = new Set(inventory);
+  const missing = [...declared.keys()].filter((file) => !inventorySet.has(file));
   assert.deepEqual(
     missing,
     [],
@@ -92,4 +99,61 @@ test('nothing declared as engine imports the application', () => {
       + 'The engine cannot take that import with it.',
     );
   }
+});
+
+test('engine inventory includes untracked nonignored files without widening its namespace', (t) => {
+  const repositoryRoot = mkdtempSync(join(tmpdir(), 'gjc-engine-inventory-'));
+  t.after(() => rmSync(repositoryRoot, { recursive: true, force: true }));
+  const git = (args: string[]) => execFileSync('git', args, { cwd: repositoryRoot, encoding: 'utf8' });
+  git(['init', '-q']);
+  // Keep the fixture independent of the developer's global ignore patterns.
+  git(['config', 'core.excludesFile', '']);
+
+  const trackedFiles = [
+    'server/gjc-tracked.ts',
+    'server/gjc-tracked.log',
+    'server/gjc-existing/tracked.ts',
+  ];
+  const untrackedFiles = [
+    'server/gjc-bun-oauth-controller.bun.test.ts',
+    'server/gjc-new.ts',
+    'server/gjc-existing/new.ts',
+    'server/gjc-new-directory/nested.ts',
+    'server/gjc-space name.ts',
+    'server/gjc-한글.ts',
+  ];
+  const excludedFiles = [
+    'server/gjc-ignored.log',
+    'server/gjc-existing/ignored.log',
+    'server/gjc-ignored-directory/generated.ts',
+    'server/gjc-local-only.ts',
+    'server/other.ts',
+    'server/gjclient.ts',
+    'server/modules/providers/gjc-app.ts',
+    'src/gjc-ui.ts',
+    'scripts/gjc-helper.ts',
+    'other/server/gjc-lookalike.ts',
+  ];
+  for (const file of [...trackedFiles, ...untrackedFiles, ...excludedFiles]) {
+    const path = join(repositoryRoot, file);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '// inventory fixture\n');
+  }
+  git(['add', '--', ...trackedFiles]);
+  // Existing tracked files must remain visible even when a later ignore rule
+  // matches them; only untracked files are subject to standard Git exclusions.
+  writeFileSync(join(repositoryRoot, '.gitignore'), '*.log\n/server/gjc-ignored-directory/\n');
+  writeFileSync(join(repositoryRoot, '.git/info/exclude'), '/server/gjc-local-only.ts\n');
+
+  const beforeStaging = inventoryEngineFiles(repositoryRoot);
+  assert.deepEqual(beforeStaging, [...trackedFiles, ...untrackedFiles].sort());
+  const recordedFiles = new Set(trackedFiles);
+  assert.deepEqual(
+    beforeStaging.filter((file) => !recordedFiles.has(file)),
+    [...untrackedFiles].sort(),
+    'new engine files must require a classification before git add',
+  );
+
+  git(['add', '--', ...untrackedFiles]);
+  assert.deepEqual(inventoryEngineFiles(repositoryRoot), beforeStaging, 'staging must not change the inventory');
 });

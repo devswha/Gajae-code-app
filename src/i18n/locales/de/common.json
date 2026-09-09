@@ -116,7 +116,13 @@
     "tasks": {
       "empty": "Noch nichts geplant",
       "emptyHint": "Wenn der Agent in dieser Sitzung eine Aufgabenliste führt, erscheint sie hier.",
-      "progress": "{{done}} von {{total}} erledigt"
+      "progress": "{{done}} von {{total}} erledigt",
+      "status": {
+        "pending": "Ausstehend",
+        "in_progress": "In Bearbeitung",
+        "completed": "Abgeschlossen",
+        "abandoned": "Verworfen"
+      }
     },
     "browser": {
       "address": "Webadresse",

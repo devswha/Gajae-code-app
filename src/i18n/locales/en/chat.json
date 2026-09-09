@@ -64,13 +64,6 @@
     "stopSpeaking": "Stop",
     "loading": "Loading…"
   },
-  "sessionWorktree": {
-    "label": "Run location",
-    "project": "Project",
-    "newWorktree": "New worktree",
-    "worktree": "Worktree",
-    "preparing": "Preparing worktree"
-  },
   "input": {
     "placeholder": "Ask {{provider}}, use / for commands, or @ to add files…",
     "modelReasoning": {
@@ -101,6 +94,8 @@
     },
     "scrollToBottom": "Jump to latest",
     "queue": {
+      "reviewBeforeSending": "Edit and review before sending",
+      "recoveryNotice": "Recovered queued messages are paused to avoid duplicate sending. Use Edit on a queued message, review its text and attachments, then Send. Your current draft is kept when you edit a queued message.",
       "sendNext": "Queue another message",
       "label": "Queued",
       "willSend": "Sends when the current run finishes",
@@ -113,6 +108,14 @@
       "images_one": "{{count}} image added",
       "images_other": "{{count}} images added",
       "steerNow": "Steer the active turn"
+    },
+    "draftPersistence": {
+      "failed": "Draft saving failed. Keep this window open.",
+      "retry": "Retry draft saving",
+      "failedInline": "Draft and attachment saving failed ({{reason}}). Your live input is still here. Use Retry draft saving. Keep this window open; do not restart until saving succeeds.",
+      "recoveredRetry": "Draft saving recovered. Review your input and attachments, then press Send again.",
+      "recoveryStillFailed": "Draft recovery still failed. Your live input and existing stored data have been kept.",
+      "recoveryNotReady": "Draft recovery is not ready. Your input has been kept; retry after recovery completes."
     },
     "skills": {
       "label": "Choose a skill",

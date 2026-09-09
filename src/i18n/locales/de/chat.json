@@ -64,13 +64,6 @@
     "stopSpeaking": "Stopp",
     "loading": "Laden…"
   },
-  "sessionWorktree": {
-    "label": "Ausführungsort",
-    "project": "Projekt",
-    "newWorktree": "Neuer Worktree",
-    "worktree": "Worktree",
-    "preparing": "Worktree wird vorbereitet"
-  },
   "input": {
     "placeholder": "Fragen Sie {{provider}}, verwenden Sie / für Befehle oder @, um Dateien hinzuzufügen ...",
     "modelReasoning": {
@@ -101,6 +94,8 @@
     },
     "scrollToBottom": "Zum Neuesten springen",
     "queue": {
+      "reviewBeforeSending": "Vor dem Senden bearbeiten und prüfen",
+      "recoveryNotice": "Wiederhergestellte Nachrichten warten auf Ihre Prüfung, um doppeltes Senden zu vermeiden. Bearbeiten Sie die Nachricht, prüfen Sie Text und Anhänge und senden Sie sie dann. Ihr aktueller Entwurf bleibt erhalten.",
       "sendNext": "Eine weitere Nachricht in die Warteschlange stellen",
       "label": "In der Warteschlange",
       "willSend": "Wird gesendet, wenn der aktuelle Lauf beendet ist",
@@ -113,6 +108,14 @@
       "images_one": "{{count}}-Bild hinzugefügt",
       "images_other": "{{count}}-Bilder hinzugefügt",
       "steerNow": "Steuern Sie den aktuellen Durchlauf"
+    },
+    "draftPersistence": {
+      "failed": "Der Entwurf konnte nicht gespeichert werden. Lassen Sie dieses Fenster geöffnet.",
+      "retry": "Entwurf erneut speichern",
+      "failedInline": "Entwurf und Anhänge konnten nicht gespeichert werden ({{reason}}). Ihre Eingabe bleibt erhalten. Speichern Sie den Entwurf erneut. Schließen Sie das Fenster nicht und starten Sie die App erst nach erfolgreichem Speichern neu.",
+      "recoveredRetry": "Der Entwurf wurde gespeichert. Prüfen Sie Eingabe und Anhänge und drücken Sie erneut Senden.",
+      "recoveryStillFailed": "Die Wiederherstellung ist fehlgeschlagen. Ihre Eingabe und die gespeicherten Daten bleiben erhalten.",
+      "recoveryNotReady": "Der Entwurf wird noch wiederhergestellt. Ihre Eingabe bleibt erhalten. Versuchen Sie es danach erneut."
     },
     "skills": {
       "label": "Skill auswählen",

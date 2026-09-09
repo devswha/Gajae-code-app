@@ -85,6 +85,9 @@ test('getTuiOnlyCommandNotice covers /retry and skips app/unknown commands', () 
 });
 
 function captureComposer(sentMessages: unknown[], addedMessages: unknown[]) {
+  // Each command case starts with its own empty draft; pending confirmations
+  // now deliberately survive instead of clearing the previous case's text.
+  storage.clear();
   let composer: ReturnType<typeof useChatComposerState> | undefined;
 
   function Capture() {

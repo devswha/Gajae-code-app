@@ -13,6 +13,17 @@ const DEFAULT_LIST_BUDGET: u64 = 48 * 1024;
 const DEFAULT_CAPACITY: u64 = 4;
 
 const MAX_RECONCILE_JOB_IDS: usize = 100;
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JobActivity {
+    schema_version: u8,
+    reserved: u64,
+    queued: u64,
+    running: u64,
+    aborting: u64,
+    unknown: u64,
+}
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
@@ -221,6 +232,32 @@ fn map_authority_lock_error(error: rusqlite::Error) -> AuthorityError {
 }
 
 impl PersistentAuthority {
+    /// One read-only aggregate over ALL durable ownership, including archived
+    /// jobs and orphan nonterminal runs. No pagination, reconciliation or writes.
+    fn activity(&self) -> Result<JobActivity, AuthorityError> {
+        let mut statement = self.connection.prepare(
+            "SELECT state,COUNT(*) FROM (SELECT state FROM jobs UNION ALL SELECT state FROM runs) GROUP BY state",
+        ).map_err(|_| AuthorityError::Storage)?;
+        let mut rows = statement.query([]).map_err(|_| AuthorityError::Storage)?;
+        let mut result = JobActivity {
+            schema_version: 1,
+            ..JobActivity::default()
+        };
+        while let Some(row) = rows.next().map_err(|_| AuthorityError::Storage)? {
+            let state: String = row.get(0).map_err(|_| AuthorityError::Storage)?;
+            let count: u64 = row.get(1).map_err(|_| AuthorityError::Storage)?;
+            match state.as_str() {
+                "reserved" => result.reserved += count,
+                "queued" => result.queued += count,
+                "running" => result.running += count,
+                "aborting" => result.aborting += count,
+                "ready" | "succeeded" | "failed" | "aborted" | "interrupted" => {}
+                _ => result.unknown += count,
+            }
+        }
+        Ok(result)
+    }
+
     fn open(path: &Path) -> Result<Self, AuthorityError> {
         let path = validate_database_path(path)?;
         let lock = AuthorityLock::acquire(&path)?;
@@ -1644,6 +1681,7 @@ fn dispatch(
             .ok_or(AuthorityError::InvalidIdentifier)
     };
     let value = match request.method.as_str() {
+        "job.activity" => serde_json::to_value(authority.activity()?),
         "job.get" => serde_json::to_value(authority.snapshot(id()?)?),
         "lease.acquire" => serde_json::to_value(
             authority.acquire(
@@ -1934,6 +1972,60 @@ fn error_code(error: AuthorityError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_is_complete_read_only_and_includes_archived_jobs_and_nonterminal_runs() {
+        let (directory, database) = db();
+        let authority = PersistentAuthority::open(&database).unwrap();
+        for index in 0..151 {
+            authority.connection.execute(
+                "INSERT INTO jobs(id,provider,state,archived_at) VALUES(?1,'gjc','queued','2026-01-01')",
+                [format!("archived-{index}")],
+            ).unwrap();
+        }
+        authority
+            .connection
+            .execute(
+                "INSERT INTO jobs(id,provider,state) VALUES('ready','gjc','ready')",
+                [],
+            )
+            .unwrap();
+        authority
+            .connection
+            .execute(
+                "INSERT INTO runs(run_id,job_id,state) VALUES('unfinished','ready','running')",
+                [],
+            )
+            .unwrap();
+        authority
+            .connection
+            .execute(
+                "INSERT INTO jobs(id,provider,state) VALUES('unknown','gjc','not-a-state')",
+                [],
+            )
+            .unwrap();
+        let before = authority.connection.total_changes();
+        let observed = authority.activity().unwrap();
+        assert_eq!(
+            observed,
+            JobActivity {
+                schema_version: 1,
+                reserved: 0,
+                queued: 151,
+                running: 1,
+                aborting: 0,
+                unknown: 1
+            }
+        );
+        assert_eq!(authority.activity().unwrap(), observed);
+        assert_eq!(
+            authority.connection.total_changes(),
+            before,
+            "observation must not reconcile or mutate"
+        );
+        drop(authority);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};

@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
 
-import { GjcJobsClient, GjcJobsClientError, GjcJobsEventTooLargeError } from './gjc-jobs-client.js';
-import type { GjcNativeSpawn } from './gjc-git-client.js';
+import { GjcJobsClient, GjcJobsClientError, GjcJobsEventTooLargeError, createNativeJobsDesktopRestartReader } from './gjc-jobs-client.js';
+import { NativeActivityGroup, type GjcNativeSpawn } from './gjc-git-client.js';
 
 class FakeChild extends EventEmitter {
   readonly stdout = new EventEmitter();
@@ -14,6 +14,36 @@ class FakeChild extends EventEmitter {
 }
 function fake(children: FakeChild[]): GjcNativeSpawn { return ((_command, _args, _options) => { const child = new FakeChild(); children.push(child); return child; }) as GjcNativeSpawn; }
 const idAt = (child: FakeChild, position: number) => JSON.parse(child.stdin.writes[position]!).id as string;
+
+test('native jobs activity never starts a process and does not invalidate its own generation', async () => {
+  const children: FakeChild[] = []; const group = new NativeActivityGroup();
+  const client = new GjcJobsClient({ database: '/fixture.sqlite', spawn: fake(children), activityGroup: group });
+  const reader = createNativeJobsDesktopRestartReader(client);
+  await assert.rejects(reader.read()); assert.equal(children.length, 0);
+  const started = client.start(); const child = children[0]!;
+  child.frame({ protocolVersion: 1, id: idAt(child, 0), ok: true, result: [] }); await started;
+  const generation = reader.getGeneration(); const observed = reader.read();
+  assert.equal(JSON.parse(child.stdin.writes.at(-1)!).method, 'job.activity');
+  assert.equal(group.read().running, 0, 'readonly status is not new work');
+  child.frame({ protocolVersion: 1, id: idAt(child, 1), ok: true, result: { schemaVersion: 1, reserved: 0, queued: 2, running: 1, aborting: 0, unknown: 0 } });
+  const result = await observed;
+  assert.equal(result.generation, generation); assert.equal(reader.getGeneration(), generation);
+  assert.equal(result.queued, 2); assert.equal(result.running, 1); assert.equal(result.complete, true);
+  client.close(); child.emit('close'); assert.equal(group.read().settling, 0);
+});
+
+test('native observation rejects malformed and unknown state without certifying idle', async () => {
+  const children: FakeChild[] = []; const client = new GjcJobsClient({ database: '/fixture.sqlite', spawn: fake(children), activityGroup: new NativeActivityGroup() });
+  const starting = client.start(); const child = children[0]!;
+  child.frame({ protocolVersion: 1, id: idAt(child, 0), ok: true, result: [] }); await starting;
+  const bad = client.snapshotDesktopActivity();
+  child.frame({ protocolVersion: 1, id: idAt(child, 1), ok: true, result: { schemaVersion: 1, reserved: -1, queued: 0, running: 0, aborting: 0, unknown: 0 } });
+  await assert.rejects(bad);
+  const uncertain = client.snapshotDesktopActivity();
+  child.frame({ protocolVersion: 1, id: idAt(child, 2), ok: true, result: { schemaVersion: 1, reserved: 0, queued: 0, running: 0, aborting: 0, unknown: 1 } });
+  assert.equal((await uncertain).complete, false);
+  client.close(); child.emit('close');
+});
 
 test('jobs proves readiness through job.list probe and dispatches wrappers', async () => {
   const children: FakeChild[] = []; const client = new GjcJobsClient({ database: '/jobs.sqlite', spawn: fake(children) });

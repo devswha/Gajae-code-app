@@ -1,5 +1,13 @@
 import type * as ProviderContract from '@/shared/types.js';
 
+/** Server-owned admission only; never accept this capability from a request. */
+export interface DesktopWorkAdmission {
+  /** Acquire before dispatch; release after settlement or proven owner transfer. */
+  enter(source: string): () => void;
+  /** Already-owned completion may invalidate preparation, never committed shutdown. */
+  enterCompletion(source: string): () => void;
+}
+
 type ProviderId = ProviderContract.LLMProvider;
 type ActiveModel = ProviderContract.ProviderCurrentActiveModel;
 type ActiveModelChange = ProviderContract.ProviderSessionActiveModelChange;

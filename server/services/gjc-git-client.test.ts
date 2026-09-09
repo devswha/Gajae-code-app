@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
 
-import { GjcGitClient, type GjcNativeSpawn } from './gjc-git-client.js';
+import { GjcGitClient, NativeActivityGroup, type GjcNativeSpawn } from './gjc-git-client.js';
 
 class FakeChild extends EventEmitter {
   readonly stdout = new EventEmitter();
@@ -30,6 +30,35 @@ async function ready(client: GjcGitClient, children: FakeChild[]): Promise<FakeC
   await pending;
   return child;
 }
+
+test('native ownership spans startup, request settlement and confirmed close without forced idle', async () => {
+  const group = new NativeActivityGroup(); const children: FakeChild[] = [];
+  const client = new GjcGitClient({ workdir: '/fixture', spawn: spawn(children), activityGroup: group });
+  const initial = group.getGeneration();
+  const starting = client.start();
+  assert.equal(group.read().starting, 1);
+  assert.notEqual(group.getGeneration(), initial);
+  const child = children[0]!; child.emitFrame({ protocolVersion: 1, kind: 'ready' }); await starting;
+  assert.equal(group.read().running, 0);
+  const operation = client.status(); await tick();
+  assert.ok(group.read().running > 0);
+  child.emitFrame({ protocolVersion: 1, kind: 'response', id: requestId(child), ok: true, result: {} });
+  assert.ok(group.read().running > 0, 'response is not settlement of the awaiting continuation');
+  await operation; assert.equal(group.read().running, 0);
+  client.close(); assert.equal(group.read().settling, 1);
+  child.emit('close'); assert.equal(group.read().settling, 0);
+  assert.equal(group.read().complete, true);
+});
+
+test('failed Git work remains uncertain after losing and closing its leader', async () => {
+  const group = new NativeActivityGroup(); const children: FakeChild[] = [];
+  const client = new GjcGitClient({ workdir: '/fixture', spawn: spawn(children), activityGroup: group });
+  const child = await ready(client, children);
+  const operation = client.create({}); await tick(); child.emit('exit', 1);
+  await assert.rejects(operation); client.close(); child.emit('close');
+  assert.equal(group.read().complete, false);
+  assert.deepEqual(group.read().unknown, ['native_work_termination_unconfirmed']);
+});
 
 test('git assembles staged list items and multi-chunk diff responses', async () => {
   const children: FakeChild[] = []; const client = new GjcGitClient({ workdir: '/repo', spawn: spawn(children) });

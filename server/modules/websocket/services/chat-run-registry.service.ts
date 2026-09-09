@@ -8,6 +8,8 @@ import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/we
 import { generateMessageId } from '@/shared/utils.js';
 import type { LLMProvider, NormalizedMessage, RealtimeClientConnection } from '@/shared/types.js';
 
+import type { DesktopOwnerActivity } from '../../../../shared/desktopUpdateProtocol.js';
+
 type ChatRunStatus = 'running' | 'completed';
 type ChatRun = {
   appSessionId: string; provider: LLMProvider; providerSessionId: string | null;
@@ -33,10 +35,17 @@ type StartRunInput = {
 const completedRunLifetime = 5 * 60 * 1000;
 const eventBufferLimit = 5000;
 const runsByAppSession = new Map<string, ChatRun>();
+const activityEpoch = randomUUID();
+let activityRevision = 0n;
+let pendingPublications = 0;
+const getGeneration = (): string => `${activityEpoch}:${activityRevision}`;
 
 function scheduleCompletedRunRemoval(run: ChatRun): void {
   const timer = setTimeout(() => {
-    if (runsByAppSession.get(run.appSessionId) === run && run.status === 'completed') runsByAppSession.delete(run.appSessionId);
+    if (runsByAppSession.get(run.appSessionId) === run && run.status === 'completed') {
+      runsByAppSession.delete(run.appSessionId);
+      activityRevision += 1n;
+    }
   }, completedRunLifetime);
   void timer.unref?.();
 }
@@ -46,6 +55,7 @@ function decorateRunEvent(run: ChatRun, event: NormalizedMessage): NormalizedMes
   if (run.status === 'completed' && event.kind === 'complete') return null;
 
   const sequence = ++run.lastSeq;
+  activityRevision += 1n;
   const publishedEvent: NormalizedMessage = {
     ...event,
     id: event.id || generateMessageId(event.kind),
@@ -80,6 +90,13 @@ function decorateRunEvent(run: ChatRun, event: NormalizedMessage): NormalizedMes
 }
 
 async function broadcastSessionUpsert(sessionId: string): Promise<void> {
+  pendingPublications += 1;
+  activityRevision += 1n;
+  try { await publishSessionUpsert(sessionId); }
+  finally { pendingPublications -= 1; activityRevision += 1n; }
+}
+
+async function publishSessionUpsert(sessionId: string): Promise<void> {
   const session = sessionsDb.getSessionById(sessionId);
   if (!session || session.isArchived) return;
 
@@ -119,6 +136,7 @@ async function broadcastSessionUpsert(sessionId: string): Promise<void> {
 function persistProviderSessionId(run: ChatRun, providerSessionId: string): void {
   if (!providerSessionId || providerSessionId === run.providerSessionId) return;
   run.providerSessionId = providerSessionId;
+  activityRevision += 1n;
   const context = { appSessionId: run.appSessionId, providerSessionId };
   const report = (label: string, error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -179,12 +197,27 @@ function isCurrentRunningRun(run: ChatRun): boolean {
 }
 
 export const chatRunRegistry = {
+  getGeneration,
+
+  /** Registry ownership only; worker/SDK settlement is a separate required reader. */
+  snapshotActivity(): DesktopOwnerActivity {
+    let running = 0;
+    let approvals = 0;
+    for (const run of runsByAppSession.values()) {
+      if (run.status === 'running') running += 1;
+      approvals += run.pendingApprovals.size;
+    }
+    return { owner: 'chat', generation: getGeneration(), complete: true, starting: 0,
+      queued: 0, running, settling: pendingPublications, approvals, retained: 0, unknown: [] };
+  },
+
   startRun(input: StartRunInput): ChatRun | null {
     const currentRun = runsByAppSession.get(input.appSessionId);
     if (currentRun?.status === 'running') return null;
 
     const run = createRun(input);
     runsByAppSession.set(input.appSessionId, run);
+    activityRevision += 1n;
     return run;
   },
 
@@ -214,6 +247,14 @@ export const chatRunRegistry = {
    * decision can be persisted against the provider's tool name rather than
    * whatever the browser claims.
    */
+  getPendingApproval(requestId: string): PendingApproval | null {
+    for (const run of runsByAppSession.values()) {
+      const pending = run.pendingApprovals.get(requestId);
+      if (pending) return pending;
+    }
+    return null;
+  },
+
   resolvePendingApproval(requestId: string): PendingApproval | null {
     let resolved: PendingApproval | null = null;
     for (const run of runsByAppSession.values()) {
@@ -221,6 +262,7 @@ export const chatRunRegistry = {
       if (pending) {
         resolved ??= pending;
         run.pendingApprovals.delete(requestId);
+        activityRevision += 1n;
       }
     }
     return resolved;
@@ -231,12 +273,14 @@ export const chatRunRegistry = {
     const run = runsByAppSession.get(appSessionId);
     if (!run) return false;
     run.writer.attachConnection(connection);
+    activityRevision += 1n;
     return true;
   },
 
   /** A socket went away; no run keeps sending to it. */
   detachConnection(connection: RealtimeClientConnection): void {
     for (const run of runsByAppSession.values()) run.writer.detachConnection(connection);
+    activityRevision += 1n;
   },
 
   replayEvents(appSessionId: AppSessionId, afterSeq: number, replayGeneration?: unknown): NormalizedMessage[] {
@@ -260,5 +304,6 @@ export const chatRunRegistry = {
 
   clearAll(): void {
     runsByAppSession.clear();
+    activityRevision += 1n;
   },
 };

@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import type { Project } from '../../../types/app';
 import { useChatComposerState, type PendingCommandGate } from '../hooks/useChatComposerState';
+import { draftInputKey } from '../utils/chatStorage';
 
 /*
  * The confirmation gate.
@@ -73,6 +74,7 @@ function captureComposer(
  * the change callback rather than the returned state.
  */
 async function submit(text: string) {
+  storage.clear();
   const sentMessages: unknown[] = [];
   const addedMessages: unknown[] = [];
   const gates: Array<PendingCommandGate | null> = [];
@@ -102,12 +104,14 @@ test('a destructive form sends nothing and raises a gate instead', async () => {
   }
 });
 
-test('the gate holds the text out of the input so Enter cannot resubmit it', async () => {
+test('the gate retains its draft but repeated Enter cannot bypass confirmation', async () => {
   const { composer, sentMessages, gate } = await submit('/session delete');
 
   assert.deepEqual(sentMessages, []);
-  assert.equal(composer.input, '');
+  assert.equal(storage.get(draftInputKey(selectedProject.projectId, 'session-1')), '/session delete');
   assert.equal(gate?.text, '/session delete');
+  await composer.handleSubmit(submitEvent);
+  assert.deepEqual(sentMessages, []);
 });
 
 test('an unclassified form gates rather than running unannounced', async () => {

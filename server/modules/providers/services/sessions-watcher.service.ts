@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import { projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { generateDisplayName } from '@/modules/projects/index.js';
@@ -8,7 +9,10 @@ import { GjcSessionWatcher } from '@/modules/providers/services/gjc-session-watc
 import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
 import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
 import type { LLMProvider } from '@/shared/types.js';
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
 import { getGjcLiveSessionRoot } from '@/shared/utils.js';
+
+import type { DesktopOwnerActivity } from '../../../../shared/desktopUpdateProtocol.js';
 
 type WatcherEventType = 'add' | 'change';
 type PendingWatcherUpdate = { providers: Set<LLMProvider>; changeTypes: Set<WatcherEventType>; updatedSessionIdsByProvider: Map<LLMProvider, Set<string>> };
@@ -31,6 +35,43 @@ let queuedSince: number | null = null;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let flushRunning = false;
 let flushAgain = false;
+const activityEpoch = randomUUID();
+let activityRevision = 0n;
+let desktopAdmission: DesktopWorkAdmission | undefined;
+let initializationCount = 0;
+const initializations = new Set<Promise<void>>();
+const retiringWatchers = new Set<GjcSessionWatcher>();
+const closingTasks = new Set<Promise<void>>();
+
+function activityChanged(): void {
+  activityRevision += 1n;
+  for (const watcher of retiringWatchers) {
+    const state = watcher.snapshotActivity();
+    if (!state.starting && !state.queued && !state.running && !state.settling && !state.unknown.length) retiringWatchers.delete(watcher);
+  }
+}
+export function configureSessionsWatcherDesktopAdmission(admission: DesktopWorkAdmission): void {
+  if (desktopAdmission && desktopAdmission !== admission) throw new Error('Watcher admission already configured.');
+  desktopAdmission = admission;
+}
+export function getSessionsWatcherActivityGeneration(): string { return `${activityEpoch}:${activityRevision}`; }
+export function snapshotSessionsWatcherActivity(): DesktopOwnerActivity {
+  const watchers = [...new Set([activeWatcher, openingWatcher, ...retiringWatchers].filter((watcher): watcher is GjcSessionWatcher => watcher !== null))];
+  const parts = watchers.map((watcher) => watcher.snapshotActivity());
+  const sum = (key: 'starting' | 'queued' | 'running' | 'settling') => parts.reduce((count, item) => count + item[key], 0);
+  const unknown = [...new Set(parts.flatMap((item) => item.unknown))];
+  if (!activeWatcher && !isClosing) unknown.push('watcher_not_ready');
+  return { owner: 'watchers', generation: getSessionsWatcherActivityGeneration(), complete: unknown.length === 0,
+    starting: initializationCount + startingTasks.size + sum('starting'), queued: Number(Boolean(queued)) + Number(Boolean(restartTimer)) + sum('queued'),
+    running: Number(flushRunning) + sum('running'), settling: closingTasks.size + sum('settling'), approvals: 0, retained: 0, unknown };
+}
+
+function closeTracked(watcher: GjcSessionWatcher): Promise<void> {
+  retiringWatchers.add(watcher); activityChanged();
+  const task = watcher.close().finally(() => { closingTasks.delete(task); activityChanged(); });
+  closingTasks.add(task); activityChanged();
+  return task;
+}
 
 function clearTimer(timer: 'restart' | 'flush'): void {
   if (timer === 'restart') {
@@ -40,6 +81,7 @@ function clearTimer(timer: 'restart' | 'flush'): void {
     if (flushTimer) clearTimeout(flushTimer);
     flushTimer = null;
   }
+  activityChanged();
 }
 
 function enqueue(kind: WatcherEventType, provider: LLMProvider, sessionId: string | null): void {
@@ -52,6 +94,7 @@ function enqueue(kind: WatcherEventType, provider: LLMProvider, sessionId: strin
     queued.updatedSessionIdsByProvider.set(provider, ids);
   }
   armFlush();
+  activityChanged();
 }
 
 function armFlush(): void {
@@ -61,6 +104,7 @@ function armFlush(): void {
   const wait = Math.min(debounceMs, Math.max(0, maxDelayMs - (now - queuedSince)));
   clearTimer('flush');
   flushTimer = setTimeout(() => { void deliverQueuedUpdates(); }, wait);
+  activityChanged();
 }
 
 async function sessionFrame(provider: LLMProvider, providerSessionId: string): Promise<string | null> {
@@ -92,6 +136,7 @@ async function deliverQueuedUpdates(): Promise<void> {
   queued = null;
   queuedSince = null;
   flushRunning = true;
+  activityChanged();
   try {
     const frames: string[] = [];
     for (const [provider, ids] of batch.updatedSessionIdsByProvider) {
@@ -114,6 +159,7 @@ async function deliverQueuedUpdates(): Promise<void> {
       flushAgain = false;
       armFlush();
     }
+    activityChanged();
   }
 }
 
@@ -137,9 +183,11 @@ function scheduleRestart(): void {
   restartDelay = Math.min(restartDelay * 2, maxRestartMs);
   restartTimer = setTimeout(() => {
     restartTimer = null;
+    activityChanged();
     void startGjcSessionWatcher(true);
   }, delay);
   restartTimer.unref?.();
+  activityChanged();
 }
 
 async function openGjcWatcher(reconcile: boolean, controller: AbortController): Promise<void> {
@@ -165,9 +213,10 @@ async function openGjcWatcher(reconcile: boolean, controller: AbortController): 
     const watcher = slot.current;
     if (activeWatcher === watcher) activeWatcher = null;
     console.error('GJC native session watcher failed.');
-    void watcher?.close().catch(() => {}).finally(() => {
+    void (watcher ? closeTracked(watcher) : Promise.resolve()).catch(() => {}).finally(() => {
       if (openingWatcher === watcher) openingWatcher = null;
       scheduleRestart();
+      activityChanged();
     });
   };
   slot.current = new GjcSessionWatcher({
@@ -175,61 +224,79 @@ async function openGjcWatcher(reconcile: boolean, controller: AbortController): 
     onEvent: (event, eventSignal) => synchronizeFile(event.kind, event.path, 'gjc', eventSignal),
     onFailure: failed,
     diagnostic: (message) => console.error(message),
+    desktopAdmission,
+    onActivityChange: activityChanged,
   });
   const watcher = slot.current;
   openingWatcher = watcher;
+  activityChanged();
   try {
     await watcher.start();
     if (reported || isClosing || epoch !== watcherEpoch) {
-      await watcher.close();
+      await closeTracked(watcher);
       return;
     }
     if (openingWatcher === watcher) openingWatcher = null;
     activeWatcher = watcher;
+    activityChanged();
     if (reconcile) {
       const result = await sessionSynchronizerService.reconcileProvider('gjc', signal);
       if (reported || isClosing || epoch !== watcherEpoch) {
         if (activeWatcher === watcher) activeWatcher = null;
-        await watcher.close();
+        await closeTracked(watcher);
         return;
       }
       result.sessionIds.forEach((sessionId) => enqueue('change', 'gjc', sessionId));
     }
     if (reported || isClosing || epoch !== watcherEpoch) {
       if (activeWatcher === watcher) activeWatcher = null;
-      await watcher.close();
+      await closeTracked(watcher);
       return;
     }
     restartDelay = 1_000;
   } catch {
     failed();
-    await watcher.close();
+    await closeTracked(watcher);
   }
 }
 
 function startGjcSessionWatcher(reconcile = false): Promise<void> {
   if (isClosing || activeWatcher || openingWatcher) return Promise.resolve();
+  let release: (() => void) | undefined;
+  try { release = desktopAdmission?.enter('watcher:start'); }
+  catch { scheduleRestart(); return Promise.resolve(); }
   const controller = new AbortController();
   startControllers.add(controller);
-  const task = openGjcWatcher(reconcile, controller);
+  const task = openGjcWatcher(reconcile, controller).finally(() => release?.());
   startingTasks.add(task);
+  activityChanged();
   void task.then(
-    () => { startControllers.delete(controller); startingTasks.delete(task); },
-    () => { startControllers.delete(controller); startingTasks.delete(task); },
+    () => { startControllers.delete(controller); startingTasks.delete(task); activityChanged(); },
+    () => { startControllers.delete(controller); startingTasks.delete(task); activityChanged(); },
   );
   return task;
 }
 
-export async function initializeSessionsWatcher(): Promise<void> {
+async function initializeOwned(): Promise<void> {
   console.log('Setting up session watchers');
   isClosing = false;
   await startGjcSessionWatcher();
+  if (isClosing) return;
   const initialSync = await sessionSynchronizerService.synchronizeSessions();
   console.log('Initial session synchronization complete', { processedByProvider: initialSync.processedByProvider, failures: initialSync.failures });
 }
 
+export function initializeSessionsWatcher(): Promise<void> {
+  const release = desktopAdmission?.enter('watcher:initialize');
+  initializationCount++; activityChanged();
+  const task = initializeOwned().finally(() => { initializationCount--; initializations.delete(task); release?.(); activityChanged(); });
+  initializations.add(task);
+  return task;
+}
+
 export async function closeSessionsWatcher(): Promise<void> {
   isClosing = true;
+  activityChanged();
   watcherEpoch += 1;
   clearTimer('restart');
   clearTimer('flush');
@@ -239,12 +306,15 @@ export async function closeSessionsWatcher(): Promise<void> {
   activeWatcher = null;
   openingWatcher = null;
   await Promise.all([
-    ...watchers.map((watcher) => watcher.close().catch(() => { console.error('Failed to close GJC native session watcher.'); })),
+    ...watchers.map((watcher) => closeTracked(watcher).catch(() => { console.error('Failed to close GJC native session watcher.'); })),
     ...tasks.map((task) => task.catch(() => { console.error('Failed to stop GJC native session watcher startup.'); })),
+    ...[...initializations].map((task) => task.catch(() => {})),
   ]);
   restartDelay = 1_000;
   queued = null;
   queuedSince = null;
-  flushRunning = false;
+  // An already-running publication still owns its actual async callback.
   flushAgain = false;
+  activityChanged();
+  if (retiringWatchers.size || flushRunning) throw new Error('Session watcher cleanup is unconfirmed.');
 }

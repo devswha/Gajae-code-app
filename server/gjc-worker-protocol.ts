@@ -7,6 +7,8 @@ export type JsonObject = { [key: string]: JsonValue };
 
 export const GJC_WORKER_REQUEST_METHODS = [
   'worker.initialize',
+  'worker.activity',
+  'worker.admission',
   'session.start',
   'session.resume',
   'turn.start',
@@ -42,7 +44,7 @@ export const GJC_WORKER_EVENT_METHODS = [
 
 export type GjcWorkerRequestMethod = typeof GJC_WORKER_REQUEST_METHODS[number];
 export type GjcWorkerEventMethod = typeof GJC_WORKER_EVENT_METHODS[number];
-type GjcWorkerGlobalRequestMethod = Extract<GjcWorkerRequestMethod, 'worker.initialize' | 'worker.shutdown' | 'models.catalog' | `oauth.${string}`>;
+type GjcWorkerGlobalRequestMethod = Extract<GjcWorkerRequestMethod, 'worker.initialize' | 'worker.shutdown' | 'worker.activity' | 'worker.admission' | 'models.catalog' | `oauth.${string}`>;
 export type GjcWorkerGlobalEventMethod = Extract<GjcWorkerEventMethod, 'oauth.phase' | 'oauth.providers.updated' | 'provider.auth.updated'>;
 
 type GjcWorkerSuccess = {
@@ -61,6 +63,23 @@ type GjcWorkerFailure = {
 
 export type GjcWorkerResponsePayload = GjcWorkerSuccess | GjcWorkerFailure;
 
+/** Fixed-size, credential-free ownership evidence. Counts can overlap. */
+export type GjcWorkerActivity = {
+  /** Opaque revision of ALL accounted activity, not merely current counters. */
+  generation: string;
+  complete: boolean;
+  starting: number;
+  queued: number;
+  running: number;
+  settling: number;
+  approvals: number;
+  retained: number;
+  unknown: string[];
+};
+/** generation binds the host incarnation/revision AND runtime generation. */
+export type GjcWorkerActivityObservation = GjcWorkerActivity & { fenceId: string | null };
+export type GjcWorkerAdmissionRequest = { fenceId: string; closed: boolean };
+
 type GlobalRequestMethod = GjcWorkerGlobalRequestMethod;
 type ScopedRequestMethod = Exclude<GjcWorkerRequestMethod, GlobalRequestMethod>;
 
@@ -68,7 +87,7 @@ type GjcWorkerGlobalRequestFrame = {
   protocolVersion: typeof GJC_WORKER_PROTOCOL_VERSION;
   kind: 'request';
   id: string;
-  method: GlobalRequestMethod;
+  method: Exclude<GlobalRequestMethod, 'worker.activity' | 'worker.admission'>;
   payload: JsonObject;
 };
 
@@ -81,13 +100,18 @@ type GjcWorkerScopedRequestFrame = {
   payload: JsonObject;
 };
 
-export type GjcWorkerRequestFrame = GjcWorkerGlobalRequestFrame | GjcWorkerScopedRequestFrame;
+export type GjcWorkerRequestFrame = GjcWorkerGlobalRequestFrame | GjcWorkerScopedRequestFrame | {
+  protocolVersion: typeof GJC_WORKER_PROTOCOL_VERSION;
+  kind: 'request';
+  id: string;
+} & ({ method: 'worker.activity'; payload: Record<string, never> }
+  | { method: 'worker.admission'; payload: GjcWorkerAdmissionRequest });
 
 type GjcWorkerGlobalResponseFrame = {
   protocolVersion: typeof GJC_WORKER_PROTOCOL_VERSION;
   kind: 'response';
   id: string;
-  method: GlobalRequestMethod;
+  method: Exclude<GlobalRequestMethod, 'worker.activity' | 'worker.admission'>;
   payload: GjcWorkerResponsePayload;
 };
 
@@ -100,7 +124,12 @@ type GjcWorkerScopedResponseFrame = {
   payload: GjcWorkerResponsePayload;
 };
 
-export type GjcWorkerResponseFrame = GjcWorkerGlobalResponseFrame | GjcWorkerScopedResponseFrame;
+export type GjcWorkerResponseFrame = GjcWorkerGlobalResponseFrame | GjcWorkerScopedResponseFrame | {
+  protocolVersion: typeof GJC_WORKER_PROTOCOL_VERSION;
+  kind: 'response';
+  id: string;
+} & ({ method: 'worker.activity'; payload: GjcWorkerFailure | { ok: true; result: GjcWorkerActivityObservation } }
+  | { method: 'worker.admission'; payload: GjcWorkerFailure | { ok: true; result: { fenceId: string | null } } });
 
 type GjcWorkerStatusEventFrame = {
   protocolVersion: typeof GJC_WORKER_PROTOCOL_VERSION;
@@ -144,7 +173,7 @@ export class GjcWorkerProtocolError extends Error {
 
 const requestMethods = new Set<string>(GJC_WORKER_REQUEST_METHODS);
 const eventMethods = new Set<string>(GJC_WORKER_EVENT_METHODS);
-const globalMethods = new Set<string>(['worker.initialize', 'worker.shutdown', 'models.catalog', 'oauth.providers', 'oauth.status', 'oauth.start', 'oauth.submit', 'oauth.cancel']);
+const globalMethods = new Set<string>(['worker.initialize', 'worker.shutdown', 'worker.activity', 'worker.admission', 'models.catalog', 'oauth.providers', 'oauth.status', 'oauth.start', 'oauth.submit', 'oauth.cancel']);
 const globalEventMethods = new Set<string>(['oauth.phase', 'oauth.providers.updated', 'provider.auth.updated']);
 const safeIdentifier = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const redacted = '[redacted]';
@@ -210,6 +239,45 @@ function assertResponsePayload(value: unknown): asserts value is GjcWorkerRespon
   if ('details' in value.error) validateJson(value.error.details);
 }
 
+const activityCounts = ['starting', 'queued', 'running', 'settling', 'approvals', 'retained'] as const;
+const activityIdentifier = (value: unknown): value is string => typeof value === 'string'
+  && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
+
+export function isGjcWorkerActivity(value: unknown): value is GjcWorkerActivity {
+  if (!isPlainObject(value)) return false;
+  const keys = ['generation', 'complete', ...activityCounts, 'unknown'];
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(value).length !== keys.length
+    || keys.some((key) => !descriptors[key] || !Object.hasOwn(descriptors[key], 'value'))) return false;
+  return activityIdentifier(value.generation) && typeof value.complete === 'boolean'
+    && activityCounts.every((key) => Number.isSafeInteger(value[key]) && (value[key] as number) >= 0)
+    && Array.isArray(value.unknown) && value.unknown.length <= 32 && value.unknown.every(activityIdentifier);
+}
+
+function assertActivityPayload(method: string, value: JsonObject | GjcWorkerResponsePayload, response: boolean): void {
+  if (method !== 'worker.activity' && method !== 'worker.admission') return;
+  if (!response) {
+    const request = value as JsonObject;
+    if (method === 'worker.activity') {
+      if (Object.keys(value).length !== 0) fail('invalid_payload', 'Activity requests must have an empty payload.');
+    } else if (Object.keys(request).length !== 2 || !activityIdentifier(request.fenceId) || typeof request.closed !== 'boolean') {
+      fail('invalid_payload', 'Admission request is invalid.');
+    }
+    return;
+  }
+  if (!value.ok) return;
+  const result = value.result;
+  if (!isPlainObject(result) || (result.fenceId !== null && !activityIdentifier(result.fenceId))) {
+    fail('invalid_response_payload', 'Worker ownership response is invalid.');
+  }
+  if (method === 'worker.admission') {
+    if (Object.keys(result).length !== 1) fail('invalid_response_payload', 'Admission response is invalid.');
+  } else {
+    const { fenceId: _fenceId, ...activity } = result;
+    if (!isGjcWorkerActivity(activity)) fail('invalid_response_payload', 'Activity response is invalid.');
+  }
+}
+
 function byteLength(input: string | Uint8Array): number {
   return typeof input === 'string' ? Buffer.byteLength(input, 'utf8') : input.byteLength;
 }
@@ -237,6 +305,7 @@ export function parseGjcWorkerFrame(input: string | Uint8Array): GjcWorkerFrame 
     assertIdentifier(parsed.id, 'id');
     if (typeof parsed.method !== 'string' || !requestMethods.has(parsed.method)) fail('unknown_method', 'Request method is not supported.');
     assertPayload(parsed.payload);
+    assertActivityPayload(parsed.method, parsed.payload, false);
     if (globalMethods.has(parsed.method)) {
       if ('sessionId' in parsed) fail('invalid_session_scope', 'Global requests must omit sessionId.');
     } else {
@@ -250,6 +319,7 @@ export function parseGjcWorkerFrame(input: string | Uint8Array): GjcWorkerFrame 
     assertIdentifier(parsed.id, 'id');
     if (typeof parsed.method !== 'string' || !requestMethods.has(parsed.method)) fail('unknown_method', 'Response method must be a request method.');
     assertResponsePayload(parsed.payload);
+    assertActivityPayload(parsed.method, parsed.payload, true);
     if (globalMethods.has(parsed.method)) {
       if ('sessionId' in parsed) fail('invalid_session_scope', 'Global responses must omit sessionId.');
     } else {

@@ -5,12 +5,31 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
+use crate::macos_instance;
 use serde::{Deserialize, Serialize};
 use tauri::utils::config::{Config, WindowConfig};
 
 const MANIFEST: &str = "desktop-qa-profile.json";
+const AUTOMATION_SOCKET: &str = "a.sock";
+
+fn validate_automation_socket(root: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // Use the platform sockaddr layout, not a guessed cross-platform cap.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if root.join(AUTOMATION_SOCKET).as_os_str().as_bytes().len() >= address.sun_path.len() {
+            return Err(
+                "QA root is too long for its private automation socket; choose a shorter path."
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -26,7 +45,7 @@ pub(crate) struct QaProfile {
     webkit_store: [u8; 16],
     // Own the profile before changing directories or constructing any webview.
     // Tauri creates configured windows before invoking the app setup callback.
-    _lock: fs::File,
+    _lock: macos_instance::InstanceLock,
 }
 
 pub(crate) fn requested_root(
@@ -96,6 +115,10 @@ fn private_directory(path: &Path) -> Result<(), String> {
 
 impl QaProfile {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        Self::open_until(path, Instant::now() + macos_instance::HANDOFF_TIMEOUT)
+    }
+
+    pub(crate) fn open_until(path: &Path, deadline: Instant) -> Result<Self, String> {
         // A trailing slash or `/.` makes lstat follow the final symlink on
         // macOS. Remove those lexical suffixes before inspecting the root.
         let path: PathBuf = path.components().collect();
@@ -119,6 +142,7 @@ impl QaProfile {
             private_directory(&path)?;
         }
         let root = path.canonicalize().map_err(|error| error.to_string())?;
+        validate_automation_socket(&root)?;
         let manifest_path = root.join(MANIFEST);
         if fs::symlink_metadata(&manifest_path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err("QA manifest cannot be a symlink.".into());
@@ -144,16 +168,13 @@ impl QaProfile {
         if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| !metadata.file_type().is_file()) {
             return Err("QA instance lock must be a regular non-symlink file.".into());
         }
-        let mut options = fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(lock_path).map_err(|error| error.to_string())?;
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .map_err(|_| "This desktop QA profile is already in use.".to_owned())?;
+        let lock = macos_instance::acquire_until(&lock_path, deadline).map_err(|error| {
+            if error.is_contended() {
+                "This desktop QA profile is already in use.".to_owned()
+            } else {
+                error.to_string()
+            }
+        })?;
         private_directory(&root)?;
         let manifest = if let Some(manifest) = manifest {
             manifest
@@ -212,6 +233,10 @@ impl QaProfile {
         self.root.join("home")
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn configure(&self, config: &mut Config) -> Vec<WindowConfig> {
         let mut windows = Vec::new();
         for window in &mut config.app.windows {
@@ -261,6 +286,7 @@ impl QaProfile {
             ("TMPDIR", "tmp"),
             ("GAJAE_BROWSER_PROFILE_DIR", "browser/profile"),
             ("GAJAE_BROWSER_CACHE_DIR", "browser/chromium"),
+            ("GAJAE_AUTOMATION_SOCKET", AUTOMATION_SOCKET),
         ] {
             result.insert(
                 name.into(),
@@ -291,6 +317,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn automation_socket_is_short_private_and_really_bindable() {
+        let root = Temp::new();
+        let profile = QaProfile::open(&root.0).unwrap();
+        let environment = profile.environment();
+        let socket = PathBuf::from(&environment["GAJAE_AUTOMATION_SOCKET"]);
+        assert_eq!(socket, profile.root.join(AUTOMATION_SOCKET));
+        #[cfg(unix)]
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            assert!(
+                socket.exists(),
+                "the OS must not silently truncate the bound path"
+            );
+            drop(listener);
+        }
+        assert!(
+            validate_automation_socket(&PathBuf::from(format!("/{}", "x".repeat(200)))).is_err()
+        );
     }
 
     #[test]
@@ -429,7 +476,11 @@ mod tests {
         // A contender must not initialize missing paths before discovering the
         // owner. This directory is only a fixture, with no sidecar running.
         fs::remove_dir(profile.home().join(".cache")).unwrap();
-        assert!(QaProfile::open(&root.0).is_err());
+        assert!(QaProfile::open_until(
+            &root.0,
+            Instant::now() + std::time::Duration::from_millis(60)
+        )
+        .is_err());
         assert!(!profile.home().join(".cache").exists());
         assert_eq!(fs::read(root.0.join(MANIFEST)).unwrap(), manifest);
         let store = profile.webkit_store;

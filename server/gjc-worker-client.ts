@@ -7,6 +7,7 @@ import { dirname, isAbsolute, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Writable } from 'node:stream';
 
+import type { DesktopOwnerActivity } from '../shared/desktopUpdateProtocol.js';
 import type { GjcGoalCommand, GjcGoalSnapshot, GjcGoalScope } from '../shared/gjc-goal.js';
 
 import {
@@ -67,6 +68,9 @@ export type GjcWorkerOptions = Record<string, unknown> & {
   notificationOwner?: 'terminal-adapter';
 };
 type GjcOptionsEnricher = (options: GjcWorkerOptions) => Promise<GjcWorkerOptions>;
+/** Optional application-owned ingress accounting; the engine owns no app authority. */
+export type GjcWorkerDesktopAdmission = { acquire(source: string): { release(): void } };
+type WorkerActivityObservation = Extract<Extract<GjcWorkerResponseFrame, { method: 'worker.activity' }>['payload'], { ok: true }>['result'];
 export type GjcWorkerWriter = { send(value: unknown): void; setSessionId?(id: string): void; getAppSessionId?(): string | undefined; userId?: string | number | null };
 type Child = {
   pid?: number;
@@ -133,7 +137,9 @@ export type GjcWorkerSupervisorRuntime = {
   notifyRunFailed?: RunFailedNotifier;
   createScope?: () => string;
   diagnostic?: (message: string) => void;
+  /** Fulfillment must prove owned process-tree termination, not merely send a signal. */
   killTree?: (child: Child) => void | Promise<void>;
+  /** Same proof contract for separately reported run processes. */
   killProcessTree?: (processId: number) => void | Promise<void>;
   platform?: NodeJS.Platform;
   environment?: NodeJS.ProcessEnv;
@@ -422,8 +428,28 @@ export class GjcWorkerSupervisor {
   private readonly approvals = new Map<string, PendingApproval>();
   private readonly expiredRequests = new Map<string, ExpiredRequest>();
   private readonly oauthListeners = new Set<GjcWorkerOAuthListener>();
+  private readonly activityEpoch = randomUUID();
+  private activityRevision = 0n;
+  private readonly activityTasks = { starting: 0, settling: 0 };
+  private readonly unreapedWorkers = new Set<Child>();
+  private requestTimeoutUncertainty = false;
+  private readonly reapingWorkers = new Set<Child>();
+  private runProcessProofMissing = false;
+  private readonly hasRunProcessReaper: boolean;
+  private desktopAdmission?: GjcWorkerDesktopAdmission;
+  private restartFence?: {
+    id: string; child?: Child; acknowledged: boolean; pending?: Promise<void>;
+    /** Immutable first correlated observation for this exact acknowledged fence. */
+    remoteGeneration?: string;
+    invalidated?: boolean;
+  };
+  private observation?: {
+    id: string; child: Child; promise: Promise<WorkerActivityObservation | undefined>;
+    settle(value?: WorkerActivityObservation): void;
+  };
 
   constructor(runtime: GjcWorkerSupervisorRuntime = {}) {
+    this.hasRunProcessReaper = runtime.killProcessTree !== undefined;
     this.runtime = {
       spawn: runtime.spawn ?? spawnChild as unknown as Spawn,
       corePath: runtime.corePath,
@@ -445,6 +471,190 @@ export class GjcWorkerSupervisor {
       environment: runtime.environment ?? process.env,
     };
   }
+
+  /** Pure revision; unique across supervisors and never reused after an idle/busy/idle cycle. */
+  getGeneration(): string {
+    return `${this.activityEpoch}:${this.activityRevision}`;
+  }
+
+  configureDesktopRestartAdmission(admission?: GjcWorkerDesktopAdmission): void {
+    this.desktopAdmission = admission;
+  }
+
+  private acquireRoot(source: string): () => void {
+    if (this.restartFence) throw Object.assign(new Error('Worker admission is fenced.'), { code: 'DESKTOP_RESTART_FENCED' });
+    const lease = this.desktopAdmission?.acquire(`gjc-worker:${source}`);
+    return () => lease?.release();
+  }
+
+  /** Close locally before any await. Busy accepted roots keep running; never abort to fence. */
+  async fenceForDesktopRestart(fenceId: string): Promise<void> {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(fenceId)) throw new TypeError('Invalid worker fence.');
+    if (this.restartFence && this.restartFence.id !== fenceId) throw new Error('Worker fence conflicts.');
+    if (!this.restartFence) {
+      this.restartFence = { id: fenceId, acknowledged: false };
+      this.activityChanged();
+    }
+    const fence = this.restartFence;
+    if (fence.pending) return fence.pending;
+    if (fence.acknowledged && fence.child === this.child) return;
+    // These operations were accepted before close. They can still deliver
+    // their original request, so do not place a remote fence in their path.
+    if (this.starting || this.runs.size || this.tracker.size || this.activityTasks.starting || this.activityTasks.settling) {
+      throw new Error('Worker has accepted work.');
+    }
+    const child = this.child;
+    if (!child) {
+      if (this.unreapedWorkers.size || this.terminating || this.terminationFailure) throw new Error('Worker ownership is unconfirmed.');
+      fence.acknowledged = true;
+      return;
+    }
+    if (!this.ready) throw new Error('Worker is not ready.');
+    fence.child = child;
+    const pending = this.request('worker.admission', undefined, { fenceId, closed: true }, 1_000).then((response) => {
+      if (!response.ok || object(response.result)?.fenceId !== fenceId || this.child !== child || this.restartFence !== fence) {
+        throw new Error('Worker fence was not acknowledged.');
+      }
+      fence.acknowledged = true;
+      this.activityChanged();
+    }).finally(() => { if (fence.pending === pending) fence.pending = undefined; });
+    fence.pending = pending;
+    return pending;
+  }
+
+  /** Exact-ID release; failed/late acknowledgement leaves local admission closed. */
+  async releaseDesktopRestartFence(fenceId: string): Promise<void> {
+    const fence = this.restartFence;
+    if (!fence) return;
+    if (fence.id !== fenceId) throw new Error('Worker fence conflicts.');
+    try { await fence.pending; } catch { /* Still send ordered release to the same child. */ }
+    if (fence.child && fence.child === this.child) {
+      const response = await this.request('worker.admission', undefined, { fenceId, closed: false }, 1_000);
+      if (!response.ok || object(response.result)?.fenceId !== null) throw new Error('Worker fence release was not acknowledged.');
+    }
+    if (this.restartFence === fence) {
+      this.restartFence = undefined;
+      this.activityChanged();
+    }
+  }
+
+  /** Observes the existing child only. Never calls ensureWorker, cancellation or reaping. */
+  async readDesktopRestartActivity(): Promise<DesktopOwnerActivity> {
+    const initial = this.snapshotActivity();
+    const child = this.child;
+    if (!child || !this.ready || this.terminating || this.terminationFailure) return initial;
+    const fence = this.restartFence;
+    const remote = await this.observeWorker(child);
+    const changed = this.getGeneration() !== initial.generation || this.child !== child || this.restartFence !== fence;
+    if (!remote || changed || remote.fenceId !== (fence?.id ?? null)) {
+      return { ...initial, complete: false, unknown: [...new Set([...initial.unknown,
+        !remote ? 'worker_observation_unavailable' : 'worker_observation_stale'])] };
+    }
+    if (fence?.acknowledged && fence.child === child) {
+      if (fence.remoteGeneration === undefined) {
+        // Establishing evidence is not new activity: the first observation
+        // must still match the synchronous generation captured by authority.
+        fence.remoteGeneration = remote.generation;
+      } else if (fence.remoteGeneration !== remote.generation && !fence.invalidated) {
+        // An actual remote mutation invalidates every prepared proof under
+        // this fence. Never silently rebase it to a newer (or reverted) idle
+        // revision. Release + a new fence is the only way to establish proof.
+        fence.invalidated = true;
+        this.activityChanged();
+      }
+    }
+    // Account for this child through evidence without forgetting its OS owner.
+    // Other unreaped generations, escaped PIDs and timeout latches stay unknown.
+    const unknown = [...new Set([
+      ...initial.unknown.filter((reason) => reason !== 'worker_runtime_unaccounted'
+        || this.unreapedWorkers.size !== 1 || this.runProcessProofMissing || this.runtime.platform === 'win32'),
+      ...remote.unknown,
+      ...(!fence?.acknowledged || fence.child !== child ? ['worker_admission_open'] : []),
+      ...(fence?.invalidated ? ['worker_observation_stale'] : []),
+    ])].slice(0, 32);
+    return {
+      ...initial, complete: remote.complete && unknown.length === 0,
+      starting: initial.starting + remote.starting,
+      queued: initial.queued + remote.queued,
+      running: initial.running + remote.running,
+      settling: initial.settling + remote.settling,
+      approvals: initial.approvals + remote.approvals,
+      retained: initial.retained - Number(this.runtime.platform !== 'win32') + remote.retained,
+      unknown,
+    };
+  }
+
+  private observeWorker(child: Child): Promise<WorkerActivityObservation | undefined> {
+    // One slot per child, including a timed-out request awaiting its late reply.
+    // Repeated reads cannot accumulate requests, timers or expired-ID entries.
+    if (this.observation?.child === child) return this.observation.promise;
+    const id = `observe-${randomUUID()}`;
+    let settle!: (value?: WorkerActivityObservation) => void;
+    const promise = new Promise<WorkerActivityObservation | undefined>((resolve) => { settle = resolve; });
+    const timer = setTimeout(() => settle(), 250);
+    timer.unref?.();
+    const observation = { id, child, promise, settle: (value?: WorkerActivityObservation) => { clearTimeout(timer); settle(value); } };
+    this.observation = observation;
+    try {
+      child.stdin.write(serializeGjcWorkerFrame({ protocolVersion: GJC_WORKER_PROTOCOL_VERSION,
+        kind: 'request', id, method: 'worker.activity', payload: {} }));
+    } catch { observation.settle(); }
+    return promise;
+  }
+
+  /**
+   * Pure parent-side accounting. A retained live child is unaccounted here;
+   * readDesktopRestartActivity can compose fenced worker evidence without
+   * forgetting that OS owner. Counts overlap and include app continuations
+   * after a request/run is removed.
+   */
+  snapshotActivity(): DesktopOwnerActivity {
+    let registered = 0;
+    let running = 0;
+    let aborting = 0;
+    let approvalsInFlight = 0;
+    for (const run of this.runs.values()) {
+      if (run.phase === 'registered') registered += 1;
+      if (run.phase === 'request_issued') running += 1;
+      if (run.abortPromise) aborting += 1;
+    }
+    for (const approval of this.approvals.values()) {
+      if (approval.inFlight) approvalsInFlight += 1;
+    }
+    const unknown: string[] = [];
+    if (this.unreapedWorkers.size || this.runProcessProofMissing) unknown.push('worker_runtime_unaccounted');
+    if (this.requestTimeoutUncertainty) unknown.push('worker_request_timeout_unconfirmed');
+    if (this.reapingWorkers.size) unknown.push('worker_reap_pending');
+    if (this.terminationFailure) unknown.push('worker_reap_unconfirmed');
+    if (this.runProcessProofMissing) unknown.push('worker_process_tree_unaccounted');
+    return {
+      owner: 'gjc-worker', generation: this.getGeneration(), complete: unknown.length === 0,
+      starting: this.activityTasks.starting + registered,
+      queued: this.tracker.size,
+      running,
+      settling: this.activityTasks.settling + aborting + approvalsInFlight,
+      approvals: this.approvals.size,
+      retained: this.unreapedWorkers.size + Number(this.runProcessProofMissing),
+      unknown,
+    };
+  }
+
+  private activityChanged(): void {
+    this.activityRevision += 1n;
+  }
+
+  /** Covers awaits and synchronous user callbacks that can outlive map entries. */
+  private beginActivity(kind: keyof GjcWorkerSupervisor['activityTasks']): () => void {
+    this.activityTasks[kind] += 1;
+    this.activityChanged();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activityTasks[kind] -= 1;
+      this.activityChanged();
+    };
+  }
   /**
    * Sends a global OAuth request through the one supervised worker. OAuth
    * protocol requests deliberately carry no app session id.
@@ -453,33 +663,60 @@ export class GjcWorkerSupervisor {
     method: GjcWorkerOAuthRequestMethod,
     payload: JsonObject,
   ): Promise<GjcWorkerResponsePayload> {
-    await this.ensureWorker();
-    return this.request(method, undefined, payload);
+    const releaseAdmission = method === 'oauth.submit' || method === 'oauth.cancel' ? () => {} : this.acquireRoot(method);
+    const release = this.beginActivity('settling');
+    try {
+      if (this.restartFence && (!this.child || !this.ready)) throw new Error('No accepted OAuth attempt is available.');
+      await this.ensureWorker();
+      return await this.request(method, undefined, payload);
+    } finally {
+      release();
+      releaseAdmission();
+    }
   }
 
   async modelCatalog(): Promise<GjcWorkerResponsePayload> {
-    await this.ensureWorker();
-    return this.request('models.catalog', undefined, {});
+    const releaseAdmission = this.acquireRoot('models.catalog');
+    const release = this.beginActivity('settling');
+    try {
+      await this.ensureWorker();
+      return await this.request('models.catalog', undefined, {});
+    } finally {
+      release();
+      releaseAdmission();
+    }
   }
 
   async inspectGoal(scope: GjcGoalScope, providerSessionId: string): Promise<GjcGoalSnapshot> {
-    const liveRoot = getGjcLiveSessionRoot();
-    const sessionRoot = await resolveGjcResumeSessionRoot(providerSessionId, liveRoot) ?? liveRoot;
-    await this.ensureWorker();
-    const response = await this.request('goal.inspect', scope.appSessionId, { owner: scope.owner, cwd: scope.cwd, ...(scope.projectPath ? { projectPath: scope.projectPath } : {}), providerSessionId, sessionRoot });
-    if (!response.ok) throw new Error(response.error.message);
-    return response.result as GjcGoalSnapshot;
+    const releaseAdmission = this.acquireRoot('goal.inspect');
+    const release = this.beginActivity('settling');
+    try {
+      const liveRoot = getGjcLiveSessionRoot();
+      const sessionRoot = await resolveGjcResumeSessionRoot(providerSessionId, liveRoot) ?? liveRoot;
+      await this.ensureWorker();
+      const response = await this.request('goal.inspect', scope.appSessionId, { owner: scope.owner, cwd: scope.cwd, ...(scope.projectPath ? { projectPath: scope.projectPath } : {}), providerSessionId, sessionRoot });
+      if (!response.ok) throw new Error(response.error.message);
+      return response.result as GjcGoalSnapshot;
+    } finally {
+      release();
+      releaseAdmission();
+    }
   }
 
   async controlGoal(runId: string, scope: GjcGoalScope, command?: GjcGoalCommand, stopAfterMutation = true): Promise<GjcGoalSnapshot> {
     const run = this.runs.get(runId);
     if (!run || run.appScope !== scope.appSessionId || run.phase !== 'request_issued' || run.aborted || run.abortPromise) throw new Error('The active run changed. Refresh before controlling its goal.');
-    const response = await this.request('goal.control', scope.appSessionId, {
-      runId, owner: scope.owner, cwd: scope.cwd, ...(scope.projectPath ? { projectPath: scope.projectPath } : {}), ...(command ? { command } : {}),
-      ...(stopAfterMutation ? {} : { stopAfterMutation: false }),
-    });
-    if (!response.ok) throw new Error(response.error.message);
-    return response.result as GjcGoalSnapshot;
+    const release = this.beginActivity('settling');
+    try {
+      const response = await this.request('goal.control', scope.appSessionId, {
+        runId, owner: scope.owner, cwd: scope.cwd, ...(scope.projectPath ? { projectPath: scope.projectPath } : {}), ...(command ? { command } : {}),
+        ...(stopAfterMutation ? {} : { stopAfterMutation: false }),
+      });
+      if (!response.ok) throw new Error(response.error.message);
+      return response.result as GjcGoalSnapshot;
+    } finally {
+      release();
+    }
   }
 
   oauthProviders(): Promise<GjcWorkerResponsePayload> {
@@ -525,6 +762,7 @@ export class GjcWorkerSupervisor {
   }
 
   private emitOAuthEvent(event: GjcWorkerOAuthEvent): void {
+    this.activityChanged();
     for (const listener of this.oauthListeners) {
       try {
         listener(event);
@@ -544,10 +782,12 @@ export class GjcWorkerSupervisor {
   }
 
   private invokeAppCallback(label: string, callback: () => unknown): void {
+    const release = this.beginActivity('settling');
     try {
-      void Promise.resolve(callback()).catch(() => this.diagnose(label));
+      void Promise.resolve(callback()).catch(() => this.diagnose(label)).finally(release);
     } catch {
       this.diagnose(label);
+      release();
     }
   }
 
@@ -575,24 +815,52 @@ export class GjcWorkerSupervisor {
       resolveOutcome, resolveStarted, rejectStarted, started: false,
     };
     this.runs.set(runId, run);
-    void this.startRun(run, message);
+    this.activityChanged();
+    let releaseAdmission: () => void;
+    try { releaseAdmission = this.acquireRoot('session.start'); }
+    catch (error) {
+      this.runs.delete(runId);
+      this.activityChanged();
+      rejectStarted(error as Error); reject(error as Error); resolveOutcome('not_started');
+      return { started, completion, outcome, abortHandle: runId };
+    }
+    void this.startRun(run, message).finally(releaseAdmission);
     return { started, completion, outcome, phase: () => run.phase, abortHandle: runId };
   }
 
-
+  private canStartRun(run: Run, startingChild: Child | undefined): boolean {
+    // A cancelled/reaped run may have been removed and its ID reused while
+    // startup or model/session-root enrichment was awaiting external work.
+    if (this.runs.get(run.runId) !== run || run.phase !== 'registered') return false;
+    if (run.aborted || this.shuttingDown) {
+      // Exact identity + registered phase select abort's existing synchronous
+      // not_started path. Its notification promises retain their own lifetime.
+      void this.abort(run.runId);
+      return false;
+    }
+    // Bind to the Child, not the activity revision (ordinary events change it).
+    // If its generation is being reaped, workerFailed still owns settlement.
+    return Boolean(startingChild && this.child === startingChild && this.ready
+      && !this.terminating && !this.terminationFailure && !run.cleanupUnconfirmed && !run.abortPromise);
+  }
 
   private async startRun(run: Run, message: string): Promise<void> {
+    const release = this.beginActivity('settling');
     try {
       await this.ensureWorker();
-      if (run.phase === 'run_terminal') return;
+      const startingChild = this.child;
+      if (!this.canStartRun(run, startingChild)) return;
 
       const providerSessionId = safeId(run.options.sessionId);
       if (providerSessionId) {
         run.providerSessionId = providerSessionId;
         this.aliases.set(providerSessionId, run.runId);
+        this.activityChanged();
       }
 
       const options = safeOptions(await this.runtime.enrichOptions(run.options));
+      // No await between the final ownership check and writing the request.
+      if (!this.canStartRun(run, startingChild)) return;
       if (!options) {
         this.finish(run, true, SAFE_FAILURE, 'not_started');
         return;
@@ -613,6 +881,7 @@ export class GjcWorkerSupervisor {
         () => {
           run.phase = 'request_issued';
           run.started = true;
+          this.activityChanged();
           run.resolveStarted();
         },
       );
@@ -621,6 +890,7 @@ export class GjcWorkerSupervisor {
         // Preserve that outcome through native jobs and the chat terminal.
         run.runtimeAborted = !run.aborted && !run.abortPromise;
         run.aborted = true;
+        this.activityChanged();
       }
       this.finish(run, run.terminalFailed || !response.ok, runFailureMessage(response));
     } catch (error) {
@@ -631,6 +901,8 @@ export class GjcWorkerSupervisor {
         true,
         error instanceof GjcConfigurationError ? error.message : SAFE_FAILURE,
       );
+    } finally {
+      release();
     }
   }
 
@@ -641,6 +913,16 @@ export class GjcWorkerSupervisor {
     }
     if (this.ready && this.child) return Promise.resolve();
     if (this.starting) return this.starting;
+    const release = this.beginActivity('starting');
+    try {
+      return this.startWorker(release);
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  private startWorker(releaseStartup: () => void): Promise<void> {
     const compiled = this.runtime.compiled ?? !import.meta.url.endsWith('.ts');
     const workerPath = this.runtime.workerPath ?? fileURLToPath(new URL(compiled ? './gjc-bun-worker.js' : './gjc-bun-worker.ts', import.meta.url));
     const bundledBunPath = fileURLToPath(new URL(
@@ -684,6 +966,8 @@ export class GjcWorkerSupervisor {
       windowsHide: true,
     });
     this.child = child; this.ready = false; this.decoder = new GjcWorkerNdjsonDecoder();
+    this.unreapedWorkers.add(child);
+    this.activityChanged();
     const usesWindowsJobGuard = this.runtime.platform === 'win32';
     let guardSettled = !usesWindowsJobGuard;
     let guardBuffer = Buffer.alloc(0);
@@ -699,6 +983,7 @@ export class GjcWorkerSupervisor {
     const settleGuard = (error?: Error): void => {
       if (guardSettled) return;
       guardSettled = true;
+      this.activityChanged();
       if (guardTimer) clearTimeout(guardTimer);
       if (error) rejectGuard(error);
       else resolveGuard();
@@ -761,6 +1046,7 @@ export class GjcWorkerSupervisor {
         if (child !== this.child) throw new Error('worker generation was replaced during initialization');
         if (!response.ok) throw new Error(`worker.initialize was rejected (${response.error.code})`);
         this.ready = true;
+        this.activityChanged();
       })
       .catch((error: unknown) => {
         // Callers only ever see the sanitized failure; this line is the one
@@ -772,9 +1058,14 @@ export class GjcWorkerSupervisor {
         throw new Error(SAFE_FAILURE);
       })
       .finally(() => {
-        if (this.starting === starting) this.starting = undefined;
+        if (this.starting === starting) {
+          this.starting = undefined;
+          this.activityChanged();
+        }
+        releaseStartup();
       });
     this.starting = starting;
+    this.activityChanged();
     return starting;
   }
 
@@ -803,6 +1094,7 @@ export class GjcWorkerSupervisor {
       return Promise.reject(error);
     }
     const tracked = this.tracker.track(request);
+    this.activityChanged();
     try {
       child.stdin.write(frame);
       onWritten?.();
@@ -816,6 +1108,12 @@ export class GjcWorkerSupervisor {
           request.id,
           new Error(REQUEST_TIMEOUT),
         )) {
+          // The bounded late-response correlation cache is not a lifetime proof.
+          // Even a late OAuth/goal reply cannot account for its SDK continuations.
+          // Admission cannot launch SDK work. A timed-out close remains fenced
+          // locally until an ordered exact-ID release is acknowledged; it must
+          // not manufacture permanent SDK uncertainty after successful release.
+          if (method !== 'worker.admission') this.requestTimeoutUncertainty = true;
           this.expiredRequests.set(request.id, {
             method: request.method,
             ...('sessionId' in request ? { sessionId: request.sessionId } : {}),
@@ -824,6 +1122,7 @@ export class GjcWorkerSupervisor {
             const oldest = this.expiredRequests.keys().next().value;
             if (oldest) this.expiredRequests.delete(oldest);
           }
+          this.activityChanged();
         }
       }, timeout);
       timer.unref?.();
@@ -855,10 +1154,20 @@ export class GjcWorkerSupervisor {
   }
 
   private handleResponse(response: GjcWorkerResponseFrame): void {
+    if (response.method === 'worker.activity') {
+      const observation = this.observation;
+      if (!observation || observation.id !== response.id || observation.child !== this.child) {
+        throw new GjcWorkerProtocolError('unknown_response_id', 'Activity response does not match its request.');
+      }
+      this.observation = undefined;
+      observation.settle(response.payload.ok ? response.payload.result : undefined);
+      return;
+    }
     if (!response.payload.ok && response.payload.error.code === GJC_CLEANUP_UNCONFIRMED_CODE) {
       const child = this.child;
       if (child) {
         for (const run of this.runs.values()) run.cleanupUnconfirmed = true;
+        this.activityChanged();
         // Fence synchronously, before settling the request and its startRun
         // continuation. workerFailed owns every terminal after verified reap.
         void this.workerFailed(child);
@@ -868,6 +1177,7 @@ export class GjcWorkerSupervisor {
     const expired = this.expiredRequests.get(response.id);
     if (!expired) {
       this.tracker.settle(response);
+      this.activityChanged();
       return;
     }
 
@@ -879,6 +1189,7 @@ export class GjcWorkerSupervisor {
       );
     }
     this.expiredRequests.delete(response.id);
+    this.activityChanged();
   }
 
   private handleEvent(event: GjcWorkerEventFrame): void {
@@ -895,10 +1206,14 @@ export class GjcWorkerSupervisor {
     const run = runId ? this.runs.get(runId) : undefined;
     const scope = 'sessionId' in event ? event.sessionId : undefined;
     if (!run || scope !== run.appScope) return;
+    this.activityChanged();
 
     if (event.method === 'worker.status') {
       const processId = payload?.processId;
       if (processId === null) {
+        // A status message dropping a PID is not OS termination proof. Do not
+        // forget a process the existing reap path can no longer verify.
+        if (run.processId) this.runProcessProofMissing = true;
         run.processId = undefined;
         return;
       }
@@ -908,6 +1223,9 @@ export class GjcWorkerSupervisor {
         && processId > 0
         && processId <= 0x7fffffff
       ) {
+        if (!this.hasRunProcessReaper || (run.processId && run.processId !== processId)) {
+          this.runProcessProofMissing = true;
+        }
         run.processId = processId;
       }
       return;
@@ -958,6 +1276,7 @@ export class GjcWorkerSupervisor {
     if (event.method === 'turn.failed' || event.method === 'turn.completed') {
       run.terminalForwarded = true;
       run.terminalFailed = event.method === 'turn.failed';
+      this.activityChanged();
     }
   }
 
@@ -975,6 +1294,7 @@ export class GjcWorkerSupervisor {
     // 'registered' has not reached the worker yet and 'run_terminal' is over.
     if (!run || run.phase !== 'request_issued' || run.aborted || run.abortPromise) return false;
 
+    const release = this.beginActivity('settling');
     try {
       const response = await this.request('turn.steer', run.appScope, {
         runId: run.runId,
@@ -984,6 +1304,8 @@ export class GjcWorkerSupervisor {
       return object(response.result)?.steered === true;
     } catch {
       return false;
+    } finally {
+      release();
     }
   }
 
@@ -994,20 +1316,28 @@ export class GjcWorkerSupervisor {
     if (run.abortPromise) return run.abortPromise.then((aborted) => aborted ? 'aborted' : 'unconfirmed');
     if (run.phase === 'registered') {
       run.aborted = true;
+      this.activityChanged();
       this.finish(run, false, SAFE_FAILURE, 'not_started');
       return Promise.resolve('not_started');
     }
+    const release = this.beginActivity('settling');
     const abortPromise = this.request('turn.abort', run.appScope, {
       runId: run.runId,
     }).then((response) => {
       const result = response.ok ? object(response.result) : undefined;
       if (!response.ok || result?.aborted !== true || run.phase === 'run_terminal') return false;
       run.aborted = true;
+      this.activityChanged();
       return true;
     }).catch(() => false).finally(() => {
-      if (run.abortPromise === abortPromise) run.abortPromise = undefined;
+      if (run.abortPromise === abortPromise) {
+        run.abortPromise = undefined;
+        this.activityChanged();
+      }
+      release();
     });
     run.abortPromise = abortPromise;
+    this.activityChanged();
     return abortPromise.then((aborted) => aborted ? 'aborted' : 'unconfirmed');
   }
   async terminate(alias: string): Promise<GjcWorkerReapOutcome> {
@@ -1035,6 +1365,7 @@ export class GjcWorkerSupervisor {
     if (!pending || !serializedDecision) return false;
     if (pending.inFlight) return true;
     pending.inFlight = true;
+    const release = this.beginActivity('settling');
     void this.request('ask.reply', pending.appScope, {
       runId: pending.runId,
       requestId,
@@ -1044,7 +1375,7 @@ export class GjcWorkerSupervisor {
       if (!response.ok || result?.accepted !== true) {
         this.restoreApproval(requestId, pending);
       }
-    }).catch(() => this.restoreApproval(requestId, pending));
+    }).catch(() => this.restoreApproval(requestId, pending)).finally(release);
     return true;
   }
 
@@ -1054,10 +1385,12 @@ export class GjcWorkerSupervisor {
     if (run?.cleanupUnconfirmed) return;
     if (!run || run.phase === 'run_terminal') {
       this.approvals.delete(requestId);
+      this.activityChanged();
       return;
     }
 
     pending.inFlight = false;
+    this.activityChanged();
     try {
       run.writer.send(pending.message);
     } catch {
@@ -1073,6 +1406,15 @@ export class GjcWorkerSupervisor {
   }
 
   private finish(run: Run, failed: boolean, failureMessage = SAFE_FAILURE, outcome: GjcWorkerOutcome = run.aborted ? 'aborted' : run.phase === 'registered' ? 'not_started' : 'completed'): void {
+    const release = this.beginActivity('settling');
+    try {
+      this.finishRun(run, failed, failureMessage, outcome);
+    } finally {
+      release();
+    }
+  }
+
+  private finishRun(run: Run, failed: boolean, failureMessage: string, outcome: GjcWorkerOutcome): void {
     if (run.phase === 'run_terminal') return;
     if (run.cleanupUnconfirmed) {
       if (outcome !== 'reaped') return;
@@ -1084,7 +1426,9 @@ export class GjcWorkerSupervisor {
         run.runtimeAborted = false;
       }
     }
+    if (run.processId && outcome !== 'reaped') this.runProcessProofMissing = true;
     run.phase = 'run_terminal';
+    this.activityChanged();
     if (!run.started) run.rejectStarted(new Error(failureMessage));
     run.resolveOutcome(outcome);
 
@@ -1098,6 +1442,7 @@ export class GjcWorkerSupervisor {
     for (const [id, pending] of this.approvals) {
       if (pending.runId === run.runId) this.approvals.delete(id);
     }
+    this.activityChanged();
 
     const sessionId = run.providerSessionId ?? run.appScope;
     if (failed && !run.aborted) {
@@ -1160,10 +1505,19 @@ export class GjcWorkerSupervisor {
     const existingGeneration = this.terminatingGeneration;
     if (existingGeneration?.child === child) return existingGeneration.outcome;
     if (child !== this.child) return Promise.resolve('unconfirmed');
+    // Retain ownership BEFORE clearing child or calling an injected terminator;
+    // callbacks may read the owner synchronously inside killTree().
+    const release = this.beginActivity('settling');
+    this.reapingWorkers.add(child);
+    if (this.observation?.child === child) {
+      this.observation.settle();
+      this.observation = undefined;
+    }
     this.child = undefined;
     this.ready = false;
     this.starting = undefined;
     this.decoder = undefined;
+    this.activityChanged();
 
     const usesWindowsJobGuard = this.runtime.platform === 'win32';
     const affectedRuns = [...this.runs.values()];
@@ -1190,32 +1544,53 @@ export class GjcWorkerSupervisor {
     }
     const termination = Promise.all(terminations).then(() => {}).catch((error) => {
       this.terminationFailure = new Error(SAFE_FAILURE, { cause: error });
+      this.activityChanged();
       throw this.terminationFailure;
     });
     this.terminating = termination;
     const outcome = termination.then(
       () => {
+        // Only this existing successful OS tree-reap barrier can clear the
+        // generation's runtime/timeout uncertainty, never failAll/exit/eviction.
+        // Lost/unverified separately reported PIDs remain a distinct blocker.
+        this.reapingWorkers.delete(child);
+        // Windows has no qualified tree-reap contract, including injected hooks.
+        if (!usesWindowsJobGuard) this.unreapedWorkers.delete(child);
+        // The default no-op run reaper or a discarded PID cannot prove the whole
+        // tree gone. Its bounded poison latch survives without retaining every
+        // otherwise-reaped Child (and its streams) across later generations.
+        if (this.unreapedWorkers.size === 0 && !this.runProcessProofMissing) {
+          this.requestTimeoutUncertainty = false;
+        }
+        this.activityChanged();
         for (const run of affectedRuns) {
           this.finish(run, run.terminalForwarded ? run.terminalFailed : true, SAFE_FAILURE, 'reaped');
         }
         return 'reaped' as const;
       },
       () => {
+        this.reapingWorkers.delete(child);
+        this.activityChanged();
         for (const run of affectedRuns) run.resolveOutcome('unconfirmed');
         return 'unconfirmed' as const;
       },
-    );
+    ).finally(release);
     this.terminatingGeneration = {
       child,
       runIds: new Set(affectedRuns.map((run) => run.runId)),
       outcome,
     };
+    this.activityChanged();
     void termination.finally(() => {
-      if (this.terminating === termination) this.terminating = undefined;
+      if (this.terminating === termination) {
+        this.terminating = undefined;
+        this.activityChanged();
+      }
     }).catch(() => {});
 
     this.tracker.failAll(new Error(SAFE_FAILURE));
     this.expiredRequests.clear();
+    this.activityChanged();
     return outcome;
   }
 
@@ -1228,17 +1603,28 @@ export class GjcWorkerSupervisor {
   shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.shuttingDown = true;
+    this.activityChanged();
     this.shutdownPromise = this.stopWorker();
     return this.shutdownPromise;
   }
 
   private async stopWorker(): Promise<void> {
+    const release = this.beginActivity('settling');
+    try {
+      await this.stopWorkerAndReap();
+    } finally {
+      release();
+    }
+  }
+
+  private async stopWorkerAndReap(): Promise<void> {
     const child = this.child;
     if (!child) {
       await this.awaitTermination();
       return;
     }
     for (const run of this.runs.values()) run.aborted = true;
+    this.activityChanged();
     try {
       await this.request(
         'worker.shutdown',
@@ -1289,6 +1675,18 @@ function reportWorkerDiagnostic(message: string): void {
 
 const supervisor = new GjcWorkerSupervisor({ enrichOptions: enrichGjcSdkRunOptions, diagnostic: reportWorkerDiagnostic });
 registerGjcRuntimeModelCatalogLoader(() => supervisor.modelCatalog());
+
+/** No lazy spawn, shutdown or admission mutation. A live idle proof needs an explicit fence. */
+export function createGjcWorkerDesktopRestartReader(worker: GjcWorkerSupervisor = supervisor): {
+  getGeneration(): string;
+  read(): Promise<DesktopOwnerActivity>;
+} {
+  return Object.freeze({
+    getGeneration: () => worker.getGeneration(),
+    read: () => worker.readDesktopRestartActivity(),
+  });
+}
+
 export function getGjcWorkerSupervisor(): GjcWorkerSupervisor { return supervisor; }
 export function isGjcSessionActive(alias: string) { return supervisor.isActive(alias); }
 export function resolveGjcToolApproval(requestId: string, decision: GjcApprovalDecision) { return supervisor.resolveApproval(requestId, decision); }

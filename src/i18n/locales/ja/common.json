@@ -114,7 +114,13 @@
     "tasks": {
       "empty": "まだ計画はありません",
       "emptyHint": "このセッションでエージェントが ToDo リストを管理すると、ここに表示されます。",
-      "progress": "{{total}} 件中 {{done}} 件完了"
+      "progress": "{{total}} 件中 {{done}} 件完了",
+      "status": {
+        "pending": "未着手",
+        "in_progress": "進行中",
+        "completed": "完了",
+        "abandoned": "取り下げ"
+      }
     },
     "browser": {
       "address": "Web アドレス。",
