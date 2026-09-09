@@ -1,5 +1,14 @@
 # gajae-app v2 — Session Handoff (resume state)
 
+**Published and installed: v2.0.0-beta.12 / desktop 0.2.6**, source `48fffce`.
+Release `385189777` contains the signed/notarized macOS DMG and click-update
+archive/manifest plus same-source Linux server/desktop artifacts. The installed
+Applications copy runs in production update mode at the prior local origin;
+beta.11 is preserved as a local binary backup. PRs #49/#50/#51 are merged.
+Extended future-version update/OS13/authority scenarios remain explicitly
+disclosed beta follow-up work, per the user's publication instruction.
+See [RELEASE-BETA12-ACCEPTANCE.md](RELEASE-BETA12-ACCEPTANCE.md) for exact evidence.
+
 Latest updater policy: the user requested a bottom-left notice above Settings
 and explicit Update clicks instead of automatic installation. Discovery is
 checks-only; download and safe restart bind the clicked native target. Cached

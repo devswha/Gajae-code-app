@@ -1,5 +1,11 @@
 # Local production updater-key custody
 
+The matching public key is now compiled into the published beta.12 / desktop
+0.2.6 application. The encrypted private key signed its updater archive and
+official Minisign 0.12 verification passed. No private key/password was uploaded.
+Independent backup remains deferred by the operator; see the release's explicit
+acceptance/limitations in `docs/RELEASE-BETA12-ACCEPTANCE.md`.
+
 ## Verified local setup — September 9, 2026
 
 The operator generated a password-protected Tauri key through the official
@@ -29,8 +35,8 @@ The repository contains no private key, password or signing credential.
 
 This is **local key-provisioning proof**, not a published update, a production
 app change, or final release acceptance. The release verifier must still use
-official Minisign 0.12 as required by `LOCAL-RELEASE.md`. This key has not yet
-been bound into a publicly distributed updater-enabled application.
+official Minisign 0.12 as required by `LOCAL-RELEASE.md`. The original provisioning
+proof preceded the beta.12 publication recorded above.
 
 ## Independent recovery backup remains pending
 
