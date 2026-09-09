@@ -1,5 +1,11 @@
 # Linux desktop (x86_64)
 
+> **Out of active development (owner decision, 2026-09-09).** The macOS app
+> is completed first. This guide and the Linux packaging scripts are kept
+> for reference and for explicit owner requests only; the CI lane below is
+> dispatch-only and does not gate merges. Do not carry Linux desktop items
+> forward as remaining work.
+
 Gajae Code App has a native Tauri 2 Linux desktop build path producing `.deb`
 and `.AppImage` packages. Each package carries the web client, server, Rust
 core, native dependencies, **Node.js 22.22.2**, and **Bun 1.4.0**. An installed
@@ -303,8 +309,8 @@ node --test scripts/release/smoke-linux-desktop.test.mjs
 
 ## CI and acceptance evidence
 
-`.github/workflows/desktop-linux.yml` runs on pull requests, pushes to `main`,
-and manual dispatch. The workflow:
+`.github/workflows/desktop-linux.yml` runs on manual dispatch only (it used to
+run on pull requests and pushes to `main`). The workflow:
 
 1. Requires an x86_64 Ubuntu 22.04 build host with glibc 2.35 and Node 22.22.2.
 2. Installs the system prerequisites and pinned Bun, then builds both packages.

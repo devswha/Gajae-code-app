@@ -34,10 +34,14 @@ job projection protocol). `scripts/` holds build/release/verify tooling.
 - Server binds loopback by default (fail-closed; it can run shell commands).
   `SERVER_PORT` defaults to 3001, Vite dev on 5173. Do not export `SERVER_PORT=0`.
 - Tauri builds choke on `CI=1`: use `env -u CI npm run tauri -- build`.
-- Linux desktop packaging targets native `x86_64-unknown-linux-gnu`, bundles
-  Node **22.22.2** and Bun **1.4.0**, and needs GTK 3/WebKitGTK 4.1 plus the
-  prerequisites in `docs/DESKTOP-LINUX.md`. CI builds on Ubuntu 22.04/glibc 2.35;
-  local Ubuntu 24.04/glibc 2.39 artifacts do not establish that compatibility floor.
+- **Desktop scope (owner decision, 2026-09-09): macOS (Apple Silicon) first.**
+  The Linux desktop app is out of active development until the macOS app is
+  complete. Do not plan, build, smoke, or gate work on Linux desktop packages;
+  do not carry Linux desktop items forward as remaining work. The Linux
+  *server* archive (self-host) stays in scope. Linux desktop packaging
+  (`docs/DESKTOP-LINUX.md`, `desktop:build:linux`, the dispatch-only
+  `desktop-linux.yml` lane) is kept, not maintained; touch it only when the
+  owner asks for a Linux desktop build.
 
 ## Commands
 
@@ -50,11 +54,11 @@ npm run check:core       # cargo fmt --check + clippy -D warnings + cargo test
 npm run verify           # FULL GATE: audit + typecheck + check:core + test + lint + check:identity + build
 npm run test:e2e:gjc     # 7 GJC wire/browser e2e tests (separate from npm test)
 npm run desktop:dev      # Tauri dev shell
-npm run server:payload:linux # Linux x64 payload + pinned runtimes
-env -u CI npm run desktop:build:linux # payload + Tauri deb/AppImage + release/desktop staging
-npm run smoke:packaged-server -- --linux-root <extracted-dir> # extracted deb or squashfs-root
-npm run smoke:packaged-server -- --linux-root <extracted-dir> --data-survival
-npm run smoke:packaged-server -- --linux-root <squashfs-root> --appimage-env # AppRun + real Python/gio terminal probes
+npm run server:payload:macos # embedded macOS server payload + sidecar (prerequisite for src-tauri cargo test)
+env -u CI npm run tauri -- build --bundles app # ad-hoc macOS app bundle (unsigned)
+npm run server:payload:linux # Linux x64 self-host payload + pinned runtimes
+# Linux desktop (out of scope; owner request only): env -u CI npm run desktop:build:linux,
+# then npm run smoke:packaged-server -- --linux-root <extracted-dir> [--data-survival|--appimage-env]
 ```
 
 Run a single test file (match the runner's env):
@@ -72,20 +76,23 @@ dist-native/bun test src/shared/view/ui/ActionMenu.dom.bun.test.tsx
 
 `npm test` has a `pretest` that builds the Rust core (debug); tests fail without it.
 
-Linux desktop CI is `.github/workflows/desktop-linux.yml`: manual/PR/push-main
-builds, with package smokes on Ubuntu 22.04 and 24.04. After the bundle build,
-it runs `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` and
-`cargo test --locked --manifest-path src-tauri/Cargo.toml`; `npm run verify`
-does not cover these desktop shell checks. It only uploads build
-artifacts; it does not publish or announce releases. Stage Linux packages as
+Desktop shell CI is `.github/workflows/desktop-macos.yml` (PR/push-main on
+`macos-14`): it builds the embedded server payload (`server:payload:macos`),
+runs `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` and
+`cargo test --locked --manifest-path src-tauri/Cargo.toml`, and assembles an
+ad-hoc app bundle. `npm run verify` does not cover these desktop shell checks;
+`cargo test` needs the sidecar and payload present, so run
+`npm run server:payload:macos` first on a clean checkout. Signing,
+notarization and publication stay in the manual `release.yml`.
+
+`.github/workflows/desktop-linux.yml` is dispatch-only and does not gate
+merges. When explicitly asked for a Linux desktop build: it produces
 `release/desktop/gajae-app-desktop-${package.version}-linux-x64.deb` and
-`.AppImage`, each with `.sha256`. Extract outside the checkout before smoking
-to prevent repository `node_modules` from masking missing bundled dependencies.
-Keep standard smoke and `--data-survival` as separate invocations. Record
-packaging, server smoke, and interactive GUI results separately.
-`desktop:build:linux` restores the verified AppImage runtime after linuxdeploy
-and before staging/checksums; preserve this step so ELF rewriting cannot break
-the runtime manifest hashes.
+`.AppImage`, each with `.sha256`, on Ubuntu 22.04/glibc 2.35 with package
+smokes on 22.04 and 24.04. Extract outside the checkout before smoking; keep
+standard smoke and `--data-survival` as separate invocations; the build
+restores the verified AppImage runtime after linuxdeploy so ELF rewriting
+cannot break the runtime manifest hashes.
 
 ## Frontend stack
 

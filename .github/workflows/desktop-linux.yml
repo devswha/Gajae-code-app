@@ -1,11 +1,11 @@
 name: Linux desktop
 
+# Linux desktop is out of active development scope (owner decision, 2026-09-09):
+# the macOS app is completed first. This lane no longer runs on pull requests
+# or pushes and does not gate merges; dispatch it manually when a Linux desktop
+# build is explicitly wanted. The Linux server archive (self-host) is unaffected.
 on:
   workflow_dispatch:
-  pull_request:
-  push:
-    branches:
-      - main
 
 permissions:
   contents: read

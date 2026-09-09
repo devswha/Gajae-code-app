@@ -44,6 +44,27 @@ must be rebuilt. See the signed QA record for the bounded patch/audit scope.
 
 Last updated: 2026-09-09 (same-source signed automatic A → B and data preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
 
+## Scope decision — macOS first, Linux desktop excluded (2026-09-09)
+
+The owner excluded the Linux desktop app from development until the macOS
+app is complete. Consequences, all landed the same day:
+
+- `.github/workflows/desktop-linux.yml` is `workflow_dispatch` only; it no
+  longer runs on PRs or pushes and does not gate merges.
+- New `.github/workflows/desktop-macos.yml` (PR/push-main, `macos-14`) is
+  the desktop shell gate: `server:payload:macos`, `cargo fmt --check` +
+  `cargo test --locked` for `src-tauri`, then an ad-hoc `tauri build
+  --bundles app` with a bundle inspection. This replaces the `src-tauri`
+  coverage the Linux lane used to provide.
+- AGENTS.md carries the rule. Linux desktop items in the updater handoff
+  (Ubuntu package/GUI smokes, AppImage runtime restore) are historical
+  evidence, not remaining work. The Linux *server* archive (self-host) and
+  its `server-linux.yml` lane stay in scope. Release assets: Linux desktop
+  deb/AppImage were already optional in `updater-artifacts.mjs`; future
+  releases ship macOS DMG/updater + Linux server archive only unless the
+  owner asks otherwise. Website download links for Linux desktop should be
+  dropped at the next release (not changed retroactively for beta.12).
+
 ## Post-beta.12 checkpoint — external PRs landed (2026-09-09 afternoon)
 
 - **#43 merged (`f6a288a`), closes #42.** Persisted goal inspection is

@@ -1,0 +1,93 @@
+name: macOS desktop
+
+# The macOS app is the active desktop target (owner decision, 2026-09-09; the
+# Linux desktop lane is dispatch-only). This lane proves the desktop shell on
+# every change: the embedded server payload builds, `src-tauri` is formatted
+# and its tests pass, and an ad-hoc app bundle assembles. Signing, notarization
+# and publication stay in the manual release workflow.
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    name: Build macOS arm64 desktop shell (ad-hoc)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          architecture: arm64
+          cache: npm
+
+      - name: Check build host
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          case "$(node --version)" in
+            v22.*) ;;
+            *) echo "Node 22 is required." >&2; exit 1 ;;
+          esac
+          echo "Desktop source commit: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.85.1 --profile minimal --component rustfmt
+          rustup default 1.85.1
+          rustup target add aarch64-apple-darwin
+          rustc --version
+
+      - name: Seed verified ripgrep install cache
+        run: node scripts/release/prime-ripgrep-cache.mjs
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check product identity
+        run: npm run check:identity
+
+      - name: Build and verify embedded macOS server payload
+        run: npm run server:payload:macos
+
+      - name: Check Tauri formatting and tests
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          env -u CI cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build ad-hoc Tauri app bundle
+        run: env -u CI npm run tauri -- build --bundles app
+
+      - name: Inspect the assembled bundle
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Gajae Code App.app"
+          test -d "$APP"
+          test -x "$APP/Contents/MacOS/gajae-app-desktop"
+          test -x "$APP/Contents/MacOS/gajae-app-server"
+          test -d "$APP/Contents/Resources/resources/server-payload"
+          codesign --verify --deep --strict "$APP"
+          du -sh "$APP" >> "$GITHUB_STEP_SUMMARY"
