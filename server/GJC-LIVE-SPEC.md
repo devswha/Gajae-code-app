@@ -206,7 +206,10 @@ method or frame changes; the policy travels inside existing payloads:
 - A call the policy covers (`bypass`, a tool on `allowAlways`, or a file
   mutation under `auto_edits`) is approved inside the worker and recorded once
   per tool per run as a `system_notice` ("Auto-approved bash (always allow)").
-  Nothing crosses to the host, so the run is never reported as awaiting input.
+  The browser omits these routine info lines when projecting chat rows; raw
+  records and permission handling are unchanged. Other info notices, warnings,
+  errors, and actual approval requests remain visible.
+  No permission request crosses to the host, so the run is never reported as awaiting input.
 - Any other gated call is an `ask.presented` event whose message is a
   `permission_request` with `requestId` prefixed `sdk-permission:`, the
   runtime's `toolName`, its `rawInput` as `input`, and a `context` naming the
@@ -215,6 +218,14 @@ method or frame changes; the policy travels inside existing payloads:
   runtime's `allow_always` option for the rest of that run, and the application
   persists it to the project's allow-list before forwarding the reply.
 - `ask` questions keep their `sdk-ask:` prefix and answer semantics.
+
+The app-owned browser and computer tool wrappers receive the same validated
+run permission mode as the SDK gate. In `bypass`, target/origin resolution still
+runs, but the extra access question is omitted without adding grants to either
+allow-list. Ask and auto-edits retain their existing access prompts. This does
+not auto-answer `ask` questions, approve Chromium installation, or override OS
+permissions or CUA driver restrictions. The mode is captured for the run; no
+implicit grant survives into a later Ask run.
 
 ## Process and terminal lifecycle
 

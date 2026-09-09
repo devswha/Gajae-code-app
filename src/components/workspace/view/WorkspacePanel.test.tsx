@@ -59,6 +59,8 @@ test('the panel offers only the surfaces the app still owns', () => {
 
   assert.doesNotMatch(html, /workspace-tab-files/);
   assert.doesNotMatch(html, /workspace-tab-editor/);
+  assert.doesNotMatch(html, /workspace-tab-tasks/);
+  assert.doesNotMatch(render({ isMobile: true }), /workspace-tab-tasks/);
 });
 
 test('only the selected tab is reachable with Tab, the rest with arrow keys', () => {

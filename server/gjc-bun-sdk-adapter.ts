@@ -723,6 +723,7 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
               config.appSessionId,
               askController.uiContext,
               this.options.automationBridge,
+              config.permissions?.mode,
             )),
           } : {}),
         };

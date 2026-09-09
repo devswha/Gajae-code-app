@@ -116,7 +116,13 @@
     "tasks": {
       "empty": "Ancora niente in programma",
       "emptyHint": "Quando l’agente tiene un elenco di attività in questa sessione, appare qui.",
-      "progress": "{{done}} di {{total}} completate"
+      "progress": "{{done}} di {{total}} completate",
+      "status": {
+        "pending": "In attesa",
+        "in_progress": "In corso",
+        "completed": "Completata",
+        "abandoned": "Abbandonata"
+      }
     },
     "browser": {
       "address": "Indirizzo web",

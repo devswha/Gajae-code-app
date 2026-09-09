@@ -206,6 +206,7 @@ The system uses Tailwind's 4px spacing scale. Existing values like `p-2`, `gap-2
 ### Chat Pane
 
 - **Structure**: `ChatMessagesPane` owns scroll; `ChatComposer` is fixed at the bottom of the chat column.
+- **Session tasks**: a collapsible, read-only task card sits above the transcript whenever the current session has a plan. Its progress stays visible when collapsed; the expanded list has a bounded, keyboard-focusable scroll area so long plans do not push the composer off screen. Tasks no longer occupy a workspace-panel tab.
 - **Performance**: message rows use `contain`, `content-visibility: auto`, and intrinsic sizes to reduce long-transcript layout cost.
 - **States**: loading, empty provider selection, older-message loaders, load-all overlay, grouped tool messages, new-message scroll button.
 - **Layout**: message and composer width align at `max-w-[54.25rem]`.

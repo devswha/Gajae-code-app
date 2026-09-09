@@ -24,6 +24,7 @@ import { useGoalControls } from '../hooks/useGoalControls';
 import GoalControls from './GoalControls';
 import ChatComposer from './ChatComposer';
 import ChatMessagesPane from './ChatMessagesPane';
+import ChatTasksPanel from './ChatTasksPanel';
 import CommandResultModal from './CommandResultModal';
 import type { ReasoningEffort } from './reasoningEffort';
 
@@ -318,6 +319,7 @@ function ChatInterface({
     <PermissionContext.Provider value={permissionContextValue}>
       <div className="flex h-full min-h-0 flex-col">
         {!historicalSession && (session.currentSessionId || selectedSession?.id) && <GoalControls key={`${selectedProject.projectId}:${session.currentSessionId ?? selectedSession?.id}`} {...goalControls} />}
+        <ChatTasksPanel sessionId={selectedSession?.id ?? session.currentSessionId ?? undefined} sessionStore={sessionStore} />
         {showLanding ? (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 pb-[10vh] sm:px-6">
             <div className="w-full max-w-184">

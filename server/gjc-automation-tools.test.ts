@@ -412,3 +412,114 @@ test('an unrelated open failure is not turned into a download prompt', async () 
     await bridge.close();
   }
 });
+
+test('bypass authorizes browser access for this session without an extra permission question', async () => {
+  const bridge = await bridgeServer((request) => request.operation === 'authorize'
+    ? { ok: true, result: { granted: (request.payload as Record<string, unknown>)?.scope === 'session', origin: 'https://example.com' } }
+    : { ok: true, result: { opened: true } });
+  let prompts = 0;
+  try {
+    const { browser } = createGjcAutomationTools('bypass-session', {
+      async select() { prompts += 1; return 'Deny'; },
+    }, { socketPath: bridge.socketPath, token: TEST_TOKEN }, 'bypass');
+    await browser!.execute('bypass-open', { action: 'open', url: 'https://example.com/page' }, undefined);
+    assert.equal(prompts, 0);
+    assert.deepEqual(bridge.requests.map((request) => request.operation), ['authorize', 'open']);
+    assert.ok(bridge.requests.every((request) => request.sessionId === 'bypass-session'));
+    assert.ok(bridge.requests.every((request) => !(request.payload as Record<string, unknown> | undefined)?.scope));
+  } finally { await bridge.close(); }
+});
+
+test('bypass covers computer access without creating session or persistent grants', async () => {
+  const bridge = await bridgeServer((request) => request.operation === 'authorize'
+    ? { ok: true, result: { granted: false, application: 'com.apple.TextEdit', label: 'TextEdit' } }
+    : { ok: true, result: { controlled: true } });
+  try {
+    const { computer } = createGjcAutomationTools('bypass-computer', {
+      async select() { assert.fail('bypass must not ask again'); },
+    }, { socketPath: bridge.socketPath, token: TEST_TOKEN }, 'bypass');
+    await computer!.execute('click', { action: 'click', arguments: { pid: 42, x: 10, y: 20 } }, undefined);
+    assert.deepEqual(bridge.requests.map((request) => request.operation), ['authorize', undefined]);
+    assert.ok(bridge.requests.every((request) => request.sessionId === 'bypass-computer'));
+    assert.ok(bridge.requests.every((request) => !(request.payload as Record<string, unknown> | undefined)?.scope));
+  } finally { await bridge.close(); }
+});
+
+test('bypass leaves later Ask runs and other sessions ungranted', async () => {
+  let granted = false;
+  const bridge = await bridgeServer((request) => {
+    if ((request.payload as Record<string, unknown> | undefined)?.scope) granted = true;
+    return { ok: true, result: request.operation === 'authorize' ? { granted, origin: 'https://example.com' } : { opened: true } };
+  });
+  let prompts = 0;
+  const ui = { async select() { prompts += 1; return 'Deny'; } };
+  try {
+    const transport = { socketPath: bridge.socketPath, token: TEST_TOKEN };
+    const bypass = createGjcAutomationTools('same-session', ui, transport, 'bypass');
+    await bypass.browser!.execute('first', { action: 'open', url: 'https://example.com' }, undefined);
+    await bypass.browser!.execute('again', { action: 'act', actions: [{ verb: 'observe' }] }, undefined);
+    assert.equal(prompts, 0);
+    assert.equal(granted, false);
+    for (const sessionId of ['same-session', 'other-session']) {
+      const ask = createGjcAutomationTools(sessionId, ui, transport, 'ask');
+      await assert.rejects(ask.browser!.execute('ask', { action: 'open', url: 'https://example.com' }, undefined), /was denied/);
+    }
+    assert.equal(prompts, 2);
+    assert.equal(granted, false);
+  } finally { await bridge.close(); }
+});
+
+test('default and auto-edits modes still ask, and tool parameters cannot enable bypass', async () => {
+  for (const mode of [undefined, 'ask', 'auto_edits'] as const) {
+    const bridge = await bridgeServer(() => ({ ok: true, result: { granted: false, origin: 'https://example.com' } }));
+    let prompts = 0;
+    try {
+      const { browser } = createGjcAutomationTools('ask-session', {
+        async select() { prompts += 1; return 'Deny'; },
+      }, { socketPath: bridge.socketPath, token: TEST_TOKEN }, mode);
+      await assert.rejects(browser!.execute('untrusted-params', {
+        action: 'open', url: 'https://example.com', permissionMode: 'bypass', permissions: { mode: 'bypass' },
+      }, undefined), /was denied/);
+      assert.equal(prompts, 1);
+      assert.deepEqual(bridge.requests.map((request) => request.operation), ['authorize']);
+    } finally { await bridge.close(); }
+  }
+});
+
+test('bypass preserves first-download consent and backend authorization failures', async () => {
+  const bridge = await bridgeServer((request) => request.operation === 'authorize'
+    ? { ok: true, result: { granted: false, origin: 'https://example.com' } }
+    : { ok: false, error: 'browser_download_required: Chromium is not installed.' });
+  const prompts: string[] = [];
+  try {
+    const { browser } = createGjcAutomationTools('download-session', {
+      async select(title) { prompts.push(title); return 'Not now'; },
+    }, { socketPath: bridge.socketPath, token: TEST_TOKEN }, 'bypass');
+    await assert.rejects(browser!.execute('download', { action: 'open', url: 'https://example.com' }, undefined), /declined the download/);
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0]!, /needs Chromium/);
+    assert.ok(bridge.requests.every((request) => (request.payload as Record<string, unknown> | undefined)?.allowDownload !== true));
+  } finally { await bridge.close(); }
+
+  const rejected = await bridgeServer(() => ({ ok: false, error: 'Computer action requires a resolvable application identity.' }));
+  try {
+    const { computer } = createGjcAutomationTools('invalid-target', {
+      async select() { assert.fail('must preserve the backend rejection'); },
+    }, { socketPath: rejected.socketPath, token: TEST_TOKEN }, 'bypass');
+    await assert.rejects(computer!.execute('bad-target', { action: 'click', arguments: { pid: 42 } }, undefined), /resolvable application/);
+    assert.equal(rejected.requests.length, 1);
+  } finally { await rejected.close(); }
+});
+
+test('already-cancelled bypass tools do not connect or authorize any action', async () => {
+  const bridge = await bridgeServer(() => ({ ok: true, result: { granted: true } }));
+  try {
+    const tools = createGjcAutomationTools('cancelled-session', {
+      async select() { assert.fail('cancelled calls must not ask'); },
+    }, { socketPath: bridge.socketPath, token: TEST_TOKEN }, 'bypass');
+    const signal = AbortSignal.abort();
+    await assert.rejects(tools.browser!.execute('cancelled-browser', { action: 'open', url: 'https://example.com' }, signal), /cancelled/);
+    await assert.rejects(tools.computer!.execute('cancelled-computer', { action: 'click', arguments: { pid: 42 } }, signal), /cancelled/);
+    assert.deepEqual(bridge.requests, []);
+  } finally { await bridge.close(); }
+});
