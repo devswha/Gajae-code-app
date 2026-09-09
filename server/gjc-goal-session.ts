@@ -23,7 +23,7 @@ type GoalManager = {
 const OWNER_ENTRY = 'gajae-goal-owner-v1';
 export const GJC_GOAL_MODEL_OPERATIONS = ['create', 'get', 'pause', 'resume', 'complete'] as const;
 
-export function readPersistedGjcGoal(manager: GoalManager): { state?: GjcGoalState; scope?: GjcGoalScope } {
+export function readPersistedGjcGoal(manager: Pick<GoalManager, 'getBranch'>): { state?: GjcGoalState; scope?: GjcGoalScope } {
   let state: GjcGoalState | undefined;
   let scope: GjcGoalScope | undefined;
   for (const entry of manager.getBranch()) {

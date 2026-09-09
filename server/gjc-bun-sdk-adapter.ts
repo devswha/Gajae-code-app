@@ -9,7 +9,8 @@ import { resolveModelRoleValue } from '@gajae-code/coding-agent/config/model-res
 import { Settings } from '@gajae-code/coding-agent/config/settings';
 import { AuthStorage } from '@gajae-code/coding-agent/session/auth-storage';
 import { SessionDisposalIncompleteError } from '@gajae-code/coding-agent/session/agent-session';
-import { SessionManager } from '@gajae-code/coding-agent/session/session-manager';
+import { parseSessionEntries, SessionManager, type SessionEntry } from '@gajae-code/coding-agent/session/session-manager';
+import { MemorySessionStorage } from '@gajae-code/coding-agent/session/session-storage';
 import { executeAcpBuiltinSlashCommand } from '@gajae-code/coding-agent/slash-commands/acp-builtins';
 import { initTheme, theme } from '@gajae-code/coding-agent/modes/theme/theme';
 import { generateSessionTitle } from '@gajae-code/coding-agent/utils/title-generator';
@@ -791,17 +792,48 @@ export class GjcBunSdkAdapter implements GjcWorkerRuntime {
   }
 
   async #inspectGjcGoal(scope: GjcGoalScope, providerSessionId: string, sessionRoot: string): Promise<GjcGoalSnapshot> {
-    const manager = await resumeManager(providerSessionId, sessionRoot);
+    // list/open can recover backups and persist replay sanitation. A goal read must
+    // never acquire write ownership of a transcript an external CLI may be using.
+    const matches = (await SessionManager.listForResumePickerReadOnly('', sessionRoot))
+      .filter((session) => session.id === providerSessionId);
+    if (matches.length !== 1) throw new Error(FAILURE);
+    const captured = SessionManager.captureTranscriptStrict(matches[0].path);
+    if (captured.kind !== 'captured') throw new Error(FAILURE);
+    const { snapshot } = captured;
     try {
-      const { state, scope: owner } = readPersistedGjcGoal(manager);
-      const actualCwd = await realpath(manager.getCwd());
+      if (snapshot.identity.sessionId !== providerSessionId) throw new Error(FAILURE);
+      // Validate an immutable copy with the SDK. Never construct a manager: even
+      // recovery hydration can rebuild sidecars and write shared image blobs.
+      const bytes = Buffer.from(snapshot.materialize());
+      const storage = new MemorySessionStorage();
+      storage.writeBytesOwnedSync(snapshot.identity.canonicalPath, bytes);
+      const inspected = await SessionManager.inspectSessionTailReadOnly(snapshot.identity.canonicalPath, storage);
+      if (inspected.kind === 'error' || inspected.identity.sessionId !== providerSessionId
+        || inspected.identity.sha256 !== snapshot.identity.sha256) throw new Error(FAILURE);
+      const entries = parseSessionEntries(bytes.toString('utf8'));
+      const header = entries[0];
+      if (header?.type !== 'session') throw new Error(FAILURE);
+      const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== 'session');
+      const byId = new Map(sessionEntries.map((entry) => [entry.id, entry]));
+      const branch: SessionEntry[] = [];
+      const visited = new Set<string>();
+      // Match getBranch(): the last entry is the leaf, not every chronological mode change.
+      for (let entry = sessionEntries.at(-1); entry && !visited.has(entry.id);
+        entry = entry.parentId ? byId.get(entry.parentId) : undefined) {
+        visited.add(entry.id);
+        branch.push(entry);
+      }
+      branch.reverse();
+      const { state, scope: owner } = readPersistedGjcGoal({ getBranch: () => branch });
+      const actualCwd = await realpath(header.cwd);
       if (actualCwd !== (owner?.cwd ?? scope.cwd)) throw new Error('Goal working directory does not match the persisted session.');
+      if (snapshot.revalidate().kind !== 'valid') throw new Error(FAILURE);
       return {
         supported: true, goal: state?.goal ?? null, runId: null,
         canControl: owner ? matchesGjcGoalOwner(owner, scope) : !state,
         resumeRequired: state?.goal.status === 'active',
       };
-    } finally { await manager.close(); }
+    } finally { snapshot.close(); }
   }
 
   async controlGjcGoal(runId: string, scope: GjcGoalScope, command?: GjcGoalCommand, stopAfterMutation = true): Promise<GjcGoalSnapshot> {
