@@ -1,6 +1,8 @@
 import { spawn as spawnChild } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
+
 const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_QUEUED_PATHS = 4096;
 const FAILURE_MESSAGE = 'GJC session watcher failed.';
@@ -51,6 +53,8 @@ export type GjcSessionWatcherOptions = {
   closeExitTimeoutMs?: number;
   diagnostic?: (message: string) => void;
   compiled?: boolean;
+  desktopAdmission?: DesktopWorkAdmission;
+  onActivityChange?: () => void;
 };
 
 function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } {
@@ -68,14 +72,6 @@ function timeout(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
   });
-}
-
-function safeCall(callback: () => unknown): void {
-  try {
-    void Promise.resolve(callback()).catch(() => {});
-  } catch {
-    // Callback failures must not escape process event handlers.
-  }
 }
 
 /** Watches GJC transcript files through the mandatory native Protocol v1 host. */
@@ -96,8 +92,14 @@ export class GjcSessionWatcher {
   private drainDone = deferred();
   private drainCancelled = false;
   private readonly drainAbort = new AbortController();
+  private readonly desktopAdmission?: DesktopWorkAdmission;
+  private readonly onActivityChange: () => void;
+  private callbacks = 0;
+  private admissionRetry?: ReturnType<typeof setTimeout>;
 
   constructor(options: GjcSessionWatcherOptions) {
+    this.desktopAdmission = options.desktopAdmission;
+    this.onActivityChange = options.onActivityChange ?? (() => {});
     this.options = {
       roots: options.roots,
       onEvent: options.onEvent,
@@ -114,6 +116,19 @@ export class GjcSessionWatcher {
     };
   }
 
+  snapshotActivity() {
+    return { starting: this.starting && !this.ready && !this.closed ? 1 : 0,
+      queued: this.pending.size, running: Number(this.draining) + this.callbacks,
+      settling: this.closed && this.child && !this.exitedOnce ? 1 : 0,
+      unknown: this.failed && !this.exitedOnce ? ['watcher_exit_unconfirmed'] : [] };
+  }
+  private changed(): void { this.onActivityChange(); }
+  private callback(work: () => unknown): void {
+    this.callbacks++; this.changed();
+    const done = () => { this.callbacks--; this.changed(); };
+    try { void Promise.resolve(work()).then(done, done); } catch { done(); }
+  }
+
   start(): Promise<void> {
     if (this.closed) return Promise.reject(new Error(FAILURE_MESSAGE));
     if (this.starting) return this.starting;
@@ -125,6 +140,7 @@ export class GjcSessionWatcher {
     ));
     const args = ['watch', ...this.options.roots.flatMap((root) => ['--root', root])];
     this.starting = this.waitForReady();
+    this.changed();
     try {
       const child = this.options.spawn(corePath, args, {
         detached: false,
@@ -133,6 +149,7 @@ export class GjcSessionWatcher {
         windowsHide: true,
       });
       this.child = child;
+      this.changed();
       child.stdout.on('data', (chunk) => this.onStdout(chunk));
       child.stderr?.on('data', () => this.diagnose(STDERR_MESSAGE));
       child.stdin.on?.('error', () => this.fail());
@@ -194,6 +211,7 @@ export class GjcSessionWatcher {
     if (record.kind === 'ready') {
       if (this.ready || keys.length !== 2 || !keys.includes('protocolVersion') || !keys.includes('kind')) return this.fail();
       this.ready = true;
+      this.changed();
       this.started.resolve();
       return;
     }
@@ -214,6 +232,7 @@ export class GjcSessionWatcher {
     }
     if (!this.pending.has(record.path) && this.pending.size >= MAX_QUEUED_PATHS) return this.fail();
     this.pending.set(record.path, { kind: record.event, path: record.path });
+    this.changed();
     void this.drain();
   }
 
@@ -221,36 +240,53 @@ export class GjcSessionWatcher {
     if (this.draining) return;
     this.drainDone = deferred();
     this.draining = true;
+    this.changed();
     try {
       while (!this.failed && !this.drainCancelled && this.pending.size > 0) {
         const event = this.pending.values().next().value as GjcSessionWatchEvent;
+        let release: (() => void) | undefined;
+        try { release = this.desktopAdmission?.enter('watcher:synchronize'); }
+        catch (error) {
+          if (error && typeof error === 'object' && 'code' in error && error.code === 'DESKTOP_RESTART_FENCED') {
+            // Retain the accepted path. It invalidates an idle proof and can
+            // resume after cancellation; it is never silently discarded.
+            if (!this.admissionRetry) this.admissionRetry = setTimeout(() => { this.admissionRetry = undefined; if (!this.closed) void this.drain(); }, 25);
+            return;
+          }
+          throw error;
+        }
         this.pending.delete(event.path);
+        this.changed();
         try {
           await this.options.onEvent(event, this.drainAbort.signal);
         } catch {
           if (!this.drainCancelled) this.diagnose(CALLBACK_FAILURE_MESSAGE);
+        } finally {
+          release?.();
         }
       }
     } finally {
       this.draining = false;
+      this.changed();
       if (this.pending.size === 0 || this.drainCancelled) this.drainDone.resolve();
     }
   }
 
   private diagnose(message: string): void {
-    safeCall(() => this.options.diagnostic(message));
+    this.callback(() => this.options.diagnostic(message));
   }
 
   private fail(): void {
     if (this.failed || this.closed) return;
     this.failed = true;
+    this.changed();
     this.drainCancelled = true;
     this.pending.clear();
     this.drainAbort.abort();
     this.drainDone.resolve();
     this.started.reject(new Error(FAILURE_MESSAGE));
     this.diagnose(FAILURE_MESSAGE);
-    safeCall(() => this.options.onFailure(new Error(FAILURE_MESSAGE)));
+    this.callback(() => this.options.onFailure(new Error(FAILURE_MESSAGE)));
     try {
       this.child?.kill('SIGKILL');
     } catch {
@@ -261,6 +297,7 @@ export class GjcSessionWatcher {
   private onExit(): void {
     if (this.exitedOnce) return;
     this.exitedOnce = true;
+    this.changed();
     this.exited.resolve();
     if (!this.closed) this.fail();
   }
@@ -269,6 +306,9 @@ export class GjcSessionWatcher {
     if (this.closing) return this.closing;
     if (!this.ready && !this.failed) this.started.reject(new Error(FAILURE_MESSAGE));
     this.closed = true;
+    if (this.admissionRetry) clearTimeout(this.admissionRetry);
+    this.admissionRetry = undefined;
+    this.changed();
     this.closing = (async () => {
       try {
         this.child?.stdin.end();
@@ -298,6 +338,7 @@ export class GjcSessionWatcher {
           await Promise.race([this.exited.promise, timeout(this.options.closeExitTimeoutMs)]);
         }
       }
+      if ((this.child && !this.exitedOnce) || this.draining) throw new Error('GJC watcher shutdown is unconfirmed.');
     })();
     return this.closing;
   }

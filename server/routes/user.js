@@ -5,6 +5,7 @@ import spawn from 'cross-spawn';
 import { userDb } from '../modules/database/index.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { getSystemGitConfig } from '../utils/gitConfig.js';
+import { asyncHandler } from '../shared/utils.js';
 
 const router = express.Router();
 
@@ -27,7 +28,7 @@ function spawnAsync(command, args, options = {}) {
   });
 }
 
-router.get('/git-config', authenticateToken, async (req, res) => {
+router.get('/git-config', authenticateToken, asyncHandler(async (req, res) => {
   try {
     const userId = req.user.id;
     let gitConfig = userDb.getGitConfig(userId);
@@ -53,10 +54,10 @@ router.get('/git-config', authenticateToken, async (req, res) => {
     console.error('Error getting git config:', error);
     res.status(500).json({ error: 'Failed to get git configuration' });
   }
-});
+}));
 
 // Apply git config globally via git config --global
-router.post('/git-config', authenticateToken, async (req, res) => {
+router.post('/git-config', authenticateToken, asyncHandler(async (req, res) => {
   try {
     const userId = req.user.id;
     const { gitName, gitEmail } = req.body;
@@ -90,7 +91,7 @@ router.post('/git-config', authenticateToken, async (req, res) => {
     console.error('Error updating git config:', error);
     res.status(500).json({ error: 'Failed to update git configuration' });
   }
-});
+}));
 
 
 export default router;

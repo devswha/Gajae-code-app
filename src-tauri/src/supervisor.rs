@@ -32,6 +32,26 @@ const EXPECTED_PAYLOAD_VERSION: &str = env!("GJC_EXPECTED_PAYLOAD_VERSION");
 #[derive(Default)]
 pub(crate) struct RecoveryScreen(std::sync::Mutex<Option<(String, bool)>>);
 
+/// Created only in the owned sidecar's independently verified health branch.
+/// The updater cannot manufacture this from its receipt or HTTP input.
+#[cfg(target_os = "macos")]
+pub(crate) struct HealthyServer {
+    target: crate::updater_attempt::Target,
+    pid: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl crate::updater_attempt::proof_seal::Sealed for HealthyServer {}
+#[cfg(target_os = "macos")]
+impl crate::updater_attempt::VerifiedHealthProof for HealthyServer {
+    fn target(&self) -> &crate::updater_attempt::Target {
+        &self.target
+    }
+    fn server_pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ReadyFrame {
     kind: String,
@@ -204,6 +224,8 @@ fn recovery_script(message: &str, retry_enabled: bool) -> String {
 
 fn reset_desktop_readiness(app: &AppHandle) {
     #[cfg(target_os = "macos")]
+    crate::updater_bridge::retire(app);
+    #[cfg(target_os = "macos")]
     crate::updater::unhealthy(app);
     app.state::<crate::navigation::LoopbackOrigin>().clear();
     crate::reset_deep_link_readiness(app);
@@ -213,6 +235,10 @@ fn show_error(window: &WebviewWindow, message: &str, retry_enabled: bool) {
     let app = window.app_handle();
     let lifecycle = app.state::<crate::lifecycle::SidecarLifecycle>();
     if lifecycle.is_shutting_down() || (retry_enabled && lifecycle.has_sidecar()) {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if crate::updater_launch::server_failed(app, message) {
         return;
     }
     reset_desktop_readiness(app);
@@ -252,14 +278,14 @@ pub(crate) fn desktop_data_root(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-fn update_attempt_admission(desktop_data_root: &Path) -> Result<(), String> {
+fn update_attempt_admission(app: &AppHandle, desktop_data_root: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        crate::updater_attempt::check(desktop_data_root)
+        crate::updater_launch::admit_server(app, desktop_data_root)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = desktop_data_root;
+        let _ = (app, desktop_data_root);
         Ok(())
     }
 }
@@ -414,6 +440,11 @@ fn navigate_and_show(
         .map_err(|error| format!("could not show main window: {error}"))
 }
 
+#[cfg(target_os = "macos")]
+fn update_bridge_environment(enabled: bool) -> [(&'static str, &'static str); 1] {
+    [("GJC_DESKTOP_UPDATE_PIPE", if enabled { "1" } else { "0" })]
+}
+
 pub fn start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let window = match app.get_webview_window("main") {
@@ -435,7 +466,7 @@ pub fn start(app: AppHandle) {
         // loading can turn it into an ordinary retryable origin error. The
         // lifecycle admission below repeats this check under its PID/shutdown
         // lock so neither startup nor Retry can skip admission.
-        if let Err(error) = update_attempt_admission(&desktop_data_root) {
+        if let Err(error) = update_attempt_admission(&app, &desktop_data_root) {
             show_error(&window, &error, false);
             return;
         }
@@ -478,7 +509,7 @@ pub fn start(app: AppHandle) {
         let path = env::var("PATH").unwrap_or_default();
         let entrypoint = payload.join("dist-server/server/index.js");
         let command = lifecycle.start(
-            || update_attempt_admission(&desktop_data_root),
+            || update_attempt_admission(&app, &desktop_data_root),
             || {
                 reset_desktop_readiness(&app);
                 *app.state::<RecoveryScreen>()
@@ -505,6 +536,11 @@ pub fn start(app: AppHandle) {
                 } else {
                     command.env("HOME", &home).env("PATH", &path)
                 };
+                // Apply after QA's env_clear so isolated children get the flag.
+                #[cfg(target_os = "macos")]
+                let command = command.envs(update_bridge_environment(
+                    crate::updater_bridge::enabled(&app),
+                ));
                 #[cfg(not(target_os = "macos"))]
                 let command = command.env("HOME", &home).env("PATH", &path);
                 let (events, child) = command
@@ -532,6 +568,18 @@ pub fn start(app: AppHandle) {
             }
         };
         let sidecar_pid = child.pid();
+        #[cfg(target_os = "macos")]
+        let mut child = child;
+        #[cfg(target_os = "macos")]
+        match crate::updater_bridge::attach(&app, sidecar_pid) {
+            Ok(Some(frame)) => {
+                if child.write(&frame).is_err() {
+                    crate::updater_bridge::retire(&app);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => eprintln!("desktop updater bridge unavailable"),
+        }
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let mut output = OutputRing::default();
         let mut ready = false;
@@ -623,6 +671,55 @@ pub fn start(app: AppHandle) {
                                 if lifecycle.is_shutting_down() {
                                     break;
                                 }
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let successor =
+                                        crate::updater_launch::revalidate_successor(&app).await;
+                                    let target = match successor {
+                                        Ok(target) => target,
+                                        Err(error) => {
+                                            handle_sidecar_failure(
+                                                &app, &window, child, events, error, false,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    };
+                                    if let Some(target) = target {
+                                        // Full bundle verification may take time. Recheck real
+                                        // server health afterward, with the SPA still withheld.
+                                        if lifecycle.is_shutting_down() {
+                                            break;
+                                        }
+                                        let verified =
+                                            health_check(ready_frame.port).and_then(|()| {
+                                                if !lifecycle.owns_pid(sidecar_pid)
+                                                    || !crate::lifecycle::process_alive(sidecar_pid)
+                                                {
+                                                    return Err(
+                                                        "Successor server ownership was lost."
+                                                            .into(),
+                                                    );
+                                                }
+                                                desktop_origin
+                                                    .persist_verified_port(ready_frame.port)?;
+                                                crate::updater_launch::finish_health(
+                                                    &app,
+                                                    &HealthyServer {
+                                                        target,
+                                                        pid: sidecar_pid,
+                                                    },
+                                                )
+                                            });
+                                        if let Err(error) = verified {
+                                            handle_sidecar_failure(
+                                                &app, &window, child, events, error, false,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    }
+                                }
                                 if let Err(error) = desktop_origin
                                     .persist_verified_port(ready_frame.port)
                                     .and_then(|()| {
@@ -688,6 +785,27 @@ pub fn start(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qa_environment_clear_preserves_only_the_explicit_late_update_flag() {
+        for enabled in [true, false] {
+            let output = std::process::Command::new("/usr/bin/env")
+                .env("GJC_DESKTOP_UPDATE_PIPE", "wrong")
+                .env_clear()
+                .envs(update_bridge_environment(enabled))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!(
+                    "GJC_DESKTOP_UPDATE_PIPE={}\n",
+                    if enabled { "1" } else { "0" }
+                )
+            );
+        }
+    }
 
     #[test]
     fn health_check_accepts_only_the_expected_server_identity() {

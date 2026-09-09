@@ -126,6 +126,39 @@ struct RuntimeManifest {
     natives: String,
     #[serde(deserialize_with = "unique_platforms")]
     platforms: BTreeMap<String, RuntimePlatform>,
+    sdk_lifecycle: SdkLifecycle,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SdkLifecycle {
+    id: String,
+    #[serde(deserialize_with = "unique_sdk_packages")]
+    packages: BTreeMap<String, String>,
+    files: Vec<RuntimeFile>,
+}
+
+fn unique_sdk_packages<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Packages;
+    impl<'de> de::Visitor<'de> for Packages {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("unique SDK package versions")
+        }
+        fn visit_map<M: de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+            let mut result = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if result.insert(key, value).is_some() {
+                    return Err(de::Error::custom("duplicate SDK package"));
+                }
+            }
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_map(Packages)
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -173,13 +206,70 @@ where
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<RuntimeManifest, String> {
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("linux", "x86_64") => "linux-x64",
+        _ => return Err("unsupported desktop runtime manifest target".to_owned()),
+    };
+    parse_manifest_for_target(bytes, target)
+}
+
+fn parse_manifest_for_target(bytes: &[u8], platform: &str) -> Result<RuntimeManifest, String> {
+    check_limit(bytes, MANIFEST_LIMIT, "runtime manifest")?;
     let failure = || "malformed payload runtime manifest".to_owned();
     let manifest: RuntimeManifest = serde_json::from_slice(bytes).map_err(|_| failure())?;
-    if manifest.schema_version != 1
+    if manifest.schema_version != 2
         || !valid_identity_text(&manifest.gjc_sdk)
         || !valid_identity_text(&manifest.bun)
         || !valid_identity_text(&manifest.natives)
         || manifest.platforms.is_empty()
+    {
+        return Err(failure());
+    }
+    let sdk = &manifest.sdk_lifecycle;
+    let allowed = [
+        "@gajae-code/coding-agent",
+        "@gajae-code/agent-core",
+        "@gajae-code/ai",
+    ];
+    if sdk.id.is_empty()
+        || sdk.id.len() > 128
+        || !sdk.id.as_bytes()[0].is_ascii_lowercase()
+        || !sdk
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || sdk.packages.len() < 2
+        || sdk.packages.len() > allowed.len()
+        || !sdk.packages.contains_key(allowed[0])
+        || !sdk.packages.contains_key(allowed[1])
+        || sdk.packages.iter().any(|(name, version)| {
+            !allowed.contains(&name.as_str())
+                || version.split('.').count() != 3
+                || version
+                    .split('.')
+                    .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        || sdk.packages.get(allowed[0]) != Some(&manifest.gjc_sdk)
+        || sdk.files.is_empty()
+        || sdk.files.len() > sdk_file_limit()?
+    {
+        return Err(failure());
+    }
+    let mut seen = BTreeSet::new();
+    for file in &sdk.files {
+        if !sdk.packages.contains_key(&file.package)
+            || !valid_sdk_path(&file.path)
+            || !valid_sha256(&file.sha256)
+            || !seen.insert((&file.package, &file.path))
+        {
+            return Err(failure());
+        }
+    }
+    if sdk
+        .packages
+        .keys()
+        .any(|name| !sdk.files.iter().any(|file| &file.package == name))
     {
         return Err(failure());
     }
@@ -205,11 +295,6 @@ fn parse_manifest(bytes: &[u8]) -> Result<RuntimeManifest, String> {
     }
     // fill:runtime-manifest permits empty closures for foreign platforms. The
     // actual desktop target must still have a populated closure.
-    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "darwin-arm64",
-        ("linux", "x86_64") => "linux-x64",
-        _ => return Err("unsupported desktop runtime manifest target".to_owned()),
-    };
     if manifest
         .platforms
         .get(platform)
@@ -218,6 +303,41 @@ fn parse_manifest(bytes: &[u8]) -> Result<RuntimeManifest, String> {
         return Err("payload runtime manifest lacks the desktop target closure".to_owned());
     }
     Ok(manifest)
+}
+
+fn sdk_file_limit() -> Result<usize, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Policy {
+        schema_version: u8,
+        max_files: usize,
+    }
+    let policy: Policy = serde_json::from_str(include_str!("../../shared/sdkLifecyclePolicy.json"))
+        .map_err(|_| "Invalid compiled SDK lifecycle policy.")?;
+    if policy.schema_version != 1 || policy.max_files == 0 || policy.max_files > 128 {
+        return Err("Invalid compiled SDK lifecycle policy.".into());
+    }
+    Ok(policy.max_files)
+}
+
+/// One strict schema owns both the installed-payload and in-archive checks.
+/// The archive validator still verifies every returned member's actual bytes.
+#[cfg(target_os = "macos")]
+pub(crate) fn runtime_manifest_files(
+    bytes: &[u8],
+    platform: &str,
+) -> Result<Vec<(String, String, String)>, String> {
+    let mut manifest = parse_manifest_for_target(bytes, platform)?;
+    let mut files = manifest
+        .platforms
+        .remove(platform)
+        .ok_or("Missing runtime target")?
+        .files;
+    files.extend(manifest.sdk_lifecycle.files);
+    Ok(files
+        .into_iter()
+        .map(|file| (file.package, file.path, file.sha256))
+        .collect())
 }
 
 fn valid_identity_text(value: &str) -> bool {
@@ -241,6 +361,17 @@ fn valid_native_path(value: &str) -> bool {
         && value
             .split('/')
             .all(|part| !part.is_empty() && part != "." && !part.chars().any(char::is_control))
+}
+
+fn valid_sdk_path(value: &str) -> bool {
+    value.starts_with("src/")
+        && value.ends_with(".ts")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn check_limit(bytes: &[u8], limit: usize, label: &str) -> Result<(), String> {
@@ -310,7 +441,7 @@ mod tests {
             })
         };
         json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "gjcSdk": "0.16.4",
             "bun": "1.4.0",
             "natives": "0.16.4",
@@ -318,6 +449,14 @@ mod tests {
                 "darwin-arm64": {"files": [file("@gajae-code/natives")]},
                 "linux-x64": {"files": [file("@gajae-code/natives")]},
             },
+            "sdkLifecycle": {
+                "id": "gjc-sdk-lifecycle-v1",
+                "packages": {"@gajae-code/coding-agent":"0.16.4", "@gajae-code/agent-core":"0.16.4"},
+                "files": [
+                    {"package":"@gajae-code/coding-agent","path":"src/sdk/session.ts","sha256":"a".repeat(64)},
+                    {"package":"@gajae-code/agent-core","path":"src/agent-loop.ts","sha256":"b".repeat(64)}
+                ]
+            }
         })
     }
 
@@ -455,8 +594,80 @@ mod tests {
     }
 
     #[test]
+    fn current_source_manifest_is_accepted_by_the_native_pre_server_guard() {
+        let source = include_bytes!("../../server/gjc-runtime-manifest.json");
+        let value: Value = serde_json::from_slice(source).unwrap();
+        let formatted = serde_json::to_vec_pretty(&value).unwrap();
+        expected(source)
+            .verify_manifests(source, &formatted)
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_sdk_inventory_limit_accepts_the_boundary_and_rejects_overflow() {
+        let mut value = manifest();
+        let files = value["sdkLifecycle"]["files"].as_array_mut().unwrap();
+        let template = files[0].clone();
+        while files.len() < sdk_file_limit().unwrap() {
+            let mut file = template.clone();
+            file["path"] = json!(format!("src/provider-{}.ts", files.len()));
+            files.push(file);
+        }
+        let source = bytes(&value);
+        assert!(expected(&source).verify_manifests(&source, &source).is_ok());
+        let mut overflow = template;
+        overflow["path"] = json!("src/overflow.ts");
+        value["sdkLifecycle"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(overflow);
+        reject_even_with_matching_digest(&value);
+    }
+
+    #[test]
+    fn sdk_closure_is_required_unique_and_semantically_identical_in_worker_copy() {
+        let source = bytes(&manifest());
+        let mut worker = manifest();
+        worker["sdkLifecycle"]["files"][0]["sha256"] = json!("f".repeat(64));
+        assert!(expected(&source)
+            .verify_manifests(&source, &bytes(&worker))
+            .is_err());
+        for bad in [
+            json!({}),
+            json!({"id":"x","packages":{},"files":[]}),
+            Value::Null,
+        ] {
+            let mut value = manifest();
+            value["sdkLifecycle"] = bad;
+            reject_even_with_matching_digest(&value);
+        }
+        let mut value = manifest();
+        let file = value["sdkLifecycle"]["files"][0].clone();
+        value["sdkLifecycle"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(file);
+        reject_even_with_matching_digest(&value);
+        let mut value = manifest();
+        value["sdkLifecycle"]["files"][0]["path"] = json!("src/../secret.ts");
+        reject_even_with_matching_digest(&value);
+        let duplicate = String::from_utf8(source).unwrap().replace(
+            "\"@gajae-code/coding-agent\":\"0.16.4\"",
+            "\"@gajae-code/coding-agent\":\"0.16.4\",\"@gajae-code/coding-agent\":\"0.16.4\"",
+        );
+        assert!(parse_manifest(duplicate.as_bytes()).is_err());
+    }
+
+    #[test]
     fn manifest_requires_supported_schema_and_typed_nonempty_fields() {
-        for field in ["schemaVersion", "gjcSdk", "bun", "natives", "platforms"] {
+        for field in [
+            "schemaVersion",
+            "gjcSdk",
+            "bun",
+            "natives",
+            "platforms",
+            "sdkLifecycle",
+        ] {
             let mut value = manifest();
             value.as_object_mut().unwrap().remove(field);
             reject_even_with_matching_digest(&value);
@@ -467,7 +678,7 @@ mod tests {
             }
         }
         for (field, bad) in [
-            ("schemaVersion", json!(2)),
+            ("schemaVersion", json!(1)),
             ("schemaVersion", json!("1")),
             ("schemaVersion", json!(1.0)),
             ("gjcSdk", json!("")),

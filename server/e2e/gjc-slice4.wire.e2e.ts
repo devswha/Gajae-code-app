@@ -96,16 +96,16 @@ test('wire e2e: HTTP jobs endpoints and full websocket projection matrix', { tim
       return jobs.replayEvents(params);
     },
   };
-  const projection = new GjcJobProjectionService(authority as any);
+  let projection = new GjcJobProjectionService(authority as any);
   let id = 0;
-  const orchestrator = new JobOrchestrator({
+  let orchestrator = new JobOrchestrator({
     jobs, supervisor, owner: 'wire-e2e', createId: () => `wire-${++id}`, gitForProject: () => client,
     broadcast: () => {},
   });
   const gitService = new GjcJobGitService(jobs, () => client, async (jobId, eventId, payload) => orchestrator.appendAdminEvent(jobId, eventId, payload));
   const originalApiKey = process.env.API_KEY;
   process.env.API_KEY = 'wire-e2e-api-key';
-  const { server, wss } = createGjcAppFactory({
+  const createRuntime = () => createGjcAppFactory({
     authority,
     orchestrator,
     gitService,
@@ -123,8 +123,10 @@ test('wire e2e: HTTP jobs endpoints and full websocket projection matrix', { tim
     },
     shell: {},
   });
-  server.listen(0, '127.0.0.1'); await once(server, 'listening'); const port = (server.address() as any).port;
-  t.after(async () => { for (const ws of wss.clients) ws.terminate(); await new Promise<void>(resolve => wss.close(() => resolve())); await new Promise<void>(resolve => server.close(() => resolve())); jobs.close(); client.close(); await rm(database, { force: true }); await rm(root, { recursive: true, force: true }); if (originalApiKey === undefined) delete process.env.API_KEY; else process.env.API_KEY = originalApiKey; });
+  let { server, wss } = createRuntime();
+  const listen = async () => { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return (server.address() as any).port as number; };
+  let port = await listen();
+  t.after(async () => { for (const ws of wss.clients) ws.terminate(); await new Promise<void>(resolve => wss.close(() => resolve())); await new Promise<void>(resolve => server.close(() => resolve())); jobs.close(); client.close(); await waitFor(async () => jobs.activity().settling === 0 && client.activity().settling === 0, 'native client close'); await rm(database, { force: true }); await rm(root, { recursive: true, force: true }); if (originalApiKey === undefined) delete process.env.API_KEY; else process.env.API_KEY = originalApiKey; });
   const request = (path: string, method = 'GET', body?: unknown, apiKey: string | null = 'wire-e2e-api-key') => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { 'content-type': 'application/json', ...(apiKey === null ? {} : { 'x-api-key': apiKey }) }, body: body === undefined ? undefined : JSON.stringify(body) });
   const connect = (apiKey: string | null = 'wire-e2e-api-key', origin?: string) => new WebSocket(`ws://127.0.0.1:${port}/ws`, {
     headers: { ...(apiKey === null ? {} : { 'x-api-key': apiKey }), ...(origin ? { origin } : {}) },
@@ -157,6 +159,19 @@ test('wire e2e: HTTP jobs endpoints and full websocket projection matrix', { tim
   await inbox.wait(frame => frame.kind === 'gjc_job_unsubscribed', 'unsubscribe');
   ws.terminate(); await once(ws, 'close');
   await orchestrator.interruptForShutdown();
+  // An irreversibly retired owner cannot be reused to fake a restart. Rebuild
+  // the HTTP/projection/orchestrator composition over the same durable jobs.
+  // This is a wire-resume fixture, not proof of installed-app process handoff.
+  await supervisor.abort(supervisor.runs[0]!.input.runId);
+  await new Promise<void>(resolve => wss.close(() => resolve()));
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  projection = new GjcJobProjectionService(authority as any);
+  orchestrator = new JobOrchestrator({
+    jobs, supervisor, owner: 'wire-e2e-resumed', createId: () => `wire-${++id}`, gitForProject: () => client,
+    broadcast: () => {},
+  });
+  ({ server, wss } = createRuntime());
+  port = await listen();
   const resumed = await request(`/api/gjc/jobs/${jobId}/resume`, 'POST', { appSessionId: 'app-wire', message: 'resume' });
   assert.equal(resumed.status, 202);
   const resumedDto = await resumed.json() as any;

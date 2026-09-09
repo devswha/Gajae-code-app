@@ -20,6 +20,34 @@ import { createWebSocketServer } from '@/modules/websocket/services/websocket-se
 
 const owner = () => ({ userId: 'owner', username: 'owner' });
 
+test('restart fence rejects a new upgrade before implicit-owner creation', () => {
+  let authenticated = 0;
+  const result = verifyWebSocketClient(upgrade({ host: '127.0.0.1:3001' }), {
+    authenticateWebSocket: () => { authenticated++; return owner(); },
+    desktopRestartAdmission: {
+      enter() { throw Object.assign(new Error('fenced'), { code: 'DESKTOP_RESTART_FENCED' }); },
+      enterCompletion() { throw new Error('not a completion'); },
+    },
+  });
+  assert.equal(result, false);
+  assert.equal(authenticated, 0);
+});
+
+test('upgrade authentication remains accounted through synchronous owner attachment', () => {
+  let active = 0;
+  let completed = 0;
+  const result = verifyWebSocketClient(upgrade({ host: '127.0.0.1:3001' }), {
+    authenticateWebSocket: () => { assert.equal(active, 1); return owner(); },
+    desktopRestartAdmission: {
+      enter() { active++; return () => { active--; completed++; }; },
+      enterCompletion() { throw new Error('not a completion'); },
+    },
+  });
+  assert.equal(result, true);
+  assert.equal(active, 0);
+  assert.equal(completed, 1);
+});
+
 const upgrade = (headers: Record<string, string | undefined>) => ({
   req: { url: '/ws', headers },
   origin: headers.origin ?? '',

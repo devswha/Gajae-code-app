@@ -22,11 +22,85 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_PREFERENCES_BYTES: usize = 4096;
 const MAX_CACHE_FILES: usize = 8;
 
+/// Notification navigation state, separate from the updater cache. Reuse the
+/// same descriptor-relative atomic I/O; these URLs grant no update authority.
+pub(crate) struct LinkStore(Store);
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingLinks {
+    schema: u8,
+    urls: Vec<String>,
+}
+
+impl LinkStore {
+    pub(crate) fn open(root: &Path) -> Result<Self, String> {
+        Store::open_named(root, "desktop-deep-links").map(Self)
+    }
+
+    pub(crate) fn read(&self) -> Result<Vec<String>, String> {
+        let Some(bytes) = self.0.read("pending.json", 8192)? else {
+            return Ok(Vec::new());
+        };
+        let record: PendingLinks =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid pending desktop links.")?;
+        Self::validate(&record)?;
+        Ok(record.urls)
+    }
+
+    pub(crate) fn write(&self, urls: Vec<String>) -> Result<(), String> {
+        let record = PendingLinks { schema: 1, urls };
+        Self::validate(&record)?;
+        let _guard = self
+            .0
+            .mutation
+            .lock()
+            .map_err(|_| "Pending links lock failed.")?;
+        self.0.atomic_json("pending.json", &record, 8192)
+    }
+
+    fn validate(record: &PendingLinks) -> Result<(), String> {
+        if record.schema != 1
+            || record.urls.len() > 16
+            || record
+                .urls
+                .iter()
+                .any(|url| url.is_empty() || url.len() > 256 || url.chars().any(char::is_control))
+        {
+            return Err("Invalid pending desktop links.".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     pub schema: u8,
+    /// Periodic discovery only; never permission to download or install.
     pub automatic: bool,
+}
+
+/// Durable user intent only. It never proves owner absence or authorizes an
+/// installer; the next launch must independently reverify every native gate.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManualIntent {
+    schema: u8,
+    target_id: String,
+    archive_sha256: String,
+    consumed: bool,
+}
+
+/// A consumed user selection, not an installation or owner-absence permit.
+pub(crate) struct ManualRequest {
+    target_id: String,
+    archive_sha256: String,
+}
+impl ManualRequest {
+    pub(crate) fn matches(&self, record: &PreparedRecord) -> bool {
+        self.target_id == record.target_id() && self.archive_sha256 == record.archive_sha256
+    }
 }
 
 impl Default for Preferences {
@@ -54,6 +128,15 @@ pub struct PreparedRecord {
 }
 
 impl PreparedRecord {
+    pub(crate) fn target_id(&self) -> String {
+        crate::updater_discovery::target_id(
+            self.release_id,
+            self.manifest_asset_id,
+            self.archive_asset_id,
+            self.manifest.as_bytes(),
+        )
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.schema != 1
             || self.release_id == 0
@@ -149,8 +232,12 @@ enum SyncPoint {
 
 impl Store {
     pub fn open(data_root: &Path) -> Result<Self, String> {
+        Self::open_named(data_root, "desktop-update-cache")
+    }
+
+    fn open_named(data_root: &Path, directory_name: &str) -> Result<Self, String> {
         let parent = open_root(data_root)?;
-        let name = c_name("desktop-update-cache")?;
+        let name = c_name(directory_name)?;
         let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
         if result != 0
             && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
@@ -159,7 +246,7 @@ impl Store {
         }
         let directory = open_at(
             &parent,
-            "desktop-update-cache",
+            directory_name,
             libc::O_RDONLY | libc::O_DIRECTORY,
             0,
         )?;
@@ -208,7 +295,7 @@ impl Store {
         self.atomic_json("preferences.json", &value, MAX_PREFERENCES_BYTES)
     }
 
-    pub fn load(&self) -> Result<Option<(PreparedRecord, Vec<u8>)>, String> {
+    fn selected_record(&self) -> Result<Option<(Pointer, PreparedRecord)>, String> {
         let Some(pointer) = self.pointer()? else {
             return Ok(None);
         };
@@ -218,6 +305,100 @@ impl Store {
         let record: PreparedRecord =
             serde_json::from_slice(&record).map_err(|_| "Invalid prepared update metadata.")?;
         record.validate()?;
+        Ok(Some((pointer, record)))
+    }
+
+    pub(crate) fn prepared_record(&self) -> Result<Option<PreparedRecord>, String> {
+        Ok(self.selected_record()?.map(|(_, record)| record))
+    }
+
+    pub(crate) fn request_manual(
+        &self,
+        target_id: &str,
+        archive_sha256: &str,
+    ) -> Result<(), String> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "Update cache lock failed.")?;
+        if !self.prepared_record()?.is_some_and(|record| {
+            record.target_id() == target_id && record.archive_sha256 == archive_sha256
+        }) {
+            return Err("Prepared update changed before recording manual intent.".into());
+        }
+        self.atomic_json(
+            "manual-intent.json",
+            &ManualIntent {
+                schema: 2,
+                target_id: target_id.to_owned(),
+                archive_sha256: archive_sha256.to_owned(),
+                consumed: false,
+            },
+            MAX_PREFERENCES_BYTES,
+        )
+    }
+
+    fn read_manual_intent(&self) -> Result<Option<ManualIntent>, String> {
+        let Some(bytes) = self.read("manual-intent.json", MAX_PREFERENCES_BYTES)? else {
+            return Ok(None);
+        };
+        let intent: ManualIntent =
+            serde_json::from_slice(&bytes).map_err(|_| "Invalid manual update intent.")?;
+        if intent.schema != 2
+            || intent.target_id.len() != 64
+            || !intent
+                .target_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || intent.archive_sha256.len() != 64
+            || !intent
+                .archive_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("Invalid manual update intent.".into());
+        }
+        Ok(Some(intent))
+    }
+
+    /// Retire the click durably before startup preflight. A failed preflight
+    /// must not make the next ordinary launch retry an earlier user action.
+    pub(crate) fn consume_manual(&self) -> Result<Option<ManualRequest>, String> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "Update cache lock failed.")?;
+        let Some(mut intent) = self.read_manual_intent()? else {
+            return Ok(None);
+        };
+        if intent.consumed {
+            return Ok(None);
+        }
+        intent.consumed = true;
+        self.atomic_json("manual-intent.json", &intent, MAX_PREFERENCES_BYTES)?;
+        Ok(Some(ManualRequest {
+            target_id: intent.target_id,
+            archive_sha256: intent.archive_sha256,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manual_requested(
+        &self,
+        target_id: &str,
+        archive_sha256: &str,
+    ) -> Result<bool, String> {
+        Ok(self.read_manual_intent()?.is_some_and(|intent| {
+            !intent.consumed
+                && intent.target_id == target_id
+                && intent.archive_sha256 == archive_sha256
+        }))
+    }
+
+    pub fn load(&self) -> Result<Option<(PreparedRecord, Vec<u8>)>, String> {
+        let Some((pointer, record)) = self.selected_record()? else {
+            return Ok(None);
+        };
         let archive = self
             .read(&format!("archive-{}", pointer.id), MAX_ARCHIVE_BYTES)?
             .ok_or("Prepared update archive is missing.")?;
@@ -705,6 +886,145 @@ mod tests {
             manifest: "{}".into(),
             inventory: serde_json::json!({"entries":[]}),
         }
+    }
+
+    #[test]
+    fn manual_click_is_consumed_durably_once_and_only_a_fresh_click_rearms_it() {
+        let root = Temp::new();
+        let store = Store::open(&root.0).unwrap();
+        let record = record();
+        store
+            .commit(store.stage(&record, b"data").unwrap())
+            .unwrap();
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        assert!(store.consume_manual().unwrap().unwrap().matches(&record));
+        drop(store);
+        let store = Store::open(&root.0).unwrap();
+        for automatic in [false, true] {
+            store.set_automatic(automatic).unwrap();
+            assert!(store.consume_manual().unwrap().is_none());
+            assert!(!store
+                .manual_requested(&record.target_id(), &record.archive_sha256)
+                .unwrap());
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.cache().join("manual-intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["consumed"], true);
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        assert!(store.consume_manual().unwrap().unwrap().matches(&record));
+        assert!(store.consume_manual().unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_consumers_share_one_manual_click() {
+        let root = Temp::new();
+        let store = std::sync::Arc::new(Store::open(&root.0).unwrap());
+        let record = record();
+        store
+            .commit(store.stage(&record, b"data").unwrap())
+            .unwrap();
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        let consumers: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || usize::from(store.consume_manual().unwrap().is_some()))
+            })
+            .collect();
+        assert_eq!(
+            consumers
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn target_id_has_a_stable_domain_and_fixed_little_endian_release_asset_ids() {
+        assert_eq!(
+            record().target_id(),
+            "1fda47fc12357e0d1dcdc71b25d7c6741934edabab89ea7019cef1484e236ce9"
+        );
+        let mut changed = record();
+        changed.manifest.push('\n');
+        assert_ne!(changed.target_id(), record().target_id());
+    }
+
+    #[test]
+    fn manual_intent_is_target_specific_without_changing_automatic_consent() {
+        let root = Temp::new();
+        let store = Store::open(&root.0).unwrap();
+        let first = record();
+        store.commit(store.stage(&first, b"data").unwrap()).unwrap();
+        store.set_automatic(false).unwrap();
+        assert!(!store
+            .manual_requested(&first.target_id(), &first.archive_sha256)
+            .unwrap());
+        store
+            .request_manual(&first.target_id(), &first.archive_sha256)
+            .unwrap();
+        assert!(store
+            .manual_requested(&first.target_id(), &first.archive_sha256)
+            .unwrap());
+        assert!(!store.preferences().unwrap().automatic);
+        assert!(store
+            .request_manual(&first.target_id(), &"b".repeat(64))
+            .is_err());
+        assert!(store
+            .request_manual(&"b".repeat(64), &first.archive_sha256)
+            .is_err());
+        let mut next = record();
+        next.archive_sha256 = "b".repeat(64);
+        store.commit(store.stage(&next, b"next").unwrap()).unwrap();
+        assert!(!store
+            .manual_requested(&next.target_id(), &next.archive_sha256)
+            .unwrap());
+        assert!(!store.preferences().unwrap().automatic);
+    }
+
+    #[test]
+    fn manual_intent_rejects_same_archive_with_replaced_release_or_manifest() {
+        let root = Temp::new();
+        let store = Store::open(&root.0).unwrap();
+        let first = record();
+        store.publish(&first, b"data").unwrap();
+        store
+            .request_manual(&first.target_id(), &first.archive_sha256)
+            .unwrap();
+        for replacement in [
+            PreparedRecord {
+                release_id: 10,
+                ..first.clone()
+            },
+            PreparedRecord {
+                manifest_asset_id: 20,
+                ..first.clone()
+            },
+            PreparedRecord {
+                archive_asset_id: 30,
+                ..first.clone()
+            },
+            PreparedRecord {
+                manifest: "{}\n".into(),
+                ..first.clone()
+            },
+        ] {
+            store.publish(&replacement, b"data").unwrap();
+            assert!(!store
+                .manual_requested(&replacement.target_id(), &replacement.archive_sha256)
+                .unwrap());
+            assert!(store
+                .request_manual(&first.target_id(), &first.archive_sha256)
+                .is_err());
+        }
+        assert!(store.preferences().unwrap().automatic);
     }
 
     #[test]

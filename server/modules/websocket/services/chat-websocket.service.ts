@@ -8,6 +8,7 @@ import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.
 import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import type { GjcJobProjectionService } from '@/modules/websocket/services/gjc-job-projection.service.js';
 import { getGlobalImageAssetsDir, normalizeImageDescriptors } from '@/shared/image-attachments.js';
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
 import type { AnyRecord, AuthenticatedWebSocketRequest, LLMProvider } from '@/shared/types.js';
 import { createNormalizedMessage, parseIncomingJsonObject } from '@/shared/utils.js';
 
@@ -23,6 +24,7 @@ type OAuthSupervisor = {
   oauthProviders(): Promise<unknown>; oauthStatus(): Promise<unknown>; oauthStart(providerId: string): Promise<unknown>; oauthSubmit(attemptId: string, value: string): Promise<unknown>; oauthCancel(attemptId: string): Promise<unknown>; subscribeOAuth(listener: (event: OAuthEvent) => void): () => void;
 };
 type ChatWebSocketDependencies = {
+  desktopRestartAdmission?: DesktopWorkAdmission;
   goalSupervisor?: GoalSupervisor;
   sessionWorktrees?: SessionWorktreeRuntime;
   spawnFns: Record<LLMProvider, ProviderSpawnFn>;
@@ -364,11 +366,12 @@ export function handleChatConnection(ws: WebSocket, request: AuthenticatedWebSoc
         const result = await handleChatGoal(userId, data, dependencies.goalSupervisor, async (sessionId, command) => {
           // Run ownership remains in the existing chat pipeline; controls do
           // not introduce a second execution loop or background task system.
+          const release = dependencies.desktopRestartAdmission?.enter('ws:goal-continuation');
           void sendChat(ws, userId, {
             sessionId,
             content: command.operation === 'create' ? `Goal: ${command.objective}` : `Goal: ${command.operation}`,
             options: { model: 'default', goalUiVersion: 1 },
-          }, dependencies, command).catch((error) => protocolFailure(ws, 'GOAL_RUN_FAILED', error instanceof Error ? error.message : 'Goal run failed.', sessionId));
+          }, dependencies, command).catch((error) => protocolFailure(ws, 'GOAL_RUN_FAILED', error instanceof Error ? error.message : 'Goal run failed.', sessionId)).finally(() => release?.());
           subscribeChat(ws, { sessions: [{ sessionId, lastSeq: 0 }] }, dependencies);
         }, dependencies.sessionWorktrees);
         sendFrame(ws, { kind: 'chat_goal', sessionId: data.sessionId, requestId: data.requestId, result });
@@ -384,10 +387,24 @@ export function handleChatConnection(ws: WebSocket, request: AuthenticatedWebSoc
   };
 
   ws.on('message', async (raw) => {
+    let release: (() => void) | undefined;
     try {
       const data = parseIncomingJsonObject(raw);
       if (!data) throw new Error('Invalid websocket payload');
       const type = typeof data.type === 'string' ? data.type : '';
+      const admission = dependencies.desktopRestartAdmission;
+      // In-memory replay/status does not spawn work. Every other dispatch is
+      // acquired before projection/model/goal/OAuth's first asynchronous step.
+      if (admission && type !== 'chat.subscribe') {
+        const ownsRun = typeof data.sessionId === 'string' && chatRunRegistry.isProcessing(data.sessionId);
+        const ownsApproval = typeof data.requestId === 'string' && chatRunRegistry.getPendingApproval(data.requestId) !== null;
+        // OAuth's UI owner can outlive the actual attempt/worker. Its current
+        // submit/cancel API may lazily spawn a worker, so it is not yet a
+        // proven owned-completion path and must use normal admission.
+        const completion = (type === 'chat.abort' && ownsRun)
+          || (type === 'chat.permission-response' && ownsApproval);
+        release = completion ? admission.enterCompletion('ws:owned-completion') : admission.enter('ws:dispatch');
+      }
       if (await dependencies.gjcProjection?.handle(ws, data)) return;
 
       if (type.startsWith('oauth.')) {
@@ -402,8 +419,14 @@ export function handleChatConnection(ws: WebSocket, request: AuthenticatedWebSoc
       else protocolFailure(ws, 'UNKNOWN_MESSAGE_TYPE', `Unknown message type "${type}".`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'DESKTOP_RESTART_FENCED') {
+        protocolFailure(ws, 'DESKTOP_RESTART_FENCED', 'Desktop restart is being prepared. Retry this request.');
+        return;
+      }
       console.error('[ERROR] Chat WebSocket error:', message);
       protocolFailure(ws, 'INTERNAL_ERROR', message);
+    } finally {
+      release?.();
     }
   });
   ws.on('close', () => {

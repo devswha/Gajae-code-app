@@ -1,6 +1,8 @@
 import { isAbsolute, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import sdkPolicy from '../shared/sdkLifecyclePolicy.json' with { type: 'json' };
+
 import manifest from './gjc-runtime-manifest.json' with { type: 'json' };
 
 type RuntimeManifestFile = {
@@ -19,7 +21,20 @@ type RuntimeManifest = {
   bun: string;
   natives: string;
   platforms: Record<string, RuntimeManifestPlatform>;
+  sdkLifecycle: {
+    id: string;
+    packages: Record<string, string>;
+    files: RuntimeManifestFile[];
+  };
 };
+
+const sdkLifecycleProofs = new WeakSet<object>();
+declare const verifiedSdkPatchBrand: unique symbol;
+/** Source-integrity evidence only, NOT complete SDK quiescence or installation authority. */
+export type VerifiedSdkPatch = Readonly<{ id: string; [verifiedSdkPatchBrand]: true }>;
+export function isVerifiedSdkPatch(value: unknown): value is VerifiedSdkPatch {
+  return typeof value === 'object' && value !== null && sdkLifecycleProofs.has(value);
+}
 
 type BunRuntime = {
   version: string;
@@ -32,6 +47,31 @@ type PackageMetadata = { name?: unknown; version?: unknown };
 const RUNTIME_MANIFEST_FAILURE = 'GJC runtime manifest validation failed.';
 const SHA256 = /^[a-f0-9]{64}$/;
 const resolverFrom = fileURLToPath(new URL('.', import.meta.url));
+const SDK_PACKAGES = new Set(['@gajae-code/coding-agent', '@gajae-code/agent-core', '@gajae-code/ai']);
+const REQUIRED_SDK_PACKAGES = ['@gajae-code/coding-agent', '@gajae-code/agent-core'];
+
+function validSdkLifecycle(value: unknown): value is RuntimeManifest['sdkLifecycle'] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const patch = value as RuntimeManifest['sdkLifecycle'];
+  if (Object.keys(patch).length !== 3 || typeof patch.id !== 'string' || !/^[a-z][a-z0-9-]{0,127}$/u.test(patch.id)
+    || !patch.packages || typeof patch.packages !== 'object' || Array.isArray(patch.packages)
+    || Object.keys(patch.packages).length < REQUIRED_SDK_PACKAGES.length || Object.keys(patch.packages).length > SDK_PACKAGES.size
+    || REQUIRED_SDK_PACKAGES.some((name) => !Object.hasOwn(patch.packages, name))
+    || Object.entries(patch.packages).some(([name, version]) => !SDK_PACKAGES.has(name) || typeof version !== 'string' || !/^\d+\.\d+\.\d+$/u.test(version))
+    || sdkPolicy.schemaVersion !== 1 || !Number.isSafeInteger(sdkPolicy.maxFiles) || sdkPolicy.maxFiles < 1 || sdkPolicy.maxFiles > 128
+    || !Array.isArray(patch.files) || !patch.files.length || patch.files.length > sdkPolicy.maxFiles) return false;
+  const seen = new Set<string>();
+  for (const file of patch.files) {
+    if (!file || typeof file !== 'object' || Object.keys(file).length !== 3
+      || !Object.hasOwn(patch.packages, file.package) || typeof file.path !== 'string'
+      || !/^src\/[A-Za-z0-9._/-]+\.ts$/u.test(file.path)
+      || file.path.split('/').some((part) => !part || part === '.' || part === '..') || !SHA256.test(file.sha256)) return false;
+    const key = `${file.package}/${file.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return Object.keys(patch.packages).every((name) => patch.files.some((file) => file.package === name));
+}
 
 function validFile(file: unknown): file is RuntimeManifestFile {
   return typeof file === 'object'
@@ -58,13 +98,14 @@ async function runtimeManifest(bun: BunRuntime): Promise<RuntimeManifest | null>
   }
   return typeof value === 'object'
     && value !== null
-    && (value as RuntimeManifest).schemaVersion === 1
+    && (value as RuntimeManifest).schemaVersion === 2
     && typeof (value as RuntimeManifest).gjcSdk === 'string'
     && typeof (value as RuntimeManifest).bun === 'string'
     && typeof (value as RuntimeManifest).natives === 'string'
     && typeof (value as RuntimeManifest).platforms === 'object'
     && (value as RuntimeManifest).platforms !== null
     && Object.values((value as RuntimeManifest).platforms).every((platform) => Array.isArray(platform.files) && platform.files.every(validFile))
+    && validSdkLifecycle((value as RuntimeManifest).sdkLifecycle)
     ? value as RuntimeManifest
     : null;
 }
@@ -88,8 +129,8 @@ async function packageMetadata(bun: BunRuntime, packageRoot: string): Promise<Pa
   }
 }
 
-async function packageRoot(bun: BunRuntime, specifier: string): Promise<string | null> {
-  const resolved = bun.resolveSync(specifier, resolverFrom);
+async function packageRoot(bun: BunRuntime, specifier: string, from = resolverFrom): Promise<string | null> {
+  const resolved = bun.resolveSync(specifier, from);
   let directory = dirname(resolved);
   while (directory !== dirname(directory)) {
     const metadata = await packageMetadata(bun, directory);
@@ -108,7 +149,7 @@ async function sha256Hex(bun: BunRuntime, path: string): Promise<string> {
  * Verifies the pinned Bun runtime and installed GJC packages before starting a Bun worker.
  * This module remains importable in Node; only this function requires Bun globals.
  */
-export async function verifyRuntimeManifest(): Promise<void> {
+export async function verifyRuntimeManifest(): Promise<VerifiedSdkPatch | undefined> {
   try {
     const bun = bunRuntime();
     const expected = bun ? await runtimeManifest(bun) : null;
@@ -144,6 +185,36 @@ export async function verifyRuntimeManifest(): Promise<void> {
         : null;
       if (!root || await sha256Hex(bun, join(root, file.path)) !== file.sha256) throw new Error();
     }
+    const sdkRoots = new Map<string, string>([['@gajae-code/coding-agent', sdkRoot]]);
+    for (const [name, version] of Object.entries(expected.sdkLifecycle.packages)) {
+      const root = sdkRoots.get(name) ?? await packageRoot(bun, name);
+      if (!root || (await packageMetadata(bun, root))?.version !== version) throw new Error();
+      sdkRoots.set(name, root);
+    }
+    // The application and the SDK/core must load the same patched instances.
+    // A matching top-level copy cannot certify an unpatched nested dependency.
+    for (const [consumer, dependencies] of [
+      ['@gajae-code/coding-agent', ['@gajae-code/agent-core', '@gajae-code/ai']],
+      ['@gajae-code/agent-core', ['@gajae-code/ai']],
+    ] as const) {
+      const consumerRoot = sdkRoots.get(consumer);
+      if (!consumerRoot) throw new Error();
+      for (const dependency of dependencies) {
+        if (!sdkRoots.has(dependency)) continue;
+        if (await packageRoot(bun, dependency, join(consumerRoot, 'src')) !== sdkRoots.get(dependency)) throw new Error();
+      }
+    }
+    if (expected.sdkLifecycle.packages['@gajae-code/coding-agent'] !== expected.gjcSdk) throw new Error();
+    for (const file of expected.sdkLifecycle.files) {
+      const root = sdkRoots.get(file.package);
+      if (!root || await sha256Hex(bun, join(root, file.path)) !== file.sha256) throw new Error();
+    }
+    // Test overrides may exercise native closure rejection, but cannot grant
+    // production lifetime evidence for arbitrary alternate SDK implementations.
+    if (process.env.GJC_ALLOW_RUNTIME_MANIFEST_OVERRIDE === '1') return undefined;
+    const proof = Object.freeze({ id: expected.sdkLifecycle.id }) as VerifiedSdkPatch;
+    sdkLifecycleProofs.add(proof);
+    return proof;
   } catch {
     throw new Error(RUNTIME_MANIFEST_FAILURE);
   }

@@ -6,6 +6,7 @@ import express from 'express';
 import spawn from 'cross-spawn';
 
 import { projectsDb } from '../modules/database/index.js';
+import { asyncHandler } from '../shared/utils.js';
 
 const router = express.Router();
 
@@ -709,7 +710,7 @@ async function attachBoundedFilePatches(files, context, hasCommits) {
   return output;
 }
 
-router.get('/status', async (req, res) => {
+router.get('/status', asyncHandler(async (req, res) => {
   const { project } = req.query;
 
   if (!project) {
@@ -756,7 +757,7 @@ router.get('/status', async (req, res) => {
         : `Failed to get git status: ${error.message}`
     });
   }
-});
+}));
 
 export async function readProjectDiff(projectPath) {
   await validateGitRepository(projectPath);
@@ -806,7 +807,7 @@ export async function readProjectDiff(projectPath) {
   return { branch, hasCommits, files, totalFiles, truncated: totalFiles > files.length };
 }
 
-router.get('/diff', async (req, res) => {
+router.get('/diff', asyncHandler(async (req, res) => {
   const { project } = req.query;
 
   if (!project) {
@@ -828,10 +829,10 @@ router.get('/diff', async (req, res) => {
         : `Failed to get git diff: ${error.message}`,
     });
   }
-});
+}));
 
 // Get list of branches
-router.get('/branches', async (req, res) => {
+router.get('/branches', asyncHandler(async (req, res) => {
   const { project } = req.query;
   
   if (!project) {
@@ -872,10 +873,10 @@ router.get('/branches', async (req, res) => {
     console.error('Git branches error:', error);
     res.json({ error: error.message });
   }
-});
+}));
 
 // Checkout branch
-router.post('/checkout', async (req, res) => {
+router.post('/checkout', asyncHandler(async (req, res) => {
   const { project, branch } = req.body;
   
   if (!project || !branch) {
@@ -894,7 +895,7 @@ router.post('/checkout', async (req, res) => {
     console.error('Git checkout error:', error);
     res.status(500).json({ error: error.message });
   }
-});
+}));
 
 // Fields are joined with the ASCII unit separator so pipes (or anything else
 // typed into a commit subject) cannot break parsing.
@@ -944,7 +945,7 @@ export function parseGitLogWithStats(stdout) {
 }
 
 // Get recent commits (across all branches, in graph order)
-router.get('/commits', async (req, res) => {
+router.get('/commits', asyncHandler(async (req, res) => {
   const { project, limit = 10 } = req.query;
 
   if (!project) {
@@ -984,10 +985,10 @@ router.get('/commits', async (req, res) => {
     console.error('Git commits error:', error);
     res.json({ error: error.message });
   }
-});
+}));
 
 // Fetch from remote (using smart remote detection)
-router.post('/fetch', async (req, res) => {
+router.post('/fetch', asyncHandler(async (req, res) => {
   const { project } = req.body;
   
   if (!project) {
@@ -1025,10 +1026,10 @@ router.post('/fetch', async (req, res) => {
         : error.message
     });
   }
-});
+}));
 
 // Pull from remote (fetch + merge using smart remote detection)
-router.post('/pull', async (req, res) => {
+router.post('/pull', asyncHandler(async (req, res) => {
   const { project } = req.body;
   
   if (!project) {
@@ -1093,10 +1094,10 @@ router.post('/pull', async (req, res) => {
       details: details
     });
   }
-});
+}));
 
 // Push commits to remote repository
-router.post('/push', async (req, res) => {
+router.post('/push', asyncHandler(async (req, res) => {
   const { project } = req.body;
   
   if (!project) {
@@ -1164,6 +1165,6 @@ router.post('/push', async (req, res) => {
       details: details
     });
   }
-});
+}));
 
 export default router;

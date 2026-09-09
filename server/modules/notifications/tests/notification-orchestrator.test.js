@@ -44,8 +44,9 @@ test('desktop payload uses the app session id when notified with a provider sess
   const fakeSocket = {
     OPEN: 1,
     readyState: 1,
-    send(message) {
+    send(message, callback) {
       sentMessages.push(JSON.parse(message));
+      callback?.();
     },
     close() {},
   };

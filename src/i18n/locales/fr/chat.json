@@ -94,6 +94,8 @@
     },
     "scrollToBottom": "Aller au dernier",
     "queue": {
+      "reviewBeforeSending": "Modifier et vérifier avant l’envoi",
+      "recoveryNotice": "Les messages récupérés sont en attente pour éviter les envois en double. Modifiez un message, vérifiez son texte et ses pièces jointes, puis envoyez-le. Votre brouillon actuel est conservé.",
       "sendNext": "Mettre un autre message en file d'attente",
       "label": "En file d'attente",
       "willSend": "Envoie lorsque l'exécution en cours se termine",
@@ -106,6 +108,14 @@
       "images_one": "Image {{count}} ajoutée",
       "images_other": "Images {{count}} ajoutées",
       "steerNow": "Piloter le virage actif"
+    },
+    "draftPersistence": {
+      "failed": "Impossible d’enregistrer le brouillon. Gardez cette fenêtre ouverte.",
+      "retry": "Réessayer l’enregistrement",
+      "failedInline": "Échec de l’enregistrement du brouillon et des pièces jointes ({{reason}}). Votre saisie est conservée. Réessayez l’enregistrement et ne fermez pas la fenêtre ni ne redémarrez l’application avant sa réussite.",
+      "recoveredRetry": "Le brouillon a été enregistré. Vérifiez le texte et les pièces jointes, puis appuyez à nouveau sur Envoyer.",
+      "recoveryStillFailed": "La récupération a échoué. Votre saisie et les données enregistrées sont conservées.",
+      "recoveryNotReady": "La récupération du brouillon est en cours. Votre saisie est conservée. Réessayez ensuite."
     },
     "skills": {
       "label": "Choisir une compétence",

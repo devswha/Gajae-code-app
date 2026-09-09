@@ -104,6 +104,7 @@ const backendElements = [
       'server/shared/image-attachments.ts',
       'server/shared/tool-output-transport.ts',
       'server/shared/request-origin.ts',
+      'server/shared/desktop-internal-activity.ts',
       'server/middleware/desktop-auth.js',
       'server/middleware/auth.js',
     ],

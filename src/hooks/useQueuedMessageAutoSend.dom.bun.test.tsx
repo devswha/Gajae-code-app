@@ -5,12 +5,13 @@ import { act, cleanup, renderHook } from '@testing-library/react';
 
 import { readQueuedMessages, writeQueuedMessages } from '../components/chat/utils/chatStorage';
 import { useChatComposerState } from '../components/chat/hooks/useChatComposerState';
+import { resetComposerFreezeForTests } from '../shared/composerFreeze';
 
 import { useQueuedMessageAutoSend } from './useQueuedMessageAutoSend';
 import type { SessionActivityMap } from './useSessionProtection';
 
 const originalFetch = globalThis.fetch;
-afterEach(() => { cleanup(); localStorage.clear(); globalThis.fetch = originalFetch; });
+afterEach(() => { cleanup(); resetComposerFreezeForTests(); localStorage.clear(); globalThis.fetch = originalFetch; });
 
 const busy = (): SessionActivityMap => new Map([['a', { startedAt: Date.now(), statusText: null, canInterrupt: true, awaitingInput: false }]]);
 
@@ -142,4 +143,18 @@ test('a completed background steer accepted late never becomes a second send', (
   act(() => socket.dispatchEvent(new Event('open')));
   assert.deepEqual(readQueuedMessages('a'), []);
   assert.deepEqual(sent.map((message) => message.type), ['chat.steer']);
+});
+
+test('a consumed cached queue cannot resurrect on activation or the next keystroke', async () => {
+  const { view, sent, socket } = mountSteeringSequence();
+  act(() => view.result.current.resolveSteerResult('follow up A', false, 'a'));
+  assert.equal(sent.length, 2);
+  assert.deepEqual(readQueuedMessages('a'), []);
+  view.rerender({ activeSessionId: 'a', processingSessions: new Map(), ws: socket });
+  act(() => view.result.current.handleInputChange({ target: { value: 'fresh draft', selectionStart: 11 } } as never));
+  assert.deepEqual(view.result.current.queuedDrafts, []);
+  assert.deepEqual(readQueuedMessages('a'), []);
+  act(() => view.result.current.handleClearInput());
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 800)); });
+  assert.equal(sent.length, 2, 'no duplicate after clearing the new input either');
 });

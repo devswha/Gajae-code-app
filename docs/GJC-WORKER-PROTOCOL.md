@@ -104,6 +104,8 @@ scope is fixed by this specification, and a frame that gets it wrong is rejected
 | --- | --- | --- |
 | `worker.initialize` | global | Negotiate startup. Must be the first request. |
 | `worker.shutdown` | global | Ask the worker to stop accepting work and exit. |
+| `worker.activity` | global | Observe bounded ownership counters on the existing worker without starting a runtime or changing its activity revision. |
+| `worker.admission` | global | Reversibly close or reopen admission using an exact fence identifier; does not cancel accepted work. |
 | `models.catalog` | global | List models the worker can run. |
 | `oauth.providers` | global | List providers that support interactive sign-in. |
 | `oauth.status` | global | Report sign-in state. |
@@ -141,10 +143,11 @@ scope is fixed by this specification, and a frame that gets it wrong is rejected
 the same event reports both "this worker is alive" and "this conversation is
 still working".
 
-## 5. Payload schemas are not part of this layer
+## 5. Payload schemas
 
-The envelope above is enforced strictly. **Payload contents are not.** A payload
-is checked for being a valid JSON object and nothing more; what belongs inside
+The envelope above is enforced strictly. **Most payload contents are not.** Except
+for the two ownership methods specified below, a payload is checked for being a
+valid JSON object and nothing more; what belongs inside
 `session.start` or `tool.completed` is defined by the typed contract the two
 reference implementations share, not by the protocol codec.
 
@@ -156,6 +159,41 @@ live in the reference implementation's types.
 Publishing them — as JSON Schema, or as a generated document — is the work that
 would make this a complete two-sided specification. Until then, treat §1–§4 as
 normative and payload shapes as observed behaviour.
+
+### Ownership observations and admission
+
+`worker.activity` accepts exactly `{}`. A successful result contains exactly
+`generation`, `complete`, `starting`, `queued`, `running`, `settling`, `approvals`,
+`retained`, `unknown`, and `fenceId`. The six counters are nonnegative safe
+integers and may overlap; `complete` is boolean. `generation` and each entry in
+`unknown` match `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`. `unknown` has at most 32
+entries. `fenceId` is null or an identifier matching the same pattern.
+An empty counter set is not idle evidence when completeness is false, an unknown
+reason is present, or the expected admission fence is absent.
+
+`worker.admission` accepts exactly `{ "fenceId": "identifier", "closed": true }`
+or the same shape with `closed: false`. A successful result contains only
+`fenceId`: the accepted identifier when closing and null when reopening. Another
+fence cannot replace or release the current fence. Accepted work and its necessary
+completion callbacks remain owned; closing admission is not an abort request.
+The reference host closes locally before awaiting the worker acknowledgement and
+must release the exact fence after a failed/cancelled/expired restart preparation.
+A late or failed release acknowledgement is not proof that admission reopened.
+The host's common admission fence closes before this worker handshake; setup and
+all activity reads share the original five-second preparation budget. A cancelled
+or timed-out handshake retains cleanup ownership through its actual settlement
+and the ordered release. Successful commit keeps worker admission closed.
+
+The worker's generation binds its incarnation, host revision and SDK generation.
+The first correlated observation under an acknowledged fence establishes the
+host's remote baseline. A later changed generation permanently invalidates that
+fence, even if counts return to zero. This is sampled evidence, not a substitute
+for complete ownership and prevention of new internal work.
+
+These payloads, including successful response results, are strictly validated by
+the codec. Unknown fields, invalid counters, or a missing result are protocol
+errors. Both methods operate on the existing worker; observation must not lazily
+start one. Neither method grants permission to install or shut down the app.
 
 ## 6. Versioning
 

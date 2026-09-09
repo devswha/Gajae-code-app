@@ -4,11 +4,13 @@ import cors from 'cors';
 import express from 'express';
 
 import { parseAllowedHosts } from '../shared/networkHosts.js';
+import { isDesktopNativeCommand } from '../shared/desktopRestartProtocol.js';
 
 import { createDesktopAuth, DESKTOP_BOOTSTRAP_PATH } from './middleware/desktop-auth.js';
 import { createWebSocketServer } from './modules/websocket/index.js';
 import { createGjcJobsRouter } from './routes/gjc-jobs.js';
 import { isAllowedRequestOrigin } from './shared/request-origin.js';
+import { asyncHandler } from './shared/utils.js';
 
 /**
  * Builds the production GJC HTTP and WebSocket composition with explicit
@@ -26,6 +28,8 @@ export function createGjcAppFactory({
   chat,
   shell,
   browser = undefined,
+  desktopUpdateRelay = undefined,
+  desktopRestartAdmission = /** @type {import('./shared/interfaces.js').DesktopWorkAdmission | undefined} */ (undefined),
 }) {
   orchestrator.deps.broadcast = (jobId, event) => {
     try { projection.publish(jobId, event); } catch { /* Durable replay recovers isolated websocket fan-out failures. */ }
@@ -34,13 +38,16 @@ export function createGjcAppFactory({
   void terminalNotificationAdapter?.startupCatchUp().catch(() => {});
 
   const app = express();
+  // One server-owned object is shared by routes mounted here and later by
+  // index.js, and by every message on already-connected chat/terminal sockets.
+  app.locals.desktopRestartAdmission = desktopRestartAdmission;
   app.set('trust proxy', 1);
   const server = http.createServer(app);
   const desktopAuth = createDesktopAuth({ server });
   const wss = createWebSocketServer(server, {
-    verifyClient: { authenticateWebSocket, desktopAuth },
-    chat,
-    shell,
+    verifyClient: { authenticateWebSocket, desktopAuth, desktopRestartAdmission },
+    chat: { ...chat, desktopRestartAdmission },
+    shell: { ...shell, desktopRestartAdmission },
     browser,
   });
   app.locals.wss = wss;
@@ -89,7 +96,21 @@ export function createGjcAppFactory({
     },
   }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  app.post('/api/desktop/update', (request, response) => {
+    response.set('Cache-Control', 'no-store');
+    if (!desktopAuth.enabled || !desktopUpdateRelay?.isAvailable()) return response.status(404).json({ error: 'updater_unavailable' });
+    if (request.headers.origin !== desktopAuth.expectedOrigin()
+      || typeof request.headers['x-gajae-update-view'] !== 'string') return response.status(403).json({ error: 'updater_unauthorized' });
+    if (!isDesktopNativeCommand(request.body)) return response.status(400).json({ error: 'updater_invalid_command' });
+    void desktopUpdateRelay.request(request.body, request.headers['x-gajae-update-view'], request.headers.origin)
+      .then((snapshot) => { if (!response.destroyed) response.json(snapshot); })
+      .catch((error) => { if (!response.destroyed) response.status(error.message === 'updater_unauthorized' ? 403 : 503).json({ error: /^[a-z_]{1,64}$/.test(error.message) ? error.message : 'updater_unavailable' }); });
+  });
   app.use('/api', validateApiKey);
+  // Authentication may create the implicit owner. Acquire before downstream
+  // middleware as well as within each handler. The nested handler lease owns
+  // its async lifetime; this outer lease alone is never completion evidence.
+  app.use('/api', asyncHandler((_request, _response, next) => next()));
   app.use('/api/gjc', authenticateGjcRoute, createGjcJobsRouter({ authority, orchestrator, gitService }));
 
   return { app, server, wss };

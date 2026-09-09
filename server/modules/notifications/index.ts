@@ -11,6 +11,11 @@ import {
   notifyUserIfEnabled as notifyEnabledUser,
 } from '@/modules/notifications/services/notification-orchestrator.service.js';
 import { handleDesktopNotificationsConnection as handleDesktopConnection } from '@/modules/notifications/websocket/desktop-notifications-websocket.service.js';
+export {
+  configureNotificationDesktopAdmission,
+  getNotificationActivityGeneration,
+  snapshotNotificationActivity,
+} from './services/desktop-update-activity.service.js';
 
 export {
   buildPayload as buildNotificationPayload,

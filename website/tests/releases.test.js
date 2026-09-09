@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -16,28 +15,27 @@ import {
 } from '../src/releases.js';
 
 /**
- * The landing page advertises the release the repository last cut, so its
- * version is read from the app rather than repeated here: a release bump that
- * forgets this page fails the gate instead of shipping stale download links.
+ * Reviewed public-release fixture: these assets were published as beta.10.
+ * A local/test candidate can advance package.json before publication; coupling
+ * the page to that version would advertise download URLs that do not exist.
+ * Update this fixture with RELEASE only after verifying the new public assets.
  */
-const appVersion = JSON.parse(
-  readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
-).version;
+const publishedVersion = '2.0.0-beta.10';
 
-test('pins the release the repository cut and its GitHub download URLs', () => {
-  assert.equal(RELEASE.version, appVersion);
-  assert.equal(RELEASE.tag, `v${appVersion}`);
-  assert.equal(desktopDmgName(), `gajae-app-desktop-${appVersion}-macos-arm64.dmg`);
-  assert.equal(desktopDebName(), `gajae-app-desktop-${appVersion}-linux-x64.deb`);
-  assert.equal(desktopAppImageName(), `gajae-app-desktop-${appVersion}-linux-x64.AppImage`);
-  assert.equal(serverArchiveName(), `gajae-app-server-${appVersion}-linux-x64-node22.tar.gz`);
+test('pins the published release and its GitHub URLs independently of local candidates', () => {
+  assert.equal(RELEASE.version, publishedVersion);
+  assert.equal(RELEASE.tag, `v${publishedVersion}`);
+  assert.equal(desktopDmgName(), `gajae-app-desktop-${publishedVersion}-macos-arm64.dmg`);
+  assert.equal(desktopDebName(), `gajae-app-desktop-${publishedVersion}-linux-x64.deb`);
+  assert.equal(desktopAppImageName(), `gajae-app-desktop-${publishedVersion}-linux-x64.AppImage`);
+  assert.equal(serverArchiveName(), `gajae-app-server-${publishedVersion}-linux-x64-node22.tar.gz`);
   assert.equal(
     downloadUrl(desktopDmgName()),
-    `${RELEASES_URL}/download/v${appVersion}/gajae-app-desktop-${appVersion}-macos-arm64.dmg`,
+    `${RELEASES_URL}/download/v${publishedVersion}/gajae-app-desktop-${publishedVersion}-macos-arm64.dmg`,
   );
   assert.equal(
     DOWNLOADS.macosArm64.checksumHref,
-    `${RELEASES_URL}/download/v${appVersion}/${checksumName(desktopDmgName())}`,
+    `${RELEASES_URL}/download/v${publishedVersion}/${checksumName(desktopDmgName())}`,
   );
   assert.match(DOWNLOADS.macosArm64.verifyCommand, /shasum -a 256 -c /);
 });

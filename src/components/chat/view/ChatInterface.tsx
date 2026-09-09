@@ -245,6 +245,10 @@ function ChatInterface({
 
   const composerNode = (
     <ComposerSurface
+      composerFrozen={composer.composerFrozen}
+      voiceOwnerKey={JSON.stringify([selectedProject.projectId, selectedSession?.id || session.currentSessionId || null])}
+      draftPersistence={composer.draftPersistence}
+      onRetryDraftPersistence={composer.retryDraftPersistence}
       pendingPermissionRequests={pendingPermissionRequests}
       handlePermissionDecision={composer.handlePermissionDecision}
       isLoading={session.isProcessing}

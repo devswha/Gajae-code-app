@@ -26,6 +26,11 @@ job projection protocol). `scripts/` holds build/release/verify tooling.
 - Bun **exactly 1.4.0** for `*.bun.test.ts` and `*.dom.bun.test.tsx` files (pinned in
   `scripts/fetch-bun.mjs`): `dist-native/bun` or PATH; fetch with
   `node scripts/fetch-bun.mjs`.
+- `npm ci` applies the app-owned SDK lifecycle patch from
+  `patches/gjc-sdk-lifecycle/manifest.json` through postinstall. Exact SDK/core/AI
+  versions and complete before/after hashes are mandatory. Use
+  `npm run apply:sdk-patch` / `npm run check:sdk-patch`; never hand-edit installed
+  dependency files. Unknown local modifications must fail rather than be replaced.
 - Server binds loopback by default (fail-closed; it can run shell commands).
   `SERVER_PORT` defaults to 3001, Vite dev on 5173. Do not export `SERVER_PORT=0`.
 - Tauri builds choke on `CI=1`: use `env -u CI npm run tauri -- build`.
@@ -151,11 +156,32 @@ is `.ts`/`.tsx`. Routing is react-router-dom 7.
   unknown dependencies. Do not add cross-module imports that violate them.
 - **Product identity is checked**: `npm run check:identity` verifies names/URLs/scheme
   against `shared/productIdentity.js`. Change identity constants there, nowhere else.
+- **Desktop updates are click-driven**: `automatic` means discovery checks only.
+  Download/restart require the native `targetId`; cached bytes alone cannot
+  authorize startup installation. Preserve one-shot manual intent consumption
+  and the draft/backend/process gates. Current contract: `docs/DESKTOP-CLICK-UPDATE.md`.
 - **Design system**: all product colors route through semantic CSS variables in
   `src/index.css` + the `@theme` color aliases in the same file. See `DESIGN.md` before
   touching UI styling; do not hardcode palette values.
 - **Bundled runtime manifest**: `server/gjc-runtime-manifest.json` is filled by
   `npm run fill:runtime-manifest` (runs automatically before dev/build:server).
+  Schema 2 includes the native closure and the canonical SDK patch's post-hashes.
+  Worker startup checks both and refuses mismatched/nested dependency instances.
+  A verified SDK patch is source-integrity evidence, not proof of complete SDK
+  quiescence; unrepresented streaming/extension work must still block restart.
+  `shared/sdkLifecyclePolicy.json` owns the file-count bound used by the applier,
+  worker and native payload/archive guard. After changing the canonical patch,
+  reapply it through a clean install and explicitly regenerate tracked runtime
+  hashes with `npm run fill:runtime-manifest -- --update` before verification;
+  normal dev/build gates only check the manifest and do not bless changed hashes.
+- **Browser archive security backport**: `patches/extract-zip-symlink-leaf/manifest.json`
+  owns the exact extract-zip 2.0.1 upstream PR160 transform. Postinstall applies
+  it; `npm run check:extract-zip-patch` verifies canonical source/package hashes
+  and rejects nested, aliased or modified installations. Server/desktop staging
+  must carry and verify this independent patch. Do not put it in the SDK32
+  lifecycle manifest or hand-edit node_modules. Audit recognition is conditional
+  on the actual patch and a current review, not an unconditional advisory skip.
+  Its archive-only protection is not a sandbox against concurrent local writers.
 - **Chat tool cards follow the runtime, not Claude**: `src/components/chat/tools/configs/toolConfigs.ts`
   is keyed by the tool's own lowercase name (`bash`, `read`, `edit`, `todo_write`), and
   its accessors read the runtime's parameter schema. `server/gjc-tool-configs.bun.test.ts`

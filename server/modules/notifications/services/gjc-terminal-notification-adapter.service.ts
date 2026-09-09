@@ -8,6 +8,7 @@ import {
   createNotificationEvent,
   notifyUserIfEnabled,
 } from '@/modules/notifications/services/notification-orchestrator.service.js';
+import { enterNotificationActivity } from '@/modules/notifications/services/desktop-update-activity.service.js';
 
 import type { JobProjectionEvent, JobTerminalOutcome } from '../../../../shared/gjc-job-projection-protocol.js';
 
@@ -30,6 +31,7 @@ type NotificationFacade = {
   createNotificationEvent(event: Record<string, unknown>): unknown;
   notifyUserIfEnabled(input: { userId: number | null; event: unknown }): unknown;
 };
+type DispatchResult = { result: 'accepted' | 'deduped' | 'failed'; settled?: Promise<void> };
 
 export type GjcTerminalNotificationAdapter = {
   onCommittedEvent(jobId: string, event: JobProjectionEvent): 'accepted' | 'deduped' | 'ignored' | 'failed';
@@ -90,30 +92,36 @@ export function createGjcTerminalNotificationAdapter(
     event: JobProjectionEvent,
     payload: TerminalPayload,
     advanceCursor: boolean,
-  ): 'accepted' | 'deduped' | 'failed' => {
-    const userId = resolveUserId();
-    const dispatch = {
-      jobId,
-      eventId: event.eventId,
-      sequence: event.sequence,
-      runId: payload.runId,
-      appSessionId: payload.appSessionId ?? null,
-      userId,
-      outcome: payload.outcome,
-      claimToken: randomUUID(),
-    } as const;
-    let claimed: boolean;
+  ): DispatchResult => {
+    let release: () => void;
+    try { release = enterNotificationActivity(); }
+    catch { return { result: 'failed' }; }
+    let settled: Promise<void> | undefined;
+    let claimToken: string | undefined;
+    const recordFailure = (error: unknown): void => {
+      if (!claimToken) return;
+      try { gjcTerminalNotificationDispatchesDb.markFailed(claimToken, boundedFailure(error)); }
+      catch { /* A notification failure must not change durable job completion. */ }
+    };
     try {
-      claimed = advanceCursor
+      const userId = resolveUserId();
+      const dispatch = {
+        jobId,
+        eventId: event.eventId,
+        sequence: event.sequence,
+        runId: payload.runId,
+        appSessionId: payload.appSessionId ?? null,
+        userId,
+        outcome: payload.outcome,
+        claimToken: randomUUID(),
+      } as const;
+      const claimed = advanceCursor
         ? gjcTerminalNotificationDispatchesDb.claimAndAdvanceCursor(dispatch)
         : gjcTerminalNotificationDispatchesDb.claim(dispatch);
-    } catch {
-      return 'failed';
-    }
-    if (!claimed) return 'deduped';
+      if (!claimed) return { result: 'deduped' };
+      claimToken = dispatch.claimToken;
 
-    try {
-      notifications.notifyUserIfEnabled({
+      const delivery = notifications.notifyUserIfEnabled({
         userId,
         event: notifications.createNotificationEvent({
           provider: 'gjc',
@@ -127,15 +135,23 @@ export function createGjcTerminalNotificationAdapter(
           dedupeKey: `gjc:job-terminal:${jobId}:${event.eventId}`,
         }),
       });
-      gjcTerminalNotificationDispatchesDb.markAccepted(dispatch.claimToken);
-      return 'accepted';
-    } catch (error) {
-      try {
-        gjcTerminalNotificationDispatchesDb.markFailed(dispatch.claimToken, boundedFailure(error));
-      } catch {
-        // A notification failure must not change durable job completion.
+      if (delivery !== null && (typeof delivery === 'object' || typeof delivery === 'function')
+        && typeof (delivery as { then?: unknown }).then === 'function') {
+        settled = Promise.resolve(delivery)
+          .then(() => { gjcTerminalNotificationDispatchesDb.markAccepted(dispatch.claimToken); })
+          .catch(recordFailure)
+          .finally(release);
+        // Keep the synchronous API: accepted means handed to the facade. The
+        // durable claim remains pending until it settles, not until UI display.
+        return { result: 'accepted', settled };
       }
-      return 'failed';
+      gjcTerminalNotificationDispatchesDb.markAccepted(dispatch.claimToken);
+      return { result: 'accepted' };
+    } catch (error) {
+      recordFailure(error);
+      return { result: 'failed' };
+    } finally {
+      if (!settled) release();
     }
   };
 
@@ -154,7 +170,7 @@ export function createGjcTerminalNotificationAdapter(
           || sequence < 1) continue;
         const event = { eventId: candidate.eventId, sequence, payload: candidate.payload } as JobProjectionEvent;
         const payload = terminalPayload(event.payload);
-        if (payload) notifyClaimed(jobId, event, payload, true);
+        if (payload) await notifyClaimed(jobId, event, payload, true).settled;
         else gjcTerminalNotificationDispatchesDb.advanceCursor(jobId, event.sequence);
         after = Math.max(after, event.sequence);
         progressed = true;
@@ -167,34 +183,38 @@ export function createGjcTerminalNotificationAdapter(
   return {
     onCommittedEvent(jobId, event) {
       const payload = terminalPayload(event.payload);
-      return payload ? notifyClaimed(jobId, event, payload, false) : 'ignored';
+      if (!payload) return 'ignored';
+      return notifyClaimed(jobId, event, payload, false).result;
     },
 
     async startupCatchUp(): Promise<void> {
-      if (!options.authority.list) return;
-      const jobs: JobSnapshot[] = [];
-      let afterCursor: string | undefined;
-      for (;;) {
-        const response = await options.authority.list({ provider: 'gjc', afterCursor, limit: 100 });
-        const page = snapshots(response);
-        jobs.push(...page);
-        const nextCursor = listNextCursor(response);
-        if (nextCursor) {
-          afterCursor = nextCursor;
-          continue;
+      const release = enterNotificationActivity(false);
+      try {
+        if (!options.authority.list) return;
+        const jobs: JobSnapshot[] = [];
+        let afterCursor: string | undefined;
+        for (;;) {
+          const response = await options.authority.list({ provider: 'gjc', afterCursor, limit: 100 });
+          const page = snapshots(response);
+          jobs.push(...page);
+          const nextCursor = listNextCursor(response);
+          if (nextCursor) {
+            afterCursor = nextCursor;
+            continue;
+          }
+          // Legacy array responses carry no cursor; fall back to length-based
+          // termination for that shape only.
+          if (!Array.isArray(response) || page.length < 100) break;
+          afterCursor = page[page.length - 1]?.jobId;
+          if (!afterCursor) break;
         }
-        // Legacy array responses carry no cursor; fall back to length-based
-        // termination for that shape only.
-        if (!Array.isArray(response) || page.length < 100) break;
-        afterCursor = page[page.length - 1]?.jobId;
-        if (!afterCursor) break;
-      }
-      const initialized = gjcTerminalNotificationDispatchesDb.initializeBaseline(jobs.map((job) => ({
-        jobId: job.jobId,
-        lastSequence: Number.isSafeInteger(job.lastSequence) && job.lastSequence! >= 0 ? job.lastSequence! : 0,
-      })));
-      if (initialized) return;
-      for (const job of jobs) await scanJob(job.jobId);
+        const initialized = gjcTerminalNotificationDispatchesDb.initializeBaseline(jobs.map((job) => ({
+          jobId: job.jobId,
+          lastSequence: Number.isSafeInteger(job.lastSequence) && job.lastSequence! >= 0 ? job.lastSequence! : 0,
+        })));
+        if (initialized) return;
+        for (const job of jobs) await scanJob(job.jobId);
+      } finally { release(); }
     },
   };
 }

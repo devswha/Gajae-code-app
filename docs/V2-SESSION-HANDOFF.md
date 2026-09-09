@@ -1,6 +1,128 @@
 # gajae-app v2 — Session Handoff (resume state)
 
-Last updated: 2026-09-07 (published beta.10 with the pending Chat UI changes). Supersedes the 2026-07-18 handoff.
+Latest updater policy: the user requested a bottom-left notice above Settings
+and explicit Update clicks instead of automatic installation. Discovery is
+checks-only; download and safe restart bind the clicked native target. Cached
+bytes/automatic=true no longer authorize a next-launch install. See
+[DESKTOP-CLICK-UPDATE.md](DESKTOP-CLICK-UPDATE.md). The delivered beta.11 DMG is
+unchanged and does not yet contain this follow-up.
+
+Latest user-test installer: **beta.11 / desktop 0.2.5**, built from `e28fa6d`,
+signed/notarized/stapled and delivered to Downloads. Final copied-app server,
+data-survival and actual isolated GUI quit/reopen/draft/image/settings checks
+passed. This is a **manual-install, updater-disabled private test DMG**, not a
+public updater release; the existing production installation was not changed.
+Artifact hash, exact source and limits: [RELEASE-BETA11-TEST.md](RELEASE-BETA11-TEST.md).
+
+Production updater key: local encrypted-file + login-Keychain provisioning and
+sign/verify/negative checks passed on September 9. Do not regenerate it.
+Independent external backup and release gates remain open. Exact local metadata
+and limits: [UPDATER-KEY-CUSTODY.md](../scripts/release/UPDATER-KEY-CUSTODY.md).
+
+Latest signed qualification: [DESKTOP-UPDATER-SIGNED-QA.md](DESKTOP-UPDATER-SIGNED-QA.md).
+Same-source f69ec4f release-mode A/B are notarized and Gatekeeper-accepted. The
+actual signed next-launch automatic A → B transition, Off/on behavior, byte-exact
+transcript/draft/queue/image/config survival and normal B reopen passed on
+September 9. QA processes are stopped and fixture/journal evidence is retained.
+Public deployment and its remaining authorization/OS13/key-custody gates are
+not complete; the production installation was not changed.
+
+Post-QA security updates raise Multer/YAML floors and apply a separate
+integrity-checked upstream ZIP symlink-leaf backport through installation,
+audit and both packaging lanes. Clean npm ci and the full verify gate pass.
+This delta is not in the frozen f69ec4f signed pair; final public artifacts
+must be rebuilt. See the signed QA record for the bounded patch/audit scope.
+
+Last updated: 2026-09-09 (same-source signed automatic A → B and data preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
+
+## Follow-up checkpoint — SDK32 and durable notification handoff
+
+`4fb43c2` remote Node 22/24 and Linux server/desktop/package/GUI checks all passed.
+The next work expands the exact 0.16.4 SDK patch to 32 files, physically joins
+built-in provider tails and the actively enabled default WebSocket host, and
+lets supported normal sessions become idle after actual cleanup. Unsupported
+opaque features remain unknown; source hashes alone are never quiescence.
+Clean `npm ci`, the regenerated runtime manifest, and a shared file-count policy
+connect all 32 files to worker/native validation.
+
+macOS notification links now survive startup/recovery/process replacement in a
+separate bounded durable queue. Actual QA uncovered and fixed an HTTP/ws bind
+failure that skipped automation-socket cleanup. The new packaged app removes
+its socket on failure, preserves pending links in recovery, then delivers both
+after a normal reopen without re-supplying URLs. Native tests: 318 + 10 pass;
+whole verify passed. Evidence and exact remaining limits are in the top section
+of [the updater handoff](MACOS-UPDATER-HANDOFF.md). This is debug/ad-hoc QA, not a
+signed same-source release or production activation; the full deployment goal remains open.
+
+## Current checkpoint — private actual restart passed, not release acceptance
+
+About's `Update and restart` now actually upgrades the isolated A10 (beta.10 /
+0.2.4) to B3 (beta.11 / 0.2.5), restarts it and commits successor health. The
+automatic preference remains false. Old native/server/core identities exited;
+the successor is native PID 7560/server 7766 with a schema-2 completion marker.
+Installed Info.plist and strict/deep code-signature verification pass. The same
+origin, Scratch project, unsent text and SVG preview remain. A read-only actual
+IndexedDB check confirms schema 2, revision 51, one 172-byte attachment and its
+original SHA-256 (`B3-after-update-bytes-ax.txt`).
+
+Evidence: `/private/tmp/gajae-native-restart.wupMI0/`, especially `A10-stderr.log`,
+`A10-manual-cycle.jsonl`, `B3-after-update-ax.txt` and `.png`. These are ad-hoc/debug
+apps with a dedicated QA updater key. B3 predates A10's final native sequencing
+change, so this is not final same-source signed/notarized qualification or a
+public release. Normal Quit/reopen also preserves beta.11, origin/project/draft/
+attachment preview (`B3-normal-reopen-ax.txt` and `.png`). Broader authenticated/
+transcript/queue data acceptance, production activation and remaining release
+gates still need work. QA fixtures/logs are retained, not installed over production.
+
+### Earlier failure and implementation checkpoints
+
+Parent-reported pushed HEAD is `721806d`; the native-restart transaction above it
+is uncommitted WIP (about 35 files at handoff; concurrent work can change this).
+The transaction now connects native challenge/draft seal, Applying/page teardown,
+authenticated backend prepare/commit, owned-tree shutdown and durable manual restart intent.
+Execution remains exact compile-bound **QA-only**, not production activation.
+Native payload and archive checks now share the strict schema-2 runtime parser.
+Source, evidence and remaining gates: [macOS updater handoff](MACOS-UPDATER-HANDOFF.md).
+
+Evidence root: `/private/tmp/gajae-native-restart.wupMI0/`. `verify-final.log`
+records full `npm run verify` (parent exit 0); `native-tests-final-rerun2.log`
+has 307 desktop Rust passes / 5 ignored plus 10 binding passes.
+`native-clippy-final.log` passed before later minor QA diagnostics/test-fixture
+changes. These are bounded checkpoints, not validation of the evolving worktree.
+
+Attachment-bearing GUI A4–A7 fail on File/Blob `NotFoundError` **before backend prepare**;
+no successful actual manual restart is recorded. An isolated same-app quit/reopen
+probe first reads both Files and ArrayBuffer at 172 bytes; rewriting the retrieved
+record breaks retained and freshly loaded Files while ArrayBuffer stays readable.
+
+For a text-only follow-up, the parent backed up isolated home/browser under the
+real profile lease to `A7-profile-before-codec/` in the evidence root, then removed
+only the current QA fixture attachment (source fixture/backup retained).
+That home/browser backup does not include the separately UUID-isolated WebKit
+store; restoring it does not restore IndexedDB attachments. Legacy migration QA
+must create the fixture again through the older app.
+`A7-reopen-stderr.log` reaches backend prepare → prepared → Applying → cancelled,
+not commit/restart. A JS auto-cancel after fetch rejection during expected Applying
+navigation is the likely self-cancel race. The new bridge/test sends no automatic
+cancel after prepared ACK dispatch; the seal waits for native abort confirmation
+and native owns the deadline. Subsequent A8 text-only attempts defer on owner
+capture/revalidation, not a successful commit or app replacement. The byte-backed
+codec is implemented; the parent's five codec/freeze/bridge suites pass 123 tests.
+Native follow-up clippy/tests also pass (307 + 10, 5 ignored). These do not replace
+fresh combined verification and actual A→B with attachment byte checks. Matching
+private QA payloads were rebuilt; temporary version overrides are restored, not a release.
+Actual A8 → A9 legacy attachment migration is verified in `A9-migrated-draft-ax.txt`:
+schema 2, expected draft, one 172-byte attachment with the original SHA-256.
+`verify-codec-union.log` is full verify exit 0. A9 still defers at backend commit;
+A10 moves page teardown before prepare without weakening generation checks.
+Its native clippy/tests pass, but A10 → B3 is incremental QA, not final same-source acceptance.
+
+The goal remains automatic update **and public deployment**. Production
+activation/owner qualification, key custody/backup, signed/notarized same-source
+A→B, actual macOS 13, G0 approval/cancel/writer-exit proof, deep-link buffering,
+SDK streaming/extension tails and full G3/G5 remain open. A verified SDK source
+patch is not full SDK quiescence. The user-active `/Applications` app and its
+data are outside this docs-only pass; no Git, runtime, build or GUI actions.
 
 ## Current task scope
 
@@ -25,6 +147,13 @@ actual macOS 13 execution are not completed by it. GUI testing used macOS
 not changed. The older session records below are historical.
 
 ## TL;DR
+
+- **Unreleased updater work** includes preparation controls, the earlier private
+  next-launch A→B, and a now-passing private About-button A10 → B3 native restart
+  with exact attachment-byte preservation. This is incremental debug QA, not final
+  signed same-source acceptance. Production install/restart
+  remains gated and no updater-enabled release is published. See the current
+  [updater checkpoint](MACOS-UPDATER-HANDOFF.md), not the older progress records.
 
 - **Unreleased follow-up: tasks above the conversation.** `ChatTasksPanel` now
   shows the session's live todo list above the transcript with collapse,

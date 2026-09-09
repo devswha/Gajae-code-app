@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { version as currentVersion } from '../../../../package.json';
+import { useDesktopUpdate } from '../../../hooks/useDesktopUpdate';
 import { useDeviceSettings } from '../../../hooks/useDeviceSettings';
 import { useProjectsQuery } from '../../../hooks/useProjectsQuery';
 import { useUiPreferences } from '../../../hooks/useUiPreferences';
@@ -18,6 +19,8 @@ import SidebarModals from './SidebarModals';
 import type { SidebarProjectListProps } from './SidebarProjectList';
 
 function Sidebar(props: SidebarProps) {
+  // Keep the shared native client alive across expanded/collapsed subscriptions.
+  useDesktopUpdate();
   const { activeSessions, onProjectSelect, onSessionSelect, onNewSession, onSessionDelete, onLoadMoreSessions, onProjectDelete, onRefresh, isMobile } = props;
   const { t } = useTranslation(['sidebar', 'common']);
   const { isPWA } = useDeviceSettings({ trackMobile: false });

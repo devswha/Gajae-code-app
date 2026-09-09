@@ -8,9 +8,12 @@
 //
 // Config is resolved per-request from headers (set by the client's voice settings),
 // falling back to server env defaults. Mounted at /api/voice behind authenticateToken.
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
+import { finished, pipeline } from 'node:stream/promises';
 
 import express from 'express';
+
+import { asyncHandler } from './shared/utils.js';
 
 const ENV = {
   baseUrl: (process.env.VOICE_API_BASE_URL || '').replace(/\/$/, ''),
@@ -120,18 +123,48 @@ function upstreamError(res, status, text) {
   return res.status(status).json({ error: text || 'voice backend error' });
 }
 
-let _upload = null;
 /**
- * Lazily build a memory-storage multer instance (25 MB cap) for audio uploads,
- * so multer is only imported when the voice feature is actually used.
- * @returns {Promise<import('multer').Multer>}
+ * Await both Multer's callback and the owned memory pipelines. On request abort
+ * Multer may call next before its storage callbacks have completed.
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @returns {Promise<void>}
  */
-async function getUpload() {
-  if (!_upload) {
-    const multer = (await import('multer')).default;
-    _upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+async function receiveAudio(req, res) {
+  const multer = (await import('multer')).default;
+  const operations = [];
+  const upload = multer({
+    storage: {
+      _handleFile: (_request, file, done) => {
+        const chunks = [];
+        const output = new Writable({
+          write(chunk, _encoding, callback) { chunks.push(chunk); callback(); },
+        });
+        operations.push(pipeline(file.stream, output).then(() => {
+          const buffer = Buffer.concat(chunks);
+          chunks.length = 0;
+          done(null, { buffer, size: buffer.length });
+        }, (error) => {
+          chunks.length = 0;
+          done(error);
+        }));
+      },
+      _removeFile: (_request, file, done) => { delete file.buffer; done(null); },
+    },
+    limits: { fileSize: 25 * 1024 * 1024 },
+  });
+  const failure = await new Promise((resolve) => upload.single('audio')(req, res, resolve)).catch((error) => error);
+  const storageFailures = [];
+  for (let settled = 0; settled < operations.length;) {
+    const batch = operations.slice(settled);
+    settled += batch.length;
+    const results = await Promise.allSettled(batch);
+    for (const result of results) if (result.status === 'rejected') storageFailures.push(result.reason);
   }
-  return _upload;
+  if (failure || req.aborted || storageFailures.length) {
+    if (req.file) delete req.file.buffer;
+    throw failure || storageFailures[0] || new Error('Request aborted');
+  }
 }
 
 /**
@@ -147,51 +180,52 @@ function authHeader(apiKey) {
 /**
  * GET /api/voice/health -> { configured } (true when a backend base URL is set).
  */
-router.get('/health', (req, res) => {
+router.get('/health', asyncHandler((req, res) => {
   res.json({ configured: Boolean(resolveConfig(req).baseUrl) });
-});
+}));
 
 /**
  * POST /api/voice/transcribe (multipart 'audio') -> { text }.
  * Forwards the uploaded audio to the backend's /audio/transcriptions endpoint.
  */
-router.post('/transcribe', async (req, res) => {
+router.post('/transcribe', asyncHandler(async (req, res) => {
   const cfg = resolveConfig(req);
   if (!cfg.baseUrl) return res.status(503).json({ error: 'No voice backend configured' });
   if (!isAllowedBackendUrl(cfg.baseUrl)) return res.status(400).json({ error: 'Invalid voice backend URL.' });
-  const upload = await getUpload();
-  upload.single('audio')(req, res, async (err) => {
-    if (err) return res.status(400).json({ error: err.message });
-    if (!req.file) return res.status(400).json({ error: 'No audio uploaded' });
-    try {
-      const fd = new FormData();
-      fd.append(
-        'file',
-        new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' }),
-        req.file.originalname || 'recording.webm',
-      );
-      fd.append('model', cfg.sttModel);
-      const r = await fetchWithTimeout(`${cfg.baseUrl}/audio/transcriptions`, {
-        method: 'POST',
-        headers: authHeader(cfg.apiKey),
-        body: fd,
-      });
-      const text = await r.text();
-      if (!r.ok) return upstreamError(res, r.status, text);
-      let data;
-      try { data = JSON.parse(text); } catch { data = { text }; }
-      res.json({ text: data.text ?? '' });
-    } catch (e) {
-      backendError(res, e);
-    }
-  });
-});
+  try {
+    await receiveAudio(req, res);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  if (!req.file) return res.status(400).json({ error: 'No audio uploaded' });
+  try {
+    const fd = new FormData();
+    fd.append(
+      'file',
+      new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' }),
+      req.file.originalname || 'recording.webm',
+    );
+    fd.append('model', cfg.sttModel);
+    const r = await fetchWithTimeout(`${cfg.baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: authHeader(cfg.apiKey),
+      body: fd,
+    });
+    const text = await r.text();
+    if (!r.ok) return upstreamError(res, r.status, text);
+    let data;
+    try { data = JSON.parse(text); } catch { data = { text }; }
+    res.json({ text: data.text ?? '' });
+  } catch (e) {
+    backendError(res, e);
+  }
+}));
 
 /**
  * POST /api/voice/tts { text } -> audio bytes.
  * Forwards the text to the backend's /audio/speech endpoint and streams the audio back.
  */
-router.post('/tts', async (req, res) => {
+router.post('/tts', asyncHandler(async (req, res) => {
   const cfg = resolveConfig(req);
   if (!cfg.baseUrl) return res.status(503).json({ error: 'No voice backend configured' });
   if (!isAllowedBackendUrl(cfg.baseUrl)) return res.status(400).json({ error: 'Invalid voice backend URL.' });
@@ -215,10 +249,32 @@ router.post('/tts', async (req, res) => {
     res.setHeader('Content-Type', r.headers.get('content-type') || 'audio/mpeg');
     res.setHeader('Cache-Control', 'no-store');
     if (!r.body) return res.end();
-    Readable.fromWeb(r.body).on('error', (error) => res.destroy(error)).pipe(res);
+    const source = Readable.fromWeb(r.body);
+    const sourceClosed = new Promise((resolve) => source.once('close', resolve));
+    const stopSource = () => { source.destroy(); };
+    const reportError = (error) => { res.destroy(error); };
+    source.on('error', reportError);
+    res.once('close', stopSource);
+    const responseDone = finished(res, { cleanup: true }).catch(stopSource);
+    try {
+      if (res.destroyed) stopSource();
+      else source.pipe(res);
+      // Readable.fromWeb's close follows its async cancel/_destroy callback.
+      // A closed client alone must not release the backend stream's ownership.
+      await Promise.all([sourceClosed, responseDone]);
+    } catch (error) {
+      res.destroy(error);
+      throw error;
+    } finally {
+      stopSource();
+      await Promise.all([sourceClosed, responseDone]);
+      res.off('close', stopSource);
+      source.off('error', reportError);
+    }
   } catch (e) {
-    backendError(res, e);
+    if (res.headersSent || res.destroyed) res.destroy(e);
+    else backendError(res, e);
   }
-});
+}));
 
 export default router;

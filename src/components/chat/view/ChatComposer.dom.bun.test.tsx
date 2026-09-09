@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { cleanup, render, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, within } from '@testing-library/react';
 import { createInstance } from 'i18next';
 import { createElement, type ComponentProps } from 'react';
 import type { DropzoneInputProps, DropzoneRootProps } from 'react-dropzone';
@@ -97,6 +97,28 @@ function slot(container: HTMLElement, name: string) {
   const element = container.querySelector<HTMLElement>(`[data-slot="prompt-input${name ? `-${name}` : ''}"]`);
   assert.ok(element, `missing prompt input ${name || 'form'}`);
   return element;
+}
+
+for (const language of ['en', 'ko']) {
+  test(`${language} draft storage failure exposes a real retry action without sending`, async () => {
+    await i18n.changeLanguage(language);
+    let retries = 0;
+    let sends = 0;
+    const view = render(composer(composerProps({
+      draftPersistence: { phase: 'error', reason: 'conflict' },
+      onRetryDraftPersistence: async () => { retries += 1; return true; },
+      onSubmit: () => { sends += 1; },
+      queuedDrafts: [{ id: 'recovered', content: 'Review me', images: [], requiresReview: true }],
+    })));
+    const warning = view.getByRole('alert');
+    assert.ok(warning.textContent?.includes(i18n.t('input.draftPersistence.failed', { ns: 'chat' })));
+    const retry = within(warning).getByRole('button', { name: i18n.t('input.draftPersistence.retry', { ns: 'chat' }) });
+    await act(async () => { fireEvent.click(retry); });
+    assert.equal(retries, 1);
+    assert.equal(sends, 0);
+    assert.ok(view.getByText(`· ${i18n.t('input.queue.reviewBeforeSending', { ns: 'chat' })}`));
+    assert.equal(view.queryByText(i18n.t('input.queue.willSend', { ns: 'chat' })), null);
+  });
 }
 
 // happy-dom does not calculate flex geometry. These assertions protect the

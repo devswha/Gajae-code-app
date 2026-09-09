@@ -46,6 +46,38 @@ impl Binding {
         }
     }
 
+    /// A compiled updater QA executable must never fall back to the real HOME
+    /// or WebKit store when launched by Finder or a UI automation tool without
+    /// its arguments. This check precedes profile creation and every webview.
+    pub(crate) fn validate_launch_profile(&self, requested: Option<&Path>) -> Result<(), String> {
+        if self.mode == Mode::Qa && (requested.is_none() || requested != self.qa_root.as_deref()) {
+            return Err("Updater QA builds require their exact compiled --qa-profile.".into());
+        }
+        Ok(())
+    }
+
+    /// The official plugin deserializes its Config BEFORE Builder::pubkey can
+    /// override it. Supply the public-only config in the native context, while
+    /// preserving disabled/unbound modes and all remote IPC restrictions.
+    pub(crate) fn configure_plugin(
+        &self,
+        config: &mut tauri::Config,
+        qa_profile: Option<&Path>,
+        release_arm64: bool,
+    ) {
+        if !self.admits_profile(qa_profile, release_arm64) {
+            return;
+        }
+        config.plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({
+                "pubkey": self.public_key,
+                "endpoints": [],
+                "dangerousInsecureTransportProtocol": false,
+            }),
+        );
+    }
+
     pub fn validate_runtime(
         &self,
         qa_profile: Option<&Path>,
@@ -121,6 +153,53 @@ impl Binding {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn official_plugin_configuration_is_supplied_only_for_admitted_profiles() {
+        let root = Path::new("/qa-profile");
+        let mut config = tauri::Config::default();
+        let mut binding = Binding {
+            mode: Mode::Disabled,
+            feed_origin: String::new(),
+            public_key: "public-test-key".into(),
+            qa_root: None,
+        };
+        binding.configure_plugin(&mut config, None, true);
+        assert!(!config.plugins.0.contains_key("updater"));
+        binding.mode = Mode::Qa;
+        binding.qa_root = Some(root.into());
+        binding.configure_plugin(&mut config, None, true);
+        assert!(!config.plugins.0.contains_key("updater"));
+        binding.configure_plugin(&mut config, Some(root), false);
+        let decoded: tauri_plugin_updater::Config =
+            serde_json::from_value(config.plugins.0["updater"].clone()).unwrap();
+        assert_eq!(decoded.pubkey, "public-test-key");
+        assert!(decoded.endpoints.is_empty());
+        assert!(!decoded.dangerous_insecure_transport_protocol);
+        assert!(
+            serde_json::from_value::<tauri_plugin_updater::Config>(serde_json::json!({})).is_err(),
+            "Builder's key override cannot repair missing Config.pubkey during deserialization"
+        );
+    }
+
+    #[test]
+    fn qa_executable_cannot_launch_with_missing_or_foreign_profile_before_any_io() {
+        let root = Path::new("/uncreated-qa-profile");
+        let mut binding = Binding {
+            mode: Mode::Qa,
+            feed_origin: String::new(),
+            public_key: String::new(),
+            qa_root: Some(root.into()),
+        };
+        assert!(binding.validate_launch_profile(None).is_err());
+        assert!(binding
+            .validate_launch_profile(Some(Path::new("/foreign")))
+            .is_err());
+        assert!(binding.validate_launch_profile(Some(root)).is_ok());
+        binding.mode = Mode::Disabled;
+        assert!(binding.validate_launch_profile(None).is_ok());
+        assert!(binding.validate_launch_profile(Some(root)).is_ok());
+    }
 
     #[test]
     fn disabled_development_and_unbound_qa_are_inert_before_io() {

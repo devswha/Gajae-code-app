@@ -1,4 +1,73 @@
 {
+  "about": {
+    "updateAvailable": "Update verfügbar: {{version}}"
+  },
+  "desktopUpdate": {
+    "update": "Aktualisieren",
+    "updating": "Aktualisierung läuft…",
+    "manualHelp": "Aktualisieren lädt das Update herunter und fordert einen sicheren Neustart an. Prüfungen laden nichts herunter und installieren nichts.",
+    "awaitingOperation": "Der vorherige native Vorgang läuft noch. Bitte noch nicht erneut versuchen.",
+    "targetVersion": "Version {{version}}",
+    "showDetails": "Details zum Desktop-Update anzeigen: {{version}} — {{status}}",
+    "dismiss": "Diesen Update-Hinweis schließen",
+    "deferredHelp": "Beenden Sie laufende Arbeiten und prüfen Sie erneut. Die Installation wird nicht automatisch wiederholt.",
+    "recoveryHelp": "Die Wiederherstellung erfordert Ihre Aufmerksamkeit in der Desktop-App. Hier kann nur der Status aktualisiert werden.",
+    "updateErrors": {
+      "busy": "Laufende Arbeiten haben den Neustart verhindert. Beenden Sie diese und klicken Sie erneut auf Aktualisieren.",
+      "changed": "Das Update-Ziel hat sich geändert. Prüfen Sie die angezeigte Version, bevor Sie erneut auf Aktualisieren klicken.",
+      "failed": "Das Update konnte nicht abgeschlossen werden. Prüfen Sie den Status und versuchen Sie es erneut."
+    },
+    "reasons": {
+      "discoveryFailed": "Die Release-Suche ist fehlgeschlagen.",
+      "cacheInvalid": "Das zwischengespeicherte Update hat die Prüfung nicht bestanden.",
+      "preparationCancelled": "Die Update-Vorbereitung wurde abgebrochen.",
+      "preferencesNotPersisted": "Die Einstellung für automatische Prüfungen konnte nicht gespeichert werden."
+    },
+    "title": "Desktop-Updates",
+    "connecting": "Verbindung zur Desktop-Aktualisierung…",
+    "unconfirmed": "Der Zugriff auf die Desktop-Aktualisierung wurde nicht bestätigt.",
+    "lastConfirmed": "Zuletzt bestätigter nativer Zustand; der aktuelle Zustand ist unbestätigt.",
+    "unknownVersion": "Version nicht bestätigt",
+    "incomplete": "Die Release-Suche ist unvollständig. Die neueste Version wurde damit nicht bestätigt.",
+    "preparationOnly": "Die Installation ist derzeit nicht verfügbar. Ein vorbereitetes Update ist noch nicht installiert.",
+    "productVersion": "App-Version",
+    "desktopVersion": "Desktop-Build",
+    "targetProductVersion": "Zielversion der App",
+    "targetDesktopVersion": "Ziel-Desktop-Build",
+    "progress": "Download-Fortschritt",
+    "knownProgress": "{{downloaded}} / {{total}} Bytes",
+    "unknownTotal": "{{downloaded}} Bytes geladen; Gesamtgröße unbekannt.",
+    "unknownProgress": "Warten auf Download-Fortschritt.",
+    "automatic": "Automatisch nach Updates suchen",
+    "automaticHelp": "Prüfungen suchen nur nach neuen Versionen. Download und Installation erfordern einen Klick auf Aktualisieren. Änderungen erscheinen nach Bestätigung durch die Desktop-App.",
+    "confirmingSetting": "Warten auf native Bestätigung der Einstellung…",
+    "confirmingRestart": "Sicherer Neustart wird angefordert…",
+    "check": "Nach Updates suchen",
+    "refresh": "Status aktualisieren",
+    "retry": "Erneut prüfen",
+    "restart": "Aktualisieren und neu starten",
+    "osPrompt": "macOS kann in einem eigenen Systemdialog eine Administratorfreigabe anfordern. Bestätigen oder widerrufen Sie dort; geben Sie hier keine Zugangsdaten ein. Bei laufenden Aufgaben kann der Neustart verschoben werden.",
+    "notes": "Versionshinweise",
+    "phases": {
+      "available": "Update verfügbar",
+      "disabled": "Updater deaktiviert",
+      "idle": "Warten auf die nächste Prüfung",
+      "checking": "Releases werden geprüft",
+      "downloading": "Update wird geladen",
+      "verifying": "Update wird verifiziert",
+      "ready": "Update vorbereitet",
+      "deferred": "Update verschoben",
+      "error": "Update-Fehler",
+      "applying": "Update wird angewendet",
+      "restarting": "Neustart läuft",
+      "recovery": "Wiederherstellung erforderlich"
+    },
+    "errors": {
+      "unavailable": "Die authentifizierte Desktop-Aktualisierung ist nicht erreichbar. Ihr aktueller Zustand ist unbekannt.",
+      "invalidResponse": "Die Desktop-Aktualisierung hat eine nicht unterstützte Antwort geliefert. Installationsaktionen bleiben deaktiviert.",
+      "timeout": "Das Warten auf die Antwort wurde beendet; der native Vorgang läuft möglicherweise weiter. Aktualisieren Sie vor einem erneuten Versuch den Status."
+    }
+  },
   "close": "Einstellungen schließen",
   "title": "Optionen",
   "account": {
