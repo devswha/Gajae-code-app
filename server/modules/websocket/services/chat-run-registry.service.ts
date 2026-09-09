@@ -123,6 +123,7 @@ async function publishSessionUpsert(sessionId: string): Promise<void> {
       fullPath: project.project_path,
       displayName,
       isStarred: Boolean(project.isStarred),
+      isArchived: Boolean(project.isArchived),
       origin: project.origin,
     },
     timestamp: new Date().toISOString(),

@@ -120,7 +120,7 @@ async function sessionFrame(provider: LLMProvider, providerSessionId: string): P
     sessionId: row.session_id,
     provider: row.provider,
     session: { id: row.session_id, summary: row.custom_name || '', messageCount: 0, lastActivity: row.updated_at ?? row.created_at ?? new Date().toISOString() },
-    project: project ? { projectId: project.project_id, path: project.project_path, fullPath: project.project_path, displayName, isStarred: Boolean(project.isStarred), origin: project.origin } : null,
+    project: project ? { projectId: project.project_id, path: project.project_path, fullPath: project.project_path, displayName, isStarred: Boolean(project.isStarred), isArchived: Boolean(project.isArchived), origin: project.origin } : null,
     timestamp: new Date().toISOString(),
   });
 }
