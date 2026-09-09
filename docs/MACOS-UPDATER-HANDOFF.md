@@ -3,12 +3,22 @@
 ## 최신 서명 QA 상태
 
 `f69ec4f`의 동일 소스 release-mode A/B가 Developer ID 서명·공증·Gatekeeper
-검증을 통과했다. B의 packaged smoke/data-survival도 통과했다. 실제 로컬 모델
-대화와 실행 중 재시작 보류를 확인했고, 초안/대기열/SVG/전사 파일의 before
-해시를 기록했다. **실제 서명 A→B 교체는 아직 미검증**이며 Mac 잠금으로 다음
-화면 조작을 기다린다. 프로덕션 배포는 하지 않았다.
-현재 앱/피드/모델 상태와 정확한 재개 절차는
+검증을 통과했다. **2026-09-09 실제 서명 A→B 자동 교체·후속 서버 health·일반
+재실행까지 통과했다.** Off에서는 A를 유지하고 On에서는 정상 종료 후 다음
+실행에 beta.11/0.2.5로 자동 교체한다. 수동 업데이트 버튼이나 QA 설치 플래그는
+사용하지 않았다. 같은 origin, 대화/모델 설정, 초안/대기열/첨부 SVG의 전체
+기록 바이트가 그대로이며 대기열 자동 전송은 없었다. 설치된 B의 서명·staple·
+Gatekeeper도 다시 통과했다. QA 앱은 정상 종료하고 피드/모델/관측기만 중지했다.
+fixture와 완료 journal은 보존하며 프로덕션 앱·공개 배포는 변경하지 않았다.
+증거와 남은 승인·복구/OS13/키 보관·백업/공개 릴리즈 조건은
 [DESKTOP-UPDATER-SIGNED-QA.md](DESKTOP-UPDATER-SIGNED-QA.md)에 있다.
+
+후속 보안 검증에서 발견한 Multer/YAML 항목은 2.3.0 및 3.15.2/4.3.2로
+갱신했다. ZIP final-leaf 취약점은 exact upstream PR160의 별도 해시 고정
+backport로 처리하고 설치·audit·서버/desktop 패키징에서 확인한다. 적용 전·
+변조·중첩 설치는 거부하며 기존 vendor-download 제한과 리뷰 기한도 유지한다.
+실제 ZIP/패키징/audit 회귀 46개 및 clean npm ci 이후 전체 verify가 통과했다.
+이 보안 변경은 위 signed f69ec4f 쌍 이후이므로 공개 후보는 새로 빌드해야 한다.
 
 ## 후속: 배포 binding과 자동 다음 실행 적용 연결
 

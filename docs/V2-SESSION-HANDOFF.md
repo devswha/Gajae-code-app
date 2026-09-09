@@ -2,10 +2,19 @@
 
 Latest signed qualification: [DESKTOP-UPDATER-SIGNED-QA.md](DESKTOP-UPDATER-SIGNED-QA.md).
 Same-source f69ec4f release-mode A/B are notarized and Gatekeeper-accepted. The
-actual signed update transition is paused for manual Mac unlock; its running
-isolated A, feed and local model are retained. Public deployment is not complete.
+actual signed next-launch automatic A → B transition, Off/on behavior, byte-exact
+transcript/draft/queue/image/config survival and normal B reopen passed on
+September 9. QA processes are stopped and fixture/journal evidence is retained.
+Public deployment and its remaining authorization/OS13/key-custody gates are
+not complete; the production installation was not changed.
 
-Last updated: 2026-09-08 (private manual-update A10 → B3 and attachment preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
+Post-QA security updates raise Multer/YAML floors and apply a separate
+integrity-checked upstream ZIP symlink-leaf backport through installation,
+audit and both packaging lanes. Clean npm ci and the full verify gate pass.
+This delta is not in the frozen f69ec4f signed pair; final public artifacts
+must be rebuilt. See the signed QA record for the bounded patch/audit scope.
+
+Last updated: 2026-09-09 (same-source signed automatic A → B and data preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
 
 ## Follow-up checkpoint — SDK32 and durable notification handoff
 

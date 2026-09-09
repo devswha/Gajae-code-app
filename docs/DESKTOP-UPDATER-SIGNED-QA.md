@@ -1,9 +1,10 @@
-# Same-source signed updater qualification — in progress
+# Same-source signed updater qualification — automatic path passed
 
-The full goal remains automatic updates and public distribution. This is not a
-release-completion record. The current interactive step is waiting for the
-operator to unlock the Mac; do not terminate/relaunch the running QA app to
-bypass that pause.
+On September 9, 2026, the same-source signed/notarized A → B next-launch
+automatic update passed on macOS 26.6.2 arm64. Off/on behavior, successor health,
+data preservation and an additional ordinary B quit/reopen were verified.
+The full public-distribution goal remains open; this is private QA, not a public
+release-completion record.
 
 ## Frozen source and signed artifacts
 
@@ -27,9 +28,11 @@ bypass that pause.
 Evidence root: `/private/tmp/gajae-signed-update.CRJaMk/`.
 QA profile: `/private/var/folders/y6/0bfmyp091_577tb_vpgs9yrw0000gn/T/gajae-update-qa-nRUrGS`.
 App copies: `builds/A/Gajae Code App.app`, `builds/B/Gajae Code App.app` beneath
-that profile. A is copied to its exact compiled root `Gajae Code App.app` and
-is currently running. Temporary source versions were restored; the source cut
-was clean before this documentation update.
+that profile. The exact compiled root `Gajae Code App.app` now contains installed
+B. Temporary source versions were restored; the source cut was clean before
+this documentation update. After acceptance the QA app was quit normally and
+the private feed, model and passive observer were stopped. All fixture files,
+cached bytes and journals are retained; the production app was not changed.
 
 ## Actual data and busy-restart checks
 
@@ -62,33 +65,120 @@ record includes the exact 164-byte SVG payload. SVG SHA-256:
 Draft record hash: `a54c78399f59f22b866c84af21662b158390157e2dd815d27f4cb80ee16a6050`.
 The provider transcript is 8,280 bytes with hash
 `6a224156ca0f4f20ee52d42f4cde3588600ec761559fdccc7f58a258419f75d4`.
-Model configuration and automatic preference are captured too. This is only
-the **before** snapshot; after-update comparison is still required.
+Model configuration and automatic preference are captured too. The comparisons
+below establish that these exact recorded bytes survived every accepted stage.
 
 The WebKit data store is UUID `3E12807D-3CDB-4540-ADCF-B8434D0B61DD`, separate
 from the QA home/browser directories. `snapshot-data.mjs` targets only that
 store and is read-only. Do not inspect a default/production WebKit store.
 
-## Resume after manual unlock
+## Accepted Off/on and normal-reopen sequence
 
-1. Use Computer Use with the full QA app path and confirm the `— QA` window.
-   Do not launch a closed QA app without its exact `--qa-profile` argument.
-2. Test Off with prepared B: persist the setting, quit normally, relaunch A
-   without `--qa-update-install`, confirm no replacement and the same data.
-3. Enable automatic updates, quit A normally, capture a final before snapshot,
-   then relaunch A with only its QA profile. The new common consent path must
-   apply B before starting its server and complete successor health.
-4. Verify B signature/ticket/version, unchanged origin, transcript/model config,
-   draft/queue/SVG bytes, and no unintended queued send. Capture a further
-   ordinary quit/reopen. Preserve failure evidence instead of resetting journals.
+1. After manual Mac unlock, Computer Use confirmed the exact `— QA` app and
+   existing session. With B already cached, automatic updates were turned off
+   through About. Normal Cmd-Q stopped A/native 97073 and server 97142.
+2. Launching the same app with only `--qa-profile` started A/native 21875 and
+   server 22012. Product beta.10 / desktop 0.2.4 remained installed; automatic
+   stayed false and no canonical attempt existed. The same session, paused
+   queue, one image and unsent draft were visible after opening the conversation.
+3. Automatic updates were enabled through About. After normal Cmd-Q and observed
+   native/server exit, the same app was launched with only `--qa-profile`:
+   **no manual restart button and no `--qa-update-install` flag** were used.
+4. `automatic-cycle.jsonl` captured attempt
+   `d5b3a37a3f728dad88ff942ca69400f8`: installer owner 23709, `installing` before
+   any server marker, then `awaiting_health`. The old owner exited; B/native
+   23998 and server 24006 completed the schema-2 `committed` health record.
+   No manual intent appeared anywhere in the observed cycle.
+5. Installed B reported product beta.11 / desktop 0.2.5. Strict/deep codesign,
+   stapler validation and Gatekeeper all passed again on the **installed** app.
+   Origin remained `http://127.0.0.1:51693`; the session, two successful responses,
+   review-paused queue/image and unsent draft were visible. Model request count
+   stayed two, both complete and not aborted: the queue was not auto-sent.
+6. A further ordinary Cmd-Q/reopen started B/native 25074 and server 25198,
+   retained the same version/origin and all data, and did not start another
+   installation. The final normal Quit stopped both processes.
 
-At the pause, A is running, B is fully cached, automatic is true and there is no
-manual install intent/canonical attempt. The private feed and local model stay
-running for resumption. Model requests are complete and its hold is false.
-No production app or data was used. Do not change the source under this pair.
+`accept-results.mjs` compared `off-before-quit`, `off-reopen`, `before-auto`,
+`after-auto` and `b-normal-reopen` snapshots with `before-update-data.json`.
+All five retain the identical 745-byte draft/queue record, exact SVG bytes,
+8,280-byte provider transcript and model configuration hash. It also checks
+consent values, installed version, the recorded install/server ordering,
+absence of manual intent, successor completion and installed signing acceptance.
+Results are saved in `accepted-results.json`. UI evidence includes
+`off-reopen-session-ax.txt`, `after-auto-session-ax.txt` / `.png`, and
+`B-normal-reopen-session-ax.txt` / `.png`.
 
-Remaining release requirements include this actual signed transition, wider
-failure/authorization qualification, production owner/OS13 acceptance, updater
-key custody/backup, and initial plus subsequent public distributions. Source
+The UI capture during process replacement briefly returned Computer Use
+`timeoutReached`; no extra app launch or installer retry was issued. The journal
+then committed normally and the successor UI was inspected. The transcript's
+failed initial fixture run remains failure evidence, not a successful model run.
+
+## Remaining public-release boundary
+
+The post-acceptance source gate was rerun and stopped at the dependency audit:
+new blocking advisories affect `extract-zip`, both `js-yaml` majors and `multer`.
+That failed run is retained as `verify-after-acceptance.log`; the earlier frozen
+source gate must not be represented as today's clean security audit. Security
+dependency changes need their own verification and final release artifacts.
+
+The compatible dependency fixes now require Multer 2.3.0 and constrain installed
+YAML 3/4 to 3.15.2/4.3.2. Regression tests cover locked version floors, empty
+merge-source limits and frontmatter compatibility; shipped third-party notices
+were regenerated. SDK/Puppeteer versions and the SDK runtime manifest did not
+change. The remaining ZIP advisory was then addressed with a separate canonical
+backport of upstream PR160 (commit `148750acb10c574818906de2a99aa13d457d5329`),
+which is open/unmerged, not a published dependency release. The manifest/helper
+pin exact version, package metadata and full before/after source hashes; unknown,
+linked, aliased and nested installations fail closed. Postinstall applies it;
+dev/build/test/audit and both server/desktop staging plus out-of-tree smokes
+verify rather than silently apply it. The independent SDK32 manifest is unchanged.
+
+The archive-only regression proves an unpatched ZIP can overwrite an outside
+canary and the patched extractor refuses it. Normal/duplicate files, directories
+and safe symlinks remain supported. The upstream change does not protect against
+a concurrent local writer swapping the path after lstat, nor later consumers
+following extracted symlinks. Neither property is claimed. Audit recognition of
+the new advisory requires the installed canonical patch and a current review;
+the older advisory additionally retains its existing pinned-vendor-download
+restriction. This is not an unconditional vulnerability waiver.
+
+The focused union passed 46 tests (`security-focused-tests.log`), covering real
+archive bytes, integrity and audit-negative cases, staging and the actual copied
+checker. A clean `npm ci` applied all 32 SDK files and the one ZIP patch
+(`security-clean-install.log`). Final source verification is recorded separately
+from the frozen signed artifacts above; any public candidate must be rebuilt
+with this security delta.
+
+The final clean-install **full `npm run verify` passed**, including audit,
+licenses/notices, typecheck, core, all tests, lint, identity and build
+(`security-final-verify.log`). Audit explicitly reports two patch-verified,
+time-bounded extract-zip records and four moderate entries below its gate; this
+is not a claim that raw `npm audit` reports zero advisories. No production key,
+public release or installed production app was changed by the security work.
+The security delta is committed as `5aecb49`; it must not be confused with the
+earlier signed updater qualification cut `f69ec4f`.
+
+With the compatible dependency updates, the parent ran the complete non-audit
+verification chain: SDK integrity, licenses/notices, typecheck, Rust core,
+all Node/Bun tests, lint, identity and build all passed. The separately rerun
+audit at that intermediate point failed on the ZIP advisory, so that intermediate
+run is not a full `npm run verify` pass. Before this dependency delta, HEAD
+`6280f49`'s Linux server CI retry
+`34250378830` (attempt 2) passed archive build and Ubuntu 22.04/24.04 acceptance;
+attempt 1 failed only at GitHub artifact finalization with HTTP 403. Its other
+Node 22/24 and Linux desktop/GUI checks also passed. Those remote results are
+not transferred to a later source cut.
+
+The native owner suite passed 31 tests (one opt-in test ignored). An explicit
+read-only live shared-domain census then failed closed because process/foreign
+evidence changed after census (`owner-census-after-qa.log`). This is not a
+production owner-absence acceptance; no process was terminated to force a pass.
+The QA app had already been closed normally; only the task-owned fixture
+services were stopped.
+
+Remaining release requirements include wider failure/authorization qualification,
+production owner/OS13 acceptance, updater-key custody/backup, and initial plus
+subsequent public distributions. No real external-provider credential/login
+migration was exercised by this synthetic model fixture. Source
 supports explicit production bindings, but default builds stay disabled and
-this QA does not yet authorize publishing an updater-enabled installer.
+this QA does not by itself authorize publishing an updater-enabled installer.
