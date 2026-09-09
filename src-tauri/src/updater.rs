@@ -1,6 +1,6 @@
-//! Preparation-only updater owner. The authenticated main-view bridge exposes
-//! status, consent and checks. Installation, restart and attempt resolution
-//! remain gated. No official plugin install/download API is called here.
+//! Native discovery and explicitly requested archive staging. Scheduled checks
+//! publish metadata only; a target-bound click permits download/verification.
+//! Installation and restart remain in their separately guarded owners.
 use std::{
     future::Future,
     sync::{
@@ -39,6 +39,7 @@ pub enum Phase {
     Disabled,
     Idle,
     Checking,
+    Available,
     Downloading,
     Verifying,
     Ready,
@@ -57,6 +58,7 @@ pub struct Snapshot {
     pub automatic: bool,
     pub product_version: &'static str,
     pub desktop_version: &'static str,
+    pub target_id: Option<String>,
     pub target_product_version: Option<String>,
     pub target_desktop_version: Option<String>,
     pub discovery_incomplete: bool,
@@ -76,6 +78,7 @@ impl Default for Snapshot {
             automatic: false,
             product_version: env!("GJC_EXPECTED_PAYLOAD_VERSION"),
             desktop_version: env!("CARGO_PKG_VERSION"),
+            target_id: None,
             target_product_version: None,
             target_desktop_version: None,
             discovery_incomplete: true,
@@ -107,6 +110,9 @@ struct Control {
     failures: usize,
     store: Option<Arc<Store>>,
     verified: Option<VerifiedTarget>,
+    offered: Option<SelectedRelease>,
+    download_requested: Option<SelectedRelease>,
+    downloading: Option<String>,
 }
 
 impl Default for Control {
@@ -122,6 +128,9 @@ impl Default for Control {
             failures: 0,
             store: None,
             verified: None,
+            offered: None,
+            download_requested: None,
+            downloading: None,
         }
     }
 }
@@ -164,6 +173,15 @@ impl Preparation {
         self.0.manual_check_if(admit)?;
         Ok(self.0.snapshot())
     }
+
+    pub(crate) fn manual_download(
+        &self,
+        target_id: &str,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<Snapshot, &'static str> {
+        self.0.manual_download_if(target_id, admit)?;
+        Ok(self.0.snapshot())
+    }
 }
 
 impl Coordinator {
@@ -189,6 +207,8 @@ impl Coordinator {
         let was_healthy = self.healthy.swap(true, Ordering::AcqRel);
         if !was_healthy {
             self.generation.fetch_add(1, Ordering::AcqRel);
+            control.offered = None;
+            control.download_requested = None;
         }
         control.next_due = Instant::now();
         if self.started.load(Ordering::Acquire) {
@@ -224,7 +244,7 @@ impl Coordinator {
         if !self.valid(generation) {
             return Err(PrepareError::Cancelled);
         }
-        set_target(&mut control.snapshot, &target.manifest);
+        set_target(&mut control.snapshot, &target.manifest, &target.id);
         control.snapshot.phase = Phase::Ready;
         control.snapshot_generation = generation;
         control.verified = Some(target);
@@ -236,6 +256,9 @@ impl Coordinator {
         control.in_flight = false;
         control.store = None;
         control.verified = None;
+        control.offered = None;
+        control.download_requested = None;
+        control.downloading = None;
         if let Err(error) = result {
             control.snapshot.phase = Phase::Error;
             control.snapshot.reason = Some(error.code());
@@ -289,6 +312,8 @@ impl Coordinator {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         control.requested = false;
+        control.download_requested = None;
+        control.downloading = None;
         control.snapshot.automatic = false;
         if store.set_automatic(automatic).is_err() {
             control.snapshot.phase = Phase::Error;
@@ -297,7 +322,7 @@ impl Coordinator {
             return Err("preferences_not_persisted");
         }
         control.snapshot.automatic = automatic;
-        control.snapshot.phase = Phase::Idle;
+        restore_target(&mut control);
         control.requested = automatic;
         control.next_due = Instant::now();
         self.changed.notify_one();
@@ -321,13 +346,156 @@ impl Coordinator {
             return Err("updater_inactive");
         }
         // Coalesce repeated requests; manual checking never modifies consent.
-        if !control.in_flight {
+        if !control.in_flight && control.download_requested.is_none() {
             control.requested = true;
             control.restart_requested = true;
             self.changed.notify_one();
         }
         Ok(())
     }
+
+    fn manual_download_if(
+        &self,
+        target_id: &str,
+        admit: impl FnOnce() -> bool,
+    ) -> Result<(), &'static str> {
+        let mut control = self.control.lock().map_err(|_| "updater_unavailable")?;
+        if !admit() {
+            return Err("updater_unauthorized");
+        }
+        if control.store.is_none()
+            || !self.started.load(Ordering::Acquire)
+            || !self.valid(control.snapshot_generation)
+        {
+            return Err("updater_inactive");
+        }
+        if !crate::updater_backend::hex_id(target_id)
+            || control.snapshot.target_id.as_deref() != Some(target_id)
+        {
+            return Err("updater_target_changed");
+        }
+        // Duplicate clicks reuse a ready archive or the one already queued.
+        if control.snapshot.phase == Phase::Ready
+            && control
+                .verified
+                .as_ref()
+                .is_some_and(|target| target.id == target_id)
+            || control
+                .download_requested
+                .as_ref()
+                .is_some_and(|target| target.target_id() == target_id)
+            || control.downloading.as_deref() == Some(target_id)
+        {
+            return Ok(());
+        }
+        if control.in_flight {
+            return Err("updater_busy");
+        }
+        let selected = control
+            .offered
+            .as_ref()
+            .filter(|target| target.target_id() == target_id)
+            .cloned()
+            .ok_or("updater_target_changed")?;
+        // A click during Retry-After fails now; it must not become a delayed
+        // download after the UI has discarded its intent. Ready cache reuse and
+        // coalescing an already admitted download above do not issue new I/O.
+        if Instant::now() < control.not_before {
+            return Err("updater_retry_later");
+        }
+        control.snapshot.phase = Phase::Downloading;
+        control.snapshot.reason = None;
+        control.snapshot.downloaded_bytes = None;
+        control.snapshot.total_bytes = Some(selected.archive_asset.size);
+        control.download_requested = Some(selected);
+        control.restart_requested = true;
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn claim_work(&self, now: Instant) -> Option<(u64, Work)> {
+        let mut control = self.control.lock().expect("update owner lock poisoned");
+        control.restart_requested = false;
+        if !self.healthy.load(Ordering::Acquire) || control.in_flight || now < control.not_before {
+            return None;
+        }
+        let work = if let Some(selected) = control.download_requested.take() {
+            control.downloading = Some(selected.target_id());
+            Work::Download(Box::new(selected))
+        } else if control.requested || control.snapshot.automatic && now >= control.next_due {
+            Work::Check
+        } else {
+            return None;
+        };
+        control.in_flight = true;
+        control.requested = false;
+        Some((self.generation.load(Ordering::Acquire), work))
+    }
+
+    /// Finish the single owned operation. True discards its discovery cursor;
+    /// failures never restore a consumed manual-download request.
+    fn finish_work(
+        &self,
+        generation: u64,
+        result: Result<(bool, Option<Duration>), PrepareError>,
+    ) -> bool {
+        let mut control = self.control.lock().expect("update owner lock poisoned");
+        control.in_flight = false;
+        control.downloading = None;
+        if !self.valid(generation) {
+            if control.snapshot_generation == generation {
+                control.snapshot.phase = Phase::Deferred;
+                control.snapshot.reason = Some("preparation_cancelled");
+            }
+            return true;
+        }
+        match result {
+            Ok((incomplete, delay)) => {
+                control.failures = 0;
+                control.snapshot.discovery_incomplete = incomplete;
+                if !matches!(control.snapshot.phase, Phase::Ready | Phase::Available) {
+                    restore_target(&mut control);
+                }
+                let minimum = delay;
+                let delay = delay.unwrap_or_else(|| {
+                    if incomplete {
+                        CONTINUATION_DELAY
+                    } else {
+                        interval_delay()
+                    }
+                });
+                control.next_due = Instant::now() + delay;
+                control.not_before = Instant::now() + minimum.unwrap_or(Duration::ZERO);
+            }
+            Err(PrepareError::Cancelled) => {
+                // A healthy/manual wake can cancel a network waiter without an
+                // epoch change. Do not leave the UI polling Downloading forever.
+                control.snapshot.phase = Phase::Deferred;
+                control.snapshot.reason = Some("preparation_cancelled");
+                return true;
+            }
+            Err(error) => {
+                let delay = match &error {
+                    PrepareError::Discovery(DiscoveryError::RetryAfter(delay)) => *delay,
+                    _ => retry_delay(control.failures),
+                };
+                control.failures = control.failures.saturating_add(1);
+                control.next_due = Instant::now() + delay;
+                control.not_before = match &error {
+                    PrepareError::Discovery(DiscoveryError::RetryAfter(_)) => control.next_due,
+                    _ => Instant::now(),
+                };
+                control.snapshot.phase = Phase::Deferred;
+                control.snapshot.reason = Some(error.code());
+            }
+        }
+        false
+    }
+}
+
+enum Work {
+    Check,
+    Download(Box<SelectedRelease>),
 }
 
 pub(crate) fn unhealthy(app: &AppHandle) {
@@ -410,16 +578,11 @@ pub(crate) struct Runtime {
 #[derive(Clone)]
 struct VerifiedTarget {
     manifest: Manifest,
-    release_id: u64,
-    manifest_asset_id: u64,
-    archive_asset_id: u64,
+    id: String,
 }
 impl VerifiedTarget {
     fn matches(&self, selected: &SelectedRelease) -> bool {
-        self.manifest == selected.manifest
-            && self.release_id == selected.release.id
-            && self.manifest_asset_id == selected.manifest_asset.id
-            && self.archive_asset_id == selected.archive_asset.id
+        self.id == selected.target_id()
     }
 }
 
@@ -525,31 +688,13 @@ async fn run(
     }
     let mut cursor = DiscoveryCursor::default();
     loop {
-        let generation = {
+        let (generation, work) = {
             // This waiter must be dropped before preparation registers its own
             // cancellation waiter; Notify::notify_one cannot wake two owners.
             let notified = owner.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let decision = {
-                let mut control = owner.control.lock().expect("update owner lock poisoned");
-                // This live consumer has observed the healthy/manual wake.
-                control.restart_requested = false;
-                let now = Instant::now();
-                if owner.healthy.load(Ordering::Acquire)
-                    && !control.in_flight
-                    && now >= control.not_before
-                    && (control.requested
-                        || (control.snapshot.automatic && now >= control.next_due))
-                {
-                    control.in_flight = true;
-                    control.requested = false;
-                    Some(owner.generation.load(Ordering::Acquire))
-                } else {
-                    None
-                }
-            };
-            let Some(generation) = decision else {
+            let Some(work) = owner.claim_work(Instant::now()) else {
                 // A bounded heartbeat coalesces OS wake/suspend without an event
                 // listener storm. Check requests and health changes wake immediately.
                 let _ = tokio::time::timeout(Duration::from_secs(30), notified).await;
@@ -561,56 +706,27 @@ async fn run(
                 }
                 continue;
             };
-            generation
+            work
         };
-        let result = prepare(&owner, generation, &runtime, &mut cursor).await;
-        let mut control = owner.control.lock().expect("update owner lock poisoned");
-        control.in_flight = false;
-        if !owner.valid(generation) {
-            control.snapshot.phase = Phase::Deferred;
-            control.snapshot.reason = Some("preparation_cancelled");
+        let result = match work {
+            Work::Check => {
+                discover(
+                    &owner,
+                    generation,
+                    updater_discovery::discover_burst(
+                        &runtime.client,
+                        &runtime.policy,
+                        &mut cursor,
+                    ),
+                )
+                .await
+            }
+            Work::Download(selected) => download(&owner, generation, &runtime, *selected)
+                .await
+                .map(|()| (owner.snapshot().discovery_incomplete, None)),
+        };
+        if owner.finish_work(generation, result) {
             cursor = DiscoveryCursor::default();
-            continue;
-        }
-        match result {
-            Ok((incomplete, delay)) => {
-                control.failures = 0;
-                control.snapshot.discovery_incomplete = incomplete;
-                if control.snapshot.phase != Phase::Ready {
-                    control.snapshot.phase = if control.verified.is_some() {
-                        Phase::Ready
-                    } else {
-                        Phase::Idle
-                    };
-                }
-                let minimum = delay;
-                let delay = delay.unwrap_or_else(|| {
-                    if incomplete {
-                        CONTINUATION_DELAY
-                    } else {
-                        interval_delay()
-                    }
-                });
-                control.next_due = Instant::now() + delay;
-                control.not_before = Instant::now() + minimum.unwrap_or(Duration::ZERO);
-            }
-            Err(PrepareError::Cancelled) => {
-                cursor = DiscoveryCursor::default();
-            }
-            Err(error) => {
-                let delay = match &error {
-                    PrepareError::Discovery(DiscoveryError::RetryAfter(delay)) => *delay,
-                    _ => retry_delay(control.failures),
-                };
-                control.failures = control.failures.saturating_add(1);
-                control.next_due = Instant::now() + delay;
-                control.not_before = match &error {
-                    PrepareError::Discovery(DiscoveryError::RetryAfter(_)) => control.next_due,
-                    _ => Instant::now(),
-                };
-                control.snapshot.phase = Phase::Deferred;
-                control.snapshot.reason = Some(error.code());
-            }
         }
     }
 }
@@ -632,40 +748,77 @@ async fn cancellable<T>(
     }
 }
 
-async fn prepare(
+async fn discover(
     owner: &Coordinator,
     generation: u64,
-    runtime: &Runtime,
-    cursor: &mut DiscoveryCursor,
+    discovery: impl Future<Output = Result<updater_discovery::DiscoveryResult, DiscoveryError>>,
 ) -> Result<(bool, Option<Duration>), PrepareError> {
     owner.phase(generation, Phase::Checking)?;
-    let result = cancellable(
-        owner,
-        generation,
-        updater_discovery::discover_burst(&runtime.client, &runtime.policy, cursor),
-    )
-    .await?;
+    let result = cancellable(owner, generation, discovery).await?;
     let incomplete = !matches!(
         result.completeness,
         DiscoveryCompleteness::CompleteObservedScan
     );
     let Some(selected) = result.selected else {
-        return Ok((incomplete, result.retry_after));
-    };
-    {
         let mut control = owner.control.lock().expect("update owner lock poisoned");
         if !owner.valid(generation) {
             return Err(PrepareError::Cancelled);
         }
-        if control
+        restore_target(&mut control);
+        return Ok((incomplete, result.retry_after));
+    };
+    offer(owner, generation, selected)?;
+    Ok((incomplete, result.retry_after))
+}
+
+fn offer(
+    owner: &Coordinator,
+    generation: u64,
+    selected: SelectedRelease,
+) -> Result<(), PrepareError> {
+    let mut control = owner.control.lock().expect("update owner lock poisoned");
+    if !owner.valid(generation) {
+        return Err(PrepareError::Cancelled);
+    }
+    // Retain the complete native candidate; a later click never runs discovery.
+    control.offered = Some(selected);
+    restore_target(&mut control);
+    control.snapshot_generation = generation;
+    Ok(())
+}
+
+fn restore_target(control: &mut Control) {
+    if let Some(selected) = &control.offered {
+        set_target(
+            &mut control.snapshot,
+            &selected.manifest,
+            &selected.target_id(),
+        );
+        control.snapshot.phase = if control
             .verified
             .as_ref()
-            .is_some_and(|verified| verified.matches(&selected))
+            .is_some_and(|verified| verified.matches(selected))
         {
-            control.snapshot.phase = Phase::Ready;
-            return Ok((incomplete, result.retry_after));
-        }
+            Phase::Ready
+        } else {
+            Phase::Available
+        };
+        control.snapshot.downloaded_bytes = None;
+        control.snapshot.total_bytes = Some(selected.archive_asset.size);
+    } else if let Some(verified) = &control.verified {
+        set_target(&mut control.snapshot, &verified.manifest, &verified.id);
+        control.snapshot.phase = Phase::Ready;
+    } else {
+        control.snapshot.phase = Phase::Idle;
     }
+}
+
+async fn download(
+    owner: &Coordinator,
+    generation: u64,
+    runtime: &Runtime,
+    selected: SelectedRelease,
+) -> Result<(), PrepareError> {
     owner.phase(generation, Phase::Downloading)?;
     {
         let mut control = owner.control.lock().expect("update owner lock poisoned");
@@ -700,9 +853,7 @@ async fn prepare(
     let manifest = selected.manifest.clone();
     let target = VerifiedTarget {
         manifest: manifest.clone(),
-        release_id: selected.release.id,
-        manifest_asset_id: selected.manifest_asset.id,
-        archive_asset_id: selected.archive_asset.id,
+        id: selected.target_id(),
     };
     let store = runtime.store.clone();
     // Never drop this blocking worker on cancellation. It has no installer
@@ -729,12 +880,11 @@ async fn prepare(
     if !owner.valid(generation) {
         return Err(PrepareError::Cancelled);
     }
-    set_target(&mut control.snapshot, &manifest);
+    set_target(&mut control.snapshot, &manifest, &target.id);
     control.snapshot.phase = Phase::Ready;
     control.snapshot_generation = generation;
-    control.snapshot.discovery_incomplete = incomplete;
     control.verified = Some(target);
-    Ok((incomplete, result.retry_after))
+    Ok(())
 }
 
 fn identity() -> ProductIdentity<'static> {
@@ -798,9 +948,7 @@ fn validate_cache(
     }
     Ok(Some(VerifiedTarget {
         manifest: manifest.clone(),
-        release_id: record.release_id,
-        manifest_asset_id: record.manifest_asset_id,
-        archive_asset_id: record.archive_asset_id,
+        id: record.target_id(),
     }))
 }
 
@@ -834,7 +982,8 @@ pub(crate) fn eligible_cached(manifest: &Manifest, os: &str) -> Result<bool, Pre
         && parse_os(&manifest.minimum_system_version)? <= parse_os(os)?)
 }
 
-fn set_target(snapshot: &mut Snapshot, manifest: &Manifest) {
+fn set_target(snapshot: &mut Snapshot, manifest: &Manifest, target_id: &str) {
+    snapshot.target_id = Some(target_id.to_owned());
     snapshot.target_product_version = Some(manifest.product_version.to_string());
     snapshot.target_desktop_version = Some(manifest.version.to_string());
     let mut notes: String = manifest.notes.chars().take(4096).collect();
@@ -885,6 +1034,452 @@ mod tests {
         }
     }
 
+    fn candidate() -> SelectedRelease {
+        use crate::updater_discovery::{AssetIdentity, ReleaseIdentity};
+        let bytes = include_bytes!("../../shared/fixtures/desktop-update-manifest.json").to_vec();
+        let manifest = parse_manifest(&bytes, &identity()).unwrap();
+        let base = format!(
+            "https://api.github.com/repos/{}/releases",
+            identity().repository
+        );
+        let tag = format!("v{}", manifest.product_version);
+        let archive_name = manifest
+            .archive_url
+            .path_segments()
+            .unwrap()
+            .next_back()
+            .unwrap()
+            .to_owned();
+        SelectedRelease {
+            release: ReleaseIdentity {
+                id: 1,
+                tag_name: tag.clone(),
+                api_url: format!("{base}/1").parse().unwrap(),
+                html_url: format!(
+                    "https://github.com/{}/releases/tag/{tag}",
+                    identity().repository
+                )
+                .parse()
+                .unwrap(),
+                prerelease: true,
+            },
+            manifest_asset: AssetIdentity {
+                id: 2,
+                name: "desktop-update.json".into(),
+                size: bytes.len() as u64,
+                api_url: format!("{base}/assets/2").parse().unwrap(),
+                download_url: manifest.archive_url.join("desktop-update.json").unwrap(),
+            },
+            archive_asset: AssetIdentity {
+                id: 3,
+                name: archive_name,
+                size: 4,
+                api_url: format!("{base}/assets/3").parse().unwrap(),
+                download_url: manifest.archive_url.clone(),
+            },
+            manifest,
+            manifest_bytes: bytes,
+        }
+    }
+
+    fn active_owner(automatic: bool) -> (Temp, Arc<Coordinator>) {
+        let temp = Temp::new();
+        let store = Arc::new(Store::open(&temp.0).unwrap());
+        store.set_automatic(automatic).unwrap();
+        let owner = Arc::new(Coordinator::default());
+        owner.healthy.store(true, Ordering::Release);
+        owner.started.store(true, Ordering::Release);
+        {
+            let mut control = owner.control.lock().unwrap();
+            control.store = Some(store);
+            control.snapshot = startup_snapshot(automatic);
+        }
+        (temp, owner)
+    }
+
+    #[test]
+    fn scheduled_and_manual_discovery_publish_available_without_downloading_or_staging() {
+        for automatic in [true, false] {
+            let (_temp, owner) = active_owner(automatic);
+            if !automatic {
+                owner.manual_check().unwrap();
+            }
+            let (generation, work) = owner.claim_work(Instant::now()).unwrap();
+            assert!(matches!(work, Work::Check));
+            let selected = candidate();
+            let target_id = selected.target_id();
+            tauri::async_runtime::block_on(discover(&owner, generation, async {
+                Ok(updater_discovery::DiscoveryResult {
+                    selected: Some(selected),
+                    completeness: DiscoveryCompleteness::CompleteObservedScan,
+                    pages_observed: 1,
+                    retry_after: None,
+                })
+            }))
+            .unwrap();
+            let snapshot = owner.snapshot();
+            assert_eq!(snapshot.phase, Phase::Available);
+            assert_eq!(snapshot.target_id.as_deref(), Some(target_id.as_str()));
+            assert_eq!(snapshot.downloaded_bytes, None);
+            let control = owner.control.lock().unwrap();
+            assert!(control.download_requested.is_none());
+            assert!(control.downloading.is_none());
+            assert!(control.verified.is_none());
+            assert!(control
+                .store
+                .as_ref()
+                .unwrap()
+                .prepared_record()
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                control
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .preferences()
+                    .unwrap()
+                    .automatic,
+                automatic
+            );
+        }
+    }
+
+    #[test]
+    fn download_admission_is_prompt_bound_coalesced_and_preserves_check_consent() {
+        let (_temp, owner) = active_owner(false);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        offer(&owner, 0, selected.clone()).unwrap();
+        let before = Instant::now();
+        let state = Preparation(owner.clone())
+            .manual_download(&target_id, || true)
+            .unwrap();
+        assert!(before.elapsed() < Duration::from_secs(1));
+        assert_eq!(state.phase, Phase::Downloading);
+        assert_eq!(state.target_id.as_deref(), Some(target_id.as_str()));
+        owner.manual_download_if(&target_id, || true).unwrap();
+        owner.manual_check().unwrap();
+        let (generation, work) = owner.claim_work(Instant::now()).unwrap();
+        let Work::Download(queued) = work else {
+            panic!("click must not rediscover")
+        };
+        assert_eq!(*queued, selected);
+        owner.manual_download_if(&target_id, || true).unwrap();
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+        assert!(owner.claim_work(Instant::now()).is_none());
+        // A verified completion preserves the exact offered identity. Repeated
+        // clicks on that ready target must not queue another archive request.
+        owner
+            .accept_cached(
+                generation,
+                VerifiedTarget {
+                    id: target_id.clone(),
+                    manifest: selected.manifest,
+                },
+            )
+            .unwrap();
+        {
+            let mut control = owner.control.lock().unwrap();
+            control.in_flight = false;
+            control.downloading = None;
+        }
+        owner.manual_download_if(&target_id, || true).unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Ready);
+        assert_eq!(
+            owner.snapshot().target_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert!(owner.claim_work(Instant::now()).is_none());
+        assert!(
+            !owner
+                .control
+                .lock()
+                .unwrap()
+                .store
+                .as_ref()
+                .unwrap()
+                .preferences()
+                .unwrap()
+                .automatic
+        );
+    }
+
+    #[test]
+    fn wrong_stale_unoffered_or_retired_download_targets_are_rejected_without_queueing() {
+        let (_temp, owner) = active_owner(false);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        assert_eq!(
+            owner.manual_download_if(&target_id, || true),
+            Err("updater_target_changed")
+        );
+        offer(&owner, 0, selected.clone()).unwrap();
+        for wrong in ["", "not-a-target", &"f".repeat(64)] {
+            assert_eq!(
+                owner.manual_download_if(wrong, || true),
+                Err("updater_target_changed")
+            );
+        }
+        let mut replacement = selected.clone();
+        replacement.manifest_bytes.push(b'\n');
+        offer(&owner, 0, replacement).unwrap();
+        assert_eq!(
+            owner.manual_download_if(&target_id, || true),
+            Err("updater_target_changed")
+        );
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+        offer(&owner, 0, selected).unwrap();
+        owner.invalidate();
+        assert_eq!(
+            owner.manual_download_if(&target_id, || true),
+            Err("updater_inactive")
+        );
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+    }
+
+    #[test]
+    fn rate_limited_manual_download_rejects_without_queueing_or_changing_phase() {
+        for automatic in [false, true] {
+            for phase in [Phase::Available, Phase::Deferred] {
+                let (_temp, owner) = active_owner(automatic);
+                let selected = candidate();
+                let target_id = selected.target_id();
+                offer(&owner, 0, selected).unwrap();
+                let not_before = Instant::now() + Duration::from_secs(24 * 60 * 60);
+                {
+                    let mut control = owner.control.lock().unwrap();
+                    control.snapshot.phase = phase;
+                    control.not_before = not_before;
+                    control.next_due = not_before;
+                }
+                let original = serde_json::to_value(owner.snapshot()).unwrap();
+                let preparation = Preparation(owner.clone());
+                let before = Instant::now();
+                for _ in 0..3 {
+                    assert_eq!(
+                        preparation
+                            .manual_download(&target_id, || true)
+                            .unwrap_err(),
+                        "updater_retry_later"
+                    );
+                }
+                assert!(before.elapsed() < Duration::from_secs(1));
+                assert_eq!(serde_json::to_value(owner.snapshot()).unwrap(), original);
+                {
+                    let control = owner.control.lock().unwrap();
+                    assert!(control.download_requested.is_none());
+                    assert!(control.downloading.is_none());
+                    assert!(!control.requested);
+                    assert!(!control.restart_requested);
+                    assert!(!control.in_flight);
+                    assert!(control
+                        .store
+                        .as_ref()
+                        .unwrap()
+                        .prepared_record()
+                        .unwrap()
+                        .is_none());
+                }
+                assert!(owner.claim_work(Instant::now()).is_none());
+                let later = owner.claim_work(not_before);
+                if automatic {
+                    assert!(matches!(later, Some((_, Work::Check))));
+                } else {
+                    assert!(later.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expired_retry_after_requires_a_new_explicit_download_click() {
+        let (_temp, owner) = active_owner(false);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        offer(&owner, 0, selected).unwrap();
+        owner.control.lock().unwrap().not_before = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            owner.manual_download_if(&target_id, || true),
+            Err("updater_retry_later")
+        );
+        owner.control.lock().unwrap().not_before = Instant::now();
+        assert!(owner.claim_work(Instant::now()).is_none());
+        owner.manual_download_if(&target_id, || true).unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Downloading);
+        assert!(matches!(
+            owner.claim_work(Instant::now()),
+            Some((_, Work::Download(_)))
+        ));
+    }
+
+    #[test]
+    fn rate_limit_does_not_prevent_verified_ready_cache_reuse() {
+        let (_temp, owner) = active_owner(false);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        owner
+            .accept_cached(
+                0,
+                VerifiedTarget {
+                    id: target_id.clone(),
+                    manifest: selected.manifest,
+                },
+            )
+            .unwrap();
+        owner.control.lock().unwrap().not_before =
+            Instant::now() + Duration::from_secs(24 * 60 * 60);
+        owner.manual_download_if(&target_id, || true).unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Ready);
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+    }
+
+    #[test]
+    fn opt_out_cancels_queued_download_without_later_auto_download() {
+        let (_temp, owner) = active_owner(true);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        offer(&owner, 0, selected).unwrap();
+        owner.manual_download_if(&target_id, || true).unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Downloading);
+        owner.set_automatic(false).unwrap();
+        assert!(owner.claim_work(Instant::now()).is_none());
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+        owner.set_automatic(true).unwrap();
+        assert!(matches!(
+            owner.claim_work(Instant::now()),
+            Some((_, Work::Check))
+        ));
+    }
+
+    #[test]
+    fn retained_verified_cache_remains_ready_on_discovery_but_not_for_same_version_substitution() {
+        let (_temp, owner) = active_owner(true);
+        let selected = candidate();
+        owner
+            .accept_cached(
+                0,
+                VerifiedTarget {
+                    id: selected.target_id(),
+                    manifest: selected.manifest.clone(),
+                },
+            )
+            .unwrap();
+        offer(&owner, 0, selected.clone()).unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Ready);
+        let mut replaced = selected;
+        replaced.archive_asset.id += 1;
+        offer(&owner, 0, replaced).unwrap();
+        assert_eq!(owner.snapshot().phase, Phase::Available);
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+    }
+
+    #[test]
+    fn download_authority_is_rechecked_after_waiting_for_the_coordinator_lock() {
+        let (_temp, owner) = active_owner(false);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        offer(&owner, 0, selected).unwrap();
+        let admission = Arc::new(AtomicBool::new(true));
+        let lock = owner.control.lock().unwrap();
+        let (entered, waiting) = std::sync::mpsc::sync_channel(1);
+        let worker = {
+            let owner = owner.clone();
+            let admission = admission.clone();
+            std::thread::spawn(move || {
+                entered.send(()).unwrap();
+                owner.manual_download_if(&target_id, || admission.load(Ordering::Acquire))
+            })
+        };
+        waiting.recv().unwrap();
+        admission.store(false, Ordering::Release);
+        drop(lock);
+        assert_eq!(worker.join().unwrap(), Err("updater_unauthorized"));
+        assert!(owner.control.lock().unwrap().download_requested.is_none());
+    }
+
+    #[test]
+    fn status_reads_do_not_queue_download_or_check_work() {
+        let (_temp, owner) = active_owner(false);
+        offer(&owner, 0, candidate()).unwrap();
+        let preparation = Preparation(owner.clone());
+        for _ in 0..5 {
+            assert_eq!(
+                preparation.snapshot(|| true).unwrap().phase,
+                Phase::Available
+            );
+        }
+        let control = owner.control.lock().unwrap();
+        assert!(!control.requested);
+        assert!(!control.in_flight);
+        assert!(control.download_requested.is_none());
+        assert!(control
+            .store
+            .as_ref()
+            .unwrap()
+            .prepared_record()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn failed_or_cancelled_manual_downloads_never_retry_automatically() {
+        for automatic in [false, true] {
+            for error in [
+                PrepareError::Cancelled,
+                PrepareError::Discovery(DiscoveryError::Network),
+                PrepareError::Discovery(DiscoveryError::RetryAfter(Duration::from_secs(120))),
+                PrepareError::Signature,
+                PrepareError::Archive,
+            ] {
+                let (_temp, owner) = active_owner(automatic);
+                let selected = candidate();
+                let target_id = selected.target_id();
+                offer(&owner, 0, selected).unwrap();
+                owner.manual_download_if(&target_id, || true).unwrap();
+                let (generation, work) = owner.claim_work(Instant::now()).unwrap();
+                assert!(matches!(work, Work::Download(_)));
+                owner.finish_work(generation, Err(error));
+                assert_eq!(owner.snapshot().phase, Phase::Deferred);
+                assert!(owner.snapshot().reason.is_some());
+                assert_eq!(
+                    owner.snapshot().target_id.as_deref(),
+                    Some(target_id.as_str())
+                );
+                let due = {
+                    let control = owner.control.lock().unwrap();
+                    control.next_due.max(control.not_before).max(Instant::now())
+                };
+                let next = owner.claim_work(due);
+                if automatic {
+                    assert!(matches!(next, Some((_, Work::Check))));
+                } else {
+                    assert!(next.is_none());
+                }
+                assert!(owner.control.lock().unwrap().download_requested.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retiring_owner_drops_queued_target_and_cannot_resume_it_on_a_new_generation() {
+        let (_temp, owner) = active_owner(false);
+        let selected = candidate();
+        let target_id = selected.target_id();
+        offer(&owner, 0, selected).unwrap();
+        owner.manual_download_if(&target_id, || true).unwrap();
+        owner.invalidate();
+        assert!(!owner.retire(Ok(())));
+        assert_eq!(
+            owner.manual_download_if(&target_id, || true),
+            Err("updater_inactive")
+        );
+        owner.healthy_start();
+        let control = owner.control.lock().unwrap();
+        assert!(control.download_requested.is_none());
+        assert!(control.offered.is_none());
+    }
+
     #[test]
     fn healthy_startup_with_automatic_off_does_not_keep_a_stale_server_error() {
         let snapshot = startup_snapshot(false);
@@ -912,6 +1507,9 @@ mod tests {
         );
         assert_eq!(native["protocolVersion"], fixture["protocolVersion"]);
         assert_eq!(native["installationAvailable"], false);
+        assert!(native.as_object().unwrap().contains_key("targetId"));
+        assert!(native["targetId"].is_null());
+        assert_eq!(serde_json::to_value(Phase::Available).unwrap(), "available");
     }
 
     #[test]
@@ -1128,9 +1726,7 @@ mod tests {
                 generation,
                 VerifiedTarget {
                     manifest,
-                    release_id: 1,
-                    manifest_asset_id: 2,
-                    archive_asset_id: 3
+                    id: "a".repeat(64),
                 }
             ),
             Err(PrepareError::Cancelled)

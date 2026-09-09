@@ -1,5 +1,15 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 최신 정책: 사용자가 누르는 업데이트
+
+사용자 요청으로 자동 설치가 아닌 **Settings 위 업데이트 안내 → 클릭 시
+다운로드·안전한 재시작** 방식으로 바꿨다. 자동 확인은 메타데이터 조회만 한다.
+캐시나 automatic=true만으로 다음 실행에 설치하지 않으며, 정확한 targetId와
+archive hash에 결합된 수동 intent만 기존 설치 검증에 진입한다. 클라이언트는
+사이드바/About가 상태와 클릭을 공유하고 바쁨·실패·대상 변경을 자동 재시도하지
+않는다. 이 변경은 기존 beta.11 설치본에 아직 반영되지 않았다. 현재 계약과
+검증 경계: [DESKTOP-CLICK-UPDATE.md](DESKTOP-CLICK-UPDATE.md).
+
 ## 최신 사용자 테스트 설치본
 
 `e28fa6d`의 beta.11 / desktop 0.2.5 수동 설치용 DMG를 Downloads에 전달했다.

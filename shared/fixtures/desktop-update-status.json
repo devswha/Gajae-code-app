@@ -6,6 +6,7 @@
   "desktopVersion": "0.2.4",
   "targetProductVersion": "2.0.0-beta.11",
   "targetDesktopVersion": "0.2.5",
+  "targetId": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   "discoveryIncomplete": false,
   "reason": null,
   "installationAvailable": false,

@@ -386,6 +386,6 @@ test('the validated command is captured before the handshake awaits native authe
 test('shared state and command fixtures reject malformed partial payloads', () => {
   assert.equal(isDesktopUpdateSnapshot(snapshot), true);
   for (const payload of [{}, null, { ...snapshot, downloadedBytes: -1 }, { ...snapshot, totalBytes: 2 }, { ...snapshot, phase: 'installed' }, { ...snapshot, extra: 'not-in-contract' }]) assert.equal(isDesktopUpdateSnapshot(payload), false);
-  for (const command of [{ action: 'status' }, { action: 'check' }, { action: 'restart' }, { action: 'setAutomatic', automatic: false }]) assert.equal(isDesktopUpdateCommand(command), true);
+  for (const command of [{ action: 'status' }, { action: 'check' }, { action: 'restart', targetId: 'f'.repeat(64) }, { action: 'download', targetId: 'f'.repeat(64) }, { action: 'setAutomatic', automatic: false }]) assert.equal(isDesktopUpdateCommand(command), true);
   for (const command of [{ action: 'install' }, { action: 'status', url: 'https://evil.test' }, { action: 'setAutomatic' }]) assert.equal(isDesktopUpdateCommand(command), false);
 });

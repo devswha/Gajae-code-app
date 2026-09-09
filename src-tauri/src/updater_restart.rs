@@ -22,6 +22,7 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct Context {
+    pub target_id: String,
     pub backend: Arc<Backend>,
     pub server_pid: u32,
     pub return_url: tauri::Url,
@@ -198,14 +199,8 @@ impl Restarts {
         let Some(attempt) = self.attempt() else {
             return false;
         };
-        if attempt.phase() == Phase::Draft && Instant::now() >= attempt.deadline {
-            let _ = attempt.phase.compare_exchange(
-                Phase::Draft as u8,
-                Phase::Aborted as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
+        // Status decoration is read-only; the dedicated expiry task owns the
+        // draft transition and its rollback notification.
         !matches!(attempt.phase(), Phase::Aborted)
     }
     pub(crate) fn decorate(
@@ -237,6 +232,9 @@ impl Restarts {
             return Err("updater_busy");
         }
         let state = snapshot(app)?;
+        if !snapshot_matches_target(&state, &context.target_id) {
+            return Err("updater_target_changed");
+        }
         if !matches!(state.phase, UpdatePhase::Ready) || !context.current.as_ref()() {
             return Err("updater_unavailable");
         }
@@ -252,6 +250,9 @@ impl Restarts {
             .prepared_record()
             .map_err(|_| "updater_unavailable")?
             .ok_or("updater_unavailable")?;
+        if !record_matches_target(&state, &record, &context.target_id) {
+            return Err("updater_target_changed");
+        }
         let manifest = crate::updater_manifest::parse_manifest(
             record.manifest.as_bytes(),
             &crate::updater_install::product_identity(),
@@ -271,6 +272,7 @@ impl Restarts {
         if !(context.current)() {
             return Err("updater_unauthorized");
         }
+        recheck_target(app, &context.target_id, &record.archive_sha256)?;
         let epoch = self
             .sequence
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -397,6 +399,39 @@ fn clear_satisfied_installation_gate(state: &mut Snapshot) {
     }
 }
 
+fn snapshot_matches_target(state: &Snapshot, target_id: &str) -> bool {
+    crate::updater_backend::hex_id(target_id)
+        && state.phase == UpdatePhase::Ready
+        && state.target_id.as_deref() == Some(target_id)
+}
+
+fn record_matches_target(
+    state: &Snapshot,
+    record: &crate::updater_store::PreparedRecord,
+    target_id: &str,
+) -> bool {
+    snapshot_matches_target(state, target_id) && record.target_id() == target_id
+}
+
+fn recheck_target(
+    app: &AppHandle,
+    target_id: &str,
+    archive_sha256: &str,
+) -> Result<(), &'static str> {
+    let state = snapshot(app)?;
+    let root = crate::supervisor::desktop_data_root(app).map_err(|_| "updater_unavailable")?;
+    let store = Store::open(&root).map_err(|_| "updater_unavailable")?;
+    let record = store
+        .prepared_record()
+        .map_err(|_| "updater_unavailable")?
+        .ok_or("updater_target_changed")?;
+    if !record_matches_target(&state, &record, target_id) || record.archive_sha256 != archive_sha256
+    {
+        return Err("updater_target_changed");
+    }
+    Ok(())
+}
+
 fn disposition(
     app: &AppHandle,
     attempt: &Attempt,
@@ -483,7 +518,9 @@ async fn prepare_restart(app: &AppHandle, attempt: Arc<Attempt>) -> Result<Reply
         Err(_) => return abort(app, &attempt, "updater_unavailable").await,
     };
     if !matches!(state.phase, UpdatePhase::Ready)
+        || !snapshot_matches_target(&state, &attempt.context.target_id)
         || state.target_desktop_version.as_deref() != Some(&attempt.desktop_version)
+        || recheck_target(app, &attempt.context.target_id, &attempt.archive_sha256).is_err()
         || !attempt.current()
     {
         return abort(app, &attempt, "updater_restart_cancelled").await;
@@ -566,7 +603,9 @@ async fn prepare_restart(app: &AppHandle, attempt: Arc<Attempt>) -> Result<Reply
         Err(_) => return abort(app, &attempt, "updater_unavailable").await,
     };
     if !matches!(state.phase, UpdatePhase::Ready)
+        || !snapshot_matches_target(&state, &attempt.context.target_id)
         || state.target_desktop_version.as_deref() != Some(&attempt.desktop_version)
+        || recheck_target(app, &attempt.context.target_id, &attempt.archive_sha256).is_err()
         || attempt.cancelled.load(Ordering::Acquire)
         || !(attempt.context.same_run)()
     {
@@ -635,7 +674,8 @@ async fn prepare_restart(app: &AppHandle, attempt: Arc<Attempt>) -> Result<Reply
             }
             let root = crate::supervisor::desktop_data_root(&handle)?;
             trace("owned-tree-exited");
-            Store::open(&root)?.request_manual(&attempt.archive_sha256)?;
+            Store::open(&root)?
+                .request_manual(&attempt.context.target_id, &attempt.archive_sha256)?;
             trace("manual-intent-saved");
             attempt.set(Phase::Restarting);
             crate::updater_launch::request_manual_restart(&handle);
@@ -743,6 +783,39 @@ mod tests {
         assert_eq!(state.reason, Some("updater_runtime_busy"));
     }
 
+    #[test]
+    fn restart_binds_both_snapshot_and_record_even_when_versions_are_identical() {
+        let record = crate::updater_store::PreparedRecord {
+            schema: 1,
+            release_id: 1,
+            manifest_asset_id: 2,
+            archive_asset_id: 3,
+            archive_size: 4,
+            archive_sha256: "a".repeat(64),
+            manifest: include_str!("../../shared/fixtures/desktop-update-manifest.json").into(),
+            inventory: serde_json::json!({}),
+        };
+        let requested = record.target_id();
+        let mut state = Snapshot {
+            phase: UpdatePhase::Ready,
+            target_id: Some(requested.clone()),
+            ..Snapshot::default()
+        };
+        assert!(record_matches_target(&state, &record, &requested));
+        assert!(!record_matches_target(&state, &record, ""));
+        assert!(!record_matches_target(&state, &record, &"b".repeat(64)));
+        let mut replaced = record.clone();
+        replaced.archive_asset_id += 1;
+        assert!(!record_matches_target(&state, &replaced, &requested));
+        replaced = record.clone();
+        replaced.manifest.push('\n');
+        assert!(!record_matches_target(&state, &replaced, &requested));
+        state.target_id = Some(replaced.target_id());
+        assert!(!record_matches_target(&state, &record, &requested));
+        state.target_id = None;
+        assert!(!record_matches_target(&state, &record, &requested));
+    }
+
     fn attempt(phase: Phase) -> (Arc<Attempt>, UnixStream) {
         let (native, peer) = UnixStream::pair().unwrap();
         (
@@ -753,6 +826,7 @@ mod tests {
                 phase: AtomicU8::new(phase as u8),
                 cancelled: AtomicBool::new(false),
                 context: Context {
+                    target_id: "d".repeat(64),
                     backend: Arc::new(Backend::new(native, "b".repeat(64)).unwrap()),
                     server_pid: 42,
                     return_url: "http://127.0.0.1:43123/".parse().unwrap(),
@@ -792,6 +866,17 @@ mod tests {
             assert_eq!(current.request_cancel(), Cancellation::TooLate);
             assert!(!current.cancelled.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn status_activity_reads_do_not_expire_or_change_a_draft() {
+        let (mut draft, _peer) = attempt(Phase::Draft);
+        Arc::get_mut(&mut draft).unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        let restarts = Restarts::default();
+        *restarts.current.lock().unwrap() = Some(draft.clone());
+        assert!(restarts.active());
+        assert!(draft.phase() == Phase::Draft);
+        assert!(!draft.cancelled.load(Ordering::Acquire));
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Main-view-bound preparation bridge. No installation or shutdown entrypoint.
+//! Main-view-bound updater bridge. Target-bound user requests enter the existing
+//! guarded preparation and draft/backend-safe restart owners.
 //! A dedicated owner-only socket keeps control data out of mixed child logs.
 //! Its secret is written once to the owned child's stdin, never to its env.
 use std::{
@@ -37,10 +38,18 @@ enum Command {
     Status {},
     #[serde(rename = "check")]
     Check {},
+    #[serde(rename = "download")]
+    Download {
+        #[serde(rename = "targetId")]
+        target_id: String,
+    },
     #[serde(rename = "setAutomatic")]
     SetAutomatic { automatic: bool },
     #[serde(rename = "restart")]
-    Restart {},
+    Restart {
+        #[serde(rename = "targetId")]
+        target_id: String,
+    },
     #[serde(rename = "restartPrepared")]
     RestartPrepared {
         #[serde(rename = "attemptId")]
@@ -498,11 +507,23 @@ fn serve(stream: UnixStream, run: &Arc<Run>, app: &AppHandle) {
                     ))
                 })
             }
-            Command::Restart {} => {
+            Command::Download { target_id } => {
+                if crate::updater_restart::blocks_start(app) {
+                    return Err("updater_busy");
+                }
+                updater.manual_download(target_id, admit).map(|state| {
+                    crate::updater_restart::Reply::Snapshot(restarts.decorate(
+                        app,
+                        run.backend.get(),
+                        state,
+                    ))
+                })
+            }
+            Command::Restart { target_id } => {
                 if !admit() {
                     return Err("updater_unauthorized");
                 }
-                restarts.begin(app, restart_context(app, run, request)?)
+                restarts.begin(app, restart_context(app, run, request, target_id)?)
             }
             Command::RestartPrepared {
                 attempt_id,
@@ -538,7 +559,11 @@ fn restart_context(
     app: &AppHandle,
     run: &Arc<Run>,
     request: &Request,
+    target_id: &str,
 ) -> Result<crate::updater_restart::Context, &'static str> {
+    if !crate::updater_backend::hex_id(target_id) {
+        return Err("updater_target_changed");
+    }
     let backend = run
         .backend
         .get()
@@ -591,6 +616,7 @@ fn restart_context(
                 .is_ok_and(|authority| authority.active && authority.epoch == epoch)
     });
     Ok(crate::updater_restart::Context {
+        target_id: target_id.to_owned(),
         backend,
         server_pid: pid,
         return_url,
@@ -1052,8 +1078,30 @@ mod tests {
             r#"{"action":"install","path":"/Applications"}"#,
             r#"{"action":"status","url":"https://evil.test"}"#,
             r#"{"action":"setAutomatic"}"#,
+            r#"{"action":"download"}"#,
+            r#"{"action":"download","targetId":null}"#,
+            r#"{"action":"restart"}"#,
+            r#"{"action":"restart","targetId":null}"#,
+            r#"{"action":"restart","targetId":42}"#,
         ] {
             assert!(serde_json::from_str::<Command>(input).is_err());
+        }
+    }
+
+    #[test]
+    fn manual_download_and_restart_require_a_bound_target() {
+        let target = "a".repeat(64);
+        for action in ["download", "restart"] {
+            let command: Command = serde_json::from_value(serde_json::json!({
+                "action": action, "targetId": target,
+            }))
+            .unwrap();
+            match command {
+                Command::Download { target_id } | Command::Restart { target_id } => {
+                    assert_eq!(target_id, target)
+                }
+                _ => panic!("unexpected command"),
+            }
         }
     }
     #[test]

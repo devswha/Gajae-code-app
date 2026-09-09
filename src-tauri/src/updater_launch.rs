@@ -351,9 +351,15 @@ async fn start_inner(app: &AppHandle) -> Result<(), String> {
         normal_start(app);
         return Ok(());
     }
-    // No candidate adds no update I/O/network work to ordinary fresh startup.
+    // With no cached candidate or pending click, ordinary startup adds no
+    // update I/O/network work.
     let cached = root.join("desktop-update-cache/ready.json");
-    if absent && !cached.exists() {
+    if absent
+        && !cached.exists()
+        && !root
+            .join("desktop-update-cache/manual-intent.json")
+            .exists()
+    {
         normal_start(app);
         return Ok(());
     }
@@ -372,6 +378,14 @@ async fn start_inner(app: &AppHandle) -> Result<(), String> {
     };
     let journal = Journal::open(&root)?;
     let loaded = journal.load()?;
+    let manual_request = if loaded.is_none() {
+        // Only a successfully consumed explicit selection can reach preflight.
+        // Missing/legacy/corrupt intent grants no authority. Existing install
+        // journals retain their separate verified-successor recovery path.
+        runtime.store.consume_manual().unwrap_or(None)
+    } else {
+        None
+    };
     let location = InstallLocation::validate(
         &runtime.binding,
         &std::env::current_exe().map_err(|_| "Current executable is unavailable.")?,
@@ -424,11 +438,7 @@ async fn start_inner(app: &AppHandle) -> Result<(), String> {
         normal_start(app);
         return Ok(());
     };
-    let manual = runtime
-        .store
-        .manual_requested(&archive.record().archive_sha256)
-        .unwrap_or(false);
-    if !installation_requested(runtime.store.preferences()?.automatic, manual)
+    if !installation_requested(manual_request.as_ref(), archive.record())
         || !crate::updater::eligible_cached(archive.manifest(), &runtime.os)
             .map_err(|error| error.code().to_owned())?
     {
@@ -485,8 +495,13 @@ async fn start_inner(app: &AppHandle) -> Result<(), String> {
     run_install(app, prepared, journal, location).await
 }
 
-fn installation_requested(automatic: bool, matching_manual_intent: bool) -> bool {
-    automatic || matching_manual_intent
+fn installation_requested(
+    request: Option<&crate::updater_store::ManualRequest>,
+    record: &crate::updater_store::PreparedRecord,
+) -> bool {
+    // The persisted preference controls discovery only. Even a fully verified
+    // cache cannot select an install without a matching explicit restart intent.
+    request.is_some_and(|request| request.matches(record))
 }
 
 async fn run_install(
@@ -594,11 +609,85 @@ pub(crate) fn finish_health(
 mod tests {
     use super::*;
     #[test]
-    fn installation_follows_durable_consent_not_a_qa_only_cli_switch() {
-        assert!(!installation_requested(false, false));
-        assert!(installation_requested(true, false));
-        assert!(installation_requested(false, true));
-        assert!(installation_requested(true, true));
+    fn automatic_checks_never_authorize_installation_without_matching_manual_intent() {
+        use crate::updater_store::{PreparedRecord, Store};
+        use std::{fs, os::unix::fs::PermissionsExt};
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut random = [0; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let root = Temp(
+            fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "gajae-launch-policy-{:x}",
+                    u64::from_ne_bytes(random)
+                )),
+        );
+        fs::create_dir(&root.0).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let record = PreparedRecord {
+            schema: 1,
+            release_id: 1,
+            manifest_asset_id: 2,
+            archive_asset_id: 3,
+            archive_size: 4,
+            archive_sha256: "a".repeat(64),
+            manifest: "{}".into(),
+            inventory: serde_json::json!({}),
+        };
+        let store = Store::open(&root.0).unwrap();
+        store
+            .commit(store.stage(&record, b"data").unwrap())
+            .unwrap();
+        assert!(store.preferences().unwrap().automatic);
+        assert!(!installation_requested(
+            store.consume_manual().unwrap().as_ref(),
+            &record
+        ));
+        let intent_path = root.0.join("desktop-update-cache/manual-intent.json");
+        fs::write(
+            &intent_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema":1,"archive_sha256":record.archive_sha256,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&intent_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !installation_requested(store.consume_manual().unwrap_or(None).as_ref(), &record),
+            "legacy unbound manual intent is not authority"
+        );
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        drop(store);
+        let store = Store::open(&root.0).unwrap();
+        for automatic in [true, false] {
+            store.set_automatic(automatic).unwrap();
+            store
+                .request_manual(&record.target_id(), &record.archive_sha256)
+                .unwrap();
+            let request = store.consume_manual().unwrap();
+            assert!(
+                installation_requested(request.as_ref(), &record),
+                "matching persisted manual intent admits the install gate"
+            );
+            let changed = PreparedRecord {
+                archive_asset_id: 4,
+                ..record.clone()
+            };
+            assert!(!installation_requested(request.as_ref(), &changed));
+            assert!(
+                !installation_requested(store.consume_manual().unwrap().as_ref(), &record),
+                "a later ordinary launch cannot replay this click"
+            );
+        }
     }
     #[test]
     fn gate_starts_closed_and_only_one_install_can_claim_it() {

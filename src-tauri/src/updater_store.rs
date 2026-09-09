@@ -77,6 +77,7 @@ impl LinkStore {
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     pub schema: u8,
+    /// Periodic discovery only; never permission to download or install.
     pub automatic: bool,
 }
 
@@ -86,7 +87,20 @@ pub struct Preferences {
 #[serde(deny_unknown_fields)]
 struct ManualIntent {
     schema: u8,
+    target_id: String,
     archive_sha256: String,
+    consumed: bool,
+}
+
+/// A consumed user selection, not an installation or owner-absence permit.
+pub(crate) struct ManualRequest {
+    target_id: String,
+    archive_sha256: String,
+}
+impl ManualRequest {
+    pub(crate) fn matches(&self, record: &PreparedRecord) -> bool {
+        self.target_id == record.target_id() && self.archive_sha256 == record.archive_sha256
+    }
 }
 
 impl Default for Preferences {
@@ -114,6 +128,15 @@ pub struct PreparedRecord {
 }
 
 impl PreparedRecord {
+    pub(crate) fn target_id(&self) -> String {
+        crate::updater_discovery::target_id(
+            self.release_id,
+            self.manifest_asset_id,
+            self.archive_asset_id,
+            self.manifest.as_bytes(),
+        )
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.schema != 1
             || self.release_id == 0
@@ -289,36 +312,44 @@ impl Store {
         Ok(self.selected_record()?.map(|(_, record)| record))
     }
 
-    pub(crate) fn request_manual(&self, archive_sha256: &str) -> Result<(), String> {
+    pub(crate) fn request_manual(
+        &self,
+        target_id: &str,
+        archive_sha256: &str,
+    ) -> Result<(), String> {
         let _mutation = self
             .mutation
             .lock()
             .map_err(|_| "Update cache lock failed.")?;
-        if self
-            .prepared_record()?
-            .as_ref()
-            .map(|record| record.archive_sha256.as_str())
-            != Some(archive_sha256)
-        {
+        if !self.prepared_record()?.is_some_and(|record| {
+            record.target_id() == target_id && record.archive_sha256 == archive_sha256
+        }) {
             return Err("Prepared update changed before recording manual intent.".into());
         }
         self.atomic_json(
             "manual-intent.json",
             &ManualIntent {
-                schema: 1,
+                schema: 2,
+                target_id: target_id.to_owned(),
                 archive_sha256: archive_sha256.to_owned(),
+                consumed: false,
             },
             MAX_PREFERENCES_BYTES,
         )
     }
 
-    pub(crate) fn manual_requested(&self, archive_sha256: &str) -> Result<bool, String> {
+    fn read_manual_intent(&self) -> Result<Option<ManualIntent>, String> {
         let Some(bytes) = self.read("manual-intent.json", MAX_PREFERENCES_BYTES)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let intent: ManualIntent =
             serde_json::from_slice(&bytes).map_err(|_| "Invalid manual update intent.")?;
-        if intent.schema != 1
+        if intent.schema != 2
+            || intent.target_id.len() != 64
+            || !intent
+                .target_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || intent.archive_sha256.len() != 64
             || !intent
                 .archive_sha256
@@ -327,7 +358,41 @@ impl Store {
         {
             return Err("Invalid manual update intent.".into());
         }
-        Ok(intent.archive_sha256 == archive_sha256)
+        Ok(Some(intent))
+    }
+
+    /// Retire the click durably before startup preflight. A failed preflight
+    /// must not make the next ordinary launch retry an earlier user action.
+    pub(crate) fn consume_manual(&self) -> Result<Option<ManualRequest>, String> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| "Update cache lock failed.")?;
+        let Some(mut intent) = self.read_manual_intent()? else {
+            return Ok(None);
+        };
+        if intent.consumed {
+            return Ok(None);
+        }
+        intent.consumed = true;
+        self.atomic_json("manual-intent.json", &intent, MAX_PREFERENCES_BYTES)?;
+        Ok(Some(ManualRequest {
+            target_id: intent.target_id,
+            archive_sha256: intent.archive_sha256,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manual_requested(
+        &self,
+        target_id: &str,
+        archive_sha256: &str,
+    ) -> Result<bool, String> {
+        Ok(self.read_manual_intent()?.is_some_and(|intent| {
+            !intent.consumed
+                && intent.target_id == target_id
+                && intent.archive_sha256 == archive_sha256
+        }))
     }
 
     pub fn load(&self) -> Result<Option<(PreparedRecord, Vec<u8>)>, String> {
@@ -824,22 +889,142 @@ mod tests {
     }
 
     #[test]
+    fn manual_click_is_consumed_durably_once_and_only_a_fresh_click_rearms_it() {
+        let root = Temp::new();
+        let store = Store::open(&root.0).unwrap();
+        let record = record();
+        store
+            .commit(store.stage(&record, b"data").unwrap())
+            .unwrap();
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        assert!(store.consume_manual().unwrap().unwrap().matches(&record));
+        drop(store);
+        let store = Store::open(&root.0).unwrap();
+        for automatic in [false, true] {
+            store.set_automatic(automatic).unwrap();
+            assert!(store.consume_manual().unwrap().is_none());
+            assert!(!store
+                .manual_requested(&record.target_id(), &record.archive_sha256)
+                .unwrap());
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.cache().join("manual-intent.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["consumed"], true);
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        assert!(store.consume_manual().unwrap().unwrap().matches(&record));
+        assert!(store.consume_manual().unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_consumers_share_one_manual_click() {
+        let root = Temp::new();
+        let store = std::sync::Arc::new(Store::open(&root.0).unwrap());
+        let record = record();
+        store
+            .commit(store.stage(&record, b"data").unwrap())
+            .unwrap();
+        store
+            .request_manual(&record.target_id(), &record.archive_sha256)
+            .unwrap();
+        let consumers: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || usize::from(store.consume_manual().unwrap().is_some()))
+            })
+            .collect();
+        assert_eq!(
+            consumers
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn target_id_has_a_stable_domain_and_fixed_little_endian_release_asset_ids() {
+        assert_eq!(
+            record().target_id(),
+            "1fda47fc12357e0d1dcdc71b25d7c6741934edabab89ea7019cef1484e236ce9"
+        );
+        let mut changed = record();
+        changed.manifest.push('\n');
+        assert_ne!(changed.target_id(), record().target_id());
+    }
+
+    #[test]
     fn manual_intent_is_target_specific_without_changing_automatic_consent() {
         let root = Temp::new();
         let store = Store::open(&root.0).unwrap();
         let first = record();
         store.commit(store.stage(&first, b"data").unwrap()).unwrap();
         store.set_automatic(false).unwrap();
-        assert!(!store.manual_requested(&first.archive_sha256).unwrap());
-        store.request_manual(&first.archive_sha256).unwrap();
-        assert!(store.manual_requested(&first.archive_sha256).unwrap());
+        assert!(!store
+            .manual_requested(&first.target_id(), &first.archive_sha256)
+            .unwrap());
+        store
+            .request_manual(&first.target_id(), &first.archive_sha256)
+            .unwrap();
+        assert!(store
+            .manual_requested(&first.target_id(), &first.archive_sha256)
+            .unwrap());
         assert!(!store.preferences().unwrap().automatic);
-        assert!(store.request_manual(&"b".repeat(64)).is_err());
+        assert!(store
+            .request_manual(&first.target_id(), &"b".repeat(64))
+            .is_err());
+        assert!(store
+            .request_manual(&"b".repeat(64), &first.archive_sha256)
+            .is_err());
         let mut next = record();
         next.archive_sha256 = "b".repeat(64);
         store.commit(store.stage(&next, b"next").unwrap()).unwrap();
-        assert!(!store.manual_requested(&next.archive_sha256).unwrap());
+        assert!(!store
+            .manual_requested(&next.target_id(), &next.archive_sha256)
+            .unwrap());
         assert!(!store.preferences().unwrap().automatic);
+    }
+
+    #[test]
+    fn manual_intent_rejects_same_archive_with_replaced_release_or_manifest() {
+        let root = Temp::new();
+        let store = Store::open(&root.0).unwrap();
+        let first = record();
+        store.publish(&first, b"data").unwrap();
+        store
+            .request_manual(&first.target_id(), &first.archive_sha256)
+            .unwrap();
+        for replacement in [
+            PreparedRecord {
+                release_id: 10,
+                ..first.clone()
+            },
+            PreparedRecord {
+                manifest_asset_id: 20,
+                ..first.clone()
+            },
+            PreparedRecord {
+                archive_asset_id: 30,
+                ..first.clone()
+            },
+            PreparedRecord {
+                manifest: "{}\n".into(),
+                ..first.clone()
+            },
+        ] {
+            store.publish(&replacement, b"data").unwrap();
+            assert!(!store
+                .manual_requested(&replacement.target_id(), &replacement.archive_sha256)
+                .unwrap());
+            assert!(store
+                .request_manual(&first.target_id(), &first.archive_sha256)
+                .is_err());
+        }
+        assert!(store.preferences().unwrap().automatic);
     }
 
     #[test]

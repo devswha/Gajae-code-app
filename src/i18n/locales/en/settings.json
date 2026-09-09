@@ -3,11 +3,25 @@
     "updateAvailable": "Update available: {{version}}"
   },
   "desktopUpdate": {
+    "update": "Update",
+    "updating": "Updating…",
+    "manualHelp": "Click Update to download and request a safe restart. Checks never download or install updates.",
+    "awaitingOperation": "Waiting for the previous native operation to finish. Do not retry yet.",
+    "targetVersion": "Version {{version}}",
+    "showDetails": "Show desktop update details: {{version}} — {{status}}",
+    "dismiss": "Dismiss this update notice",
+    "deferredHelp": "Finish active work, then check again. Installation will not retry automatically.",
+    "recoveryHelp": "Recovery needs attention in the desktop app. Only status refresh is available here.",
+    "updateErrors": {
+      "busy": "Active work blocked the restart. Finish that work, then click Update again.",
+      "changed": "The update target changed. Review the version shown before clicking Update again.",
+      "failed": "The update could not complete. Check its status, then try again."
+    },
     "reasons": {
       "discoveryFailed": "Release discovery failed.",
       "cacheInvalid": "The cached update failed validation.",
       "preparationCancelled": "Update preparation was cancelled.",
-      "preferencesNotPersisted": "The automatic update setting could not be saved."
+      "preferencesNotPersisted": "The automatic check setting could not be saved."
     },
     "title": "Desktop updates",
     "connecting": "Connecting to the desktop updater…",
@@ -24,8 +38,8 @@
     "knownProgress": "{{downloaded}} / {{total}} bytes",
     "unknownTotal": "{{downloaded}} bytes downloaded; total size unknown.",
     "unknownProgress": "Waiting for download progress.",
-    "automatic": "Automatic updates",
-    "automaticHelp": "Changes are shown only after the desktop app confirms them. Turning this off requests cancellation of scheduled updates.",
+    "automatic": "Check for updates automatically",
+    "automaticHelp": "Checks only look for new releases. Downloads and installation require clicking Update. Setting changes appear after desktop confirmation.",
     "confirmingSetting": "Waiting for native confirmation of this setting…",
     "confirmingRestart": "Requesting a safe restart…",
     "check": "Check for updates",
@@ -35,6 +49,7 @@
     "osPrompt": "macOS may ask for administrator approval in its own system dialog. Approve or cancel there; do not enter credentials here. Restart may be deferred while work is active.",
     "notes": "Release notes",
     "phases": {
+      "available": "Update available",
       "disabled": "Updater disabled",
       "idle": "Waiting for the next check",
       "checking": "Checking releases",

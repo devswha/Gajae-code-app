@@ -3,11 +3,25 @@
     "updateAvailable": "Güncelleme mevcut: {{version}}"
   },
   "desktopUpdate": {
+    "update": "Güncelle",
+    "updating": "Güncelleniyor…",
+    "manualHelp": "Güncelle düğmesi indirmeyi başlatır ve güvenli yeniden başlatma ister. Denetimler güncelleme indirmez veya kurmaz.",
+    "awaitingOperation": "Önceki yerel işlemin bitmesi bekleniyor. Henüz yeniden denemeyin.",
+    "targetVersion": "Sürüm {{version}}",
+    "showDetails": "Masaüstü güncelleme ayrıntılarını göster: {{version}} — {{status}}",
+    "dismiss": "Bu güncelleme bildirimini kapat",
+    "deferredHelp": "Devam eden işleri bitirip yeniden denetleyin. Kurulum otomatik olarak yeniden denenmez.",
+    "recoveryHelp": "Kurtarma için masaüstü uygulamasında işlem yapılması gerekir. Burada yalnızca durum yenilenebilir.",
+    "updateErrors": {
+      "busy": "Devam eden işler yeniden başlatmayı engelledi. Bu işleri bitirip Güncelle düğmesine tekrar tıklayın.",
+      "changed": "Güncelleme hedefi değişti. Güncelle düğmesine tekrar tıklamadan önce gösterilen sürümü inceleyin.",
+      "failed": "Güncelleme tamamlanamadı. Durumu denetleyip yeniden deneyin."
+    },
     "reasons": {
       "discoveryFailed": "Sürüm araması başarısız oldu.",
       "cacheInvalid": "Önbellekteki güncelleme doğrulanamadı.",
       "preparationCancelled": "Güncelleme hazırlığı iptal edildi.",
-      "preferencesNotPersisted": "Otomatik güncelleme ayarı kaydedilemedi."
+      "preferencesNotPersisted": "Otomatik denetim ayarı kaydedilemedi."
     },
     "title": "Masaüstü güncellemeleri",
     "connecting": "Masaüstü güncelleyicisine bağlanılıyor…",
@@ -24,8 +38,8 @@
     "knownProgress": "{{downloaded}} / {{total}} bayt",
     "unknownTotal": "{{downloaded}} bayt indirildi; toplam boyut bilinmiyor.",
     "unknownProgress": "İndirme ilerlemesi bekleniyor.",
-    "automatic": "Otomatik güncellemeler",
-    "automaticHelp": "Değişiklikler yalnızca masaüstü uygulaması doğruladıktan sonra görünür. Kapatmak, planlanmış güncellemelerin iptalini ister.",
+    "automatic": "Güncellemeleri otomatik denetle",
+    "automaticHelp": "Denetimler yalnızca yeni sürümleri arar. İndirme ve kurulum için Güncelle düğmesine tıklamanız gerekir. Ayarlar masaüstü uygulaması onayladıktan sonra görünür.",
     "confirmingSetting": "Ayarın yerel olarak doğrulanması bekleniyor…",
     "confirmingRestart": "Güvenli yeniden başlatma isteniyor…",
     "check": "Güncellemeleri denetle",
@@ -35,6 +49,7 @@
     "osPrompt": "macOS kendi sistem penceresinde yönetici onayı isteyebilir. Onayı veya iptali oradan yapın; buraya kimlik bilgileri girmeyin. Etkin işler varken yeniden başlatma ertelenebilir.",
     "notes": "Sürüm notları",
     "phases": {
+      "available": "Güncelleme mevcut",
       "disabled": "Güncelleyici devre dışı",
       "idle": "Sonraki denetim bekleniyor",
       "checking": "Sürümler denetleniyor",

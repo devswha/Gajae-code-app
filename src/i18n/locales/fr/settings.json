@@ -3,11 +3,25 @@
     "updateAvailable": "Mise à jour disponible : {{version}}"
   },
   "desktopUpdate": {
+    "update": "Mettre à jour",
+    "updating": "Mise à jour en cours…",
+    "manualHelp": "Mettre à jour lance le téléchargement et demande un redémarrage sûr. Les vérifications ne téléchargent ni n’installent rien.",
+    "awaitingOperation": "L’opération native précédente n’est pas terminée. Ne réessayez pas encore.",
+    "targetVersion": "Version {{version}}",
+    "showDetails": "Afficher les détails de la mise à jour de bureau : {{version}} — {{status}}",
+    "dismiss": "Masquer cet avis de mise à jour",
+    "deferredHelp": "Terminez les tâches en cours, puis vérifiez à nouveau. L’installation ne sera pas relancée automatiquement.",
+    "recoveryHelp": "La récupération nécessite votre attention dans l’application de bureau. Seule l’actualisation du statut est disponible ici.",
+    "updateErrors": {
+      "busy": "Des tâches en cours ont bloqué le redémarrage. Terminez-les, puis cliquez à nouveau sur Mettre à jour.",
+      "changed": "La cible de la mise à jour a changé. Vérifiez la version affichée avant de cliquer à nouveau sur Mettre à jour.",
+      "failed": "La mise à jour n’a pas pu aboutir. Vérifiez son statut, puis réessayez."
+    },
     "reasons": {
       "discoveryFailed": "La recherche des versions a échoué.",
       "cacheInvalid": "La validation de la mise à jour en cache a échoué.",
       "preparationCancelled": "La préparation de la mise à jour a été annulée.",
-      "preferencesNotPersisted": "Le réglage des mises à jour automatiques n’a pas pu être enregistré."
+      "preferencesNotPersisted": "Le réglage des vérifications automatiques n’a pas pu être enregistré."
     },
     "title": "Mises à jour du bureau",
     "connecting": "Connexion au service de mise à jour…",
@@ -24,8 +38,8 @@
     "knownProgress": "{{downloaded}} / {{total}} octets",
     "unknownTotal": "{{downloaded}} octets téléchargés ; taille totale inconnue.",
     "unknownProgress": "En attente de la progression du téléchargement.",
-    "automatic": "Mises à jour automatiques",
-    "automaticHelp": "Les modifications s’affichent après confirmation de l’application de bureau. Désactiver demande l’annulation des mises à jour programmées.",
+    "automatic": "Rechercher automatiquement les mises à jour",
+    "automaticHelp": "Les vérifications recherchent seulement de nouvelles versions. Le téléchargement et l’installation nécessitent un clic sur Mettre à jour. Les réglages s’affichent après confirmation de l’application.",
     "confirmingSetting": "En attente de la confirmation native du réglage…",
     "confirmingRestart": "Demande de redémarrage sécurisé…",
     "check": "Rechercher des mises à jour",
@@ -35,6 +49,7 @@
     "osPrompt": "macOS peut demander une autorisation administrateur dans sa propre boîte de dialogue. Acceptez ou annulez dans celle-ci ; ne saisissez pas d’identifiants ici. Le redémarrage peut être différé si des tâches sont actives.",
     "notes": "Notes de version",
     "phases": {
+      "available": "Mise à jour disponible",
       "disabled": "Mise à jour désactivée",
       "idle": "En attente de la prochaine recherche",
       "checking": "Recherche de versions",

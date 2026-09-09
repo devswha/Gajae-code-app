@@ -27,8 +27,10 @@ afterEach(() => {
 });
 
 function native(extra: Partial<DesktopUpdateSnapshot> = {}): DesktopUpdateSnapshot {
+  const targeted = ['available', 'downloading', 'verifying', 'ready'].includes(extra.phase ?? 'idle');
   return { protocolVersion: 1, phase: 'idle', automatic: true, productVersion: '2.0.0-beta.10',
-    desktopVersion: '0.2.4', targetProductVersion: null, targetDesktopVersion: null,
+    desktopVersion: '0.2.4', targetProductVersion: targeted ? '2.0.0-beta.11' : null, targetDesktopVersion: targeted ? '0.2.5' : null,
+    targetId: targeted ? 'f'.repeat(64) : null,
     discoveryIncomplete: false, reason: null, installationAvailable: false,
     downloadedBytes: null, totalBytes: null, notes: null, ...extra };
 }
@@ -197,7 +199,7 @@ test('check and restart commands do not invent phases; restart requires availabl
   assert.equal(commands.some((command) => command.action === 'restart'), false);
   snapshot = native({ phase: 'ready', installationAvailable: true });
   await act(async () => { await view.result.current.refresh(); await view.result.current.restart(); });
-  assert.deepEqual(commands.at(-1), { action: 'restart' });
+  assert.deepEqual(commands.at(-1), { action: 'restart', targetId: 'f'.repeat(64) });
   assert.equal(view.result.current.snapshot?.phase, 'ready', 'request success is not a claim of restarting');
   const count = commands.length;
   await act(async () => { await view.result.current.setAutomatic('yes' as unknown as boolean); });
@@ -317,4 +319,159 @@ test('unmount clears timers/listeners, ignores saved callbacks and never cancels
   assert.equal(clock.timeouts.size, 0);
   await act(async () => { poll(); timeout(); changed(); await refresh(); waiting.resolve(native()); });
   assert.equal(calls, 1);
+});
+
+test('sidebar and About share one read connection; discovering or opening ready never installs', async () => {
+  const clock = timers();
+  const commands: DesktopUpdateCommand[] = [];
+  let snapshot = native({ phase: 'available', installationAvailable: true });
+  bridge(async command => { commands.push(command); return snapshot; });
+  const sidebar = renderHook(useDesktopUpdate);
+  const about = renderHook(useDesktopUpdate);
+  await flush();
+  assert.equal(clock.intervals.size, 1);
+  assert.equal(commands.length, 1);
+  assert.equal(sidebar.result.current.snapshot, about.result.current.snapshot);
+  snapshot = native({ phase: 'ready', installationAvailable: true });
+  await clock.poll();
+  await act(async () => { await about.result.current.check(); });
+  assert.equal(commands.some(command => ['download', 'restart'].includes(command.action)), false);
+  sidebar.unmount();
+  assert.equal(clock.intervals.size, 1);
+  about.unmount();
+  assert.equal(clock.intervals.size, 0);
+});
+
+test('one click downloads only its target and performs one safe restart after verified ready', async () => {
+  const clock = timers();
+  const commands: DesktopUpdateCommand[] = [];
+  let snapshot = native({ phase: 'available', installationAvailable: true });
+  bridge(async command => {
+    commands.push(command);
+    if (command.action === 'download') snapshot = native({ phase: 'downloading', installationAvailable: true });
+    if (command.action === 'restart') snapshot = native({ phase: 'restarting', targetId: 'f'.repeat(64), installationAvailable: false });
+    return snapshot;
+  });
+  const view = renderHook(useDesktopUpdate);
+  await flush();
+  await act(async () => { const first = view.result.current.update(); void view.result.current.update(); await first; });
+  assert.equal(view.result.current.updating, true);
+  assert.deepEqual(commands.filter(command => command.action === 'download'), [{ action: 'download', targetId: 'f'.repeat(64) }]);
+  snapshot = native({ phase: 'verifying', installationAvailable: true });
+  await clock.poll();
+  assert.equal(commands.some(command => command.action === 'restart'), false);
+  snapshot = native({ phase: 'ready', installationAvailable: true });
+  await clock.poll(); await flush();
+  assert.deepEqual(commands.filter(command => command.action === 'restart'), [{ action: 'restart', targetId: 'f'.repeat(64) }]);
+  assert.equal(view.result.current.updating, false);
+  assert.equal(view.result.current.updateError, null);
+  snapshot = native({ phase: 'ready', installationAvailable: true });
+  await clock.poll(); await clock.poll();
+  assert.equal(commands.filter(command => command.action === 'restart').length, 1);
+});
+
+test('a changed target retires the click instead of applying a different version', async () => {
+  const clock = timers();
+  let snapshot = native({ phase: 'available', installationAvailable: true });
+  const commands: DesktopUpdateCommand[] = [];
+  bridge(async command => { commands.push(command); if (command.action === 'download') snapshot = native({ phase: 'downloading', installationAvailable: true }); return snapshot; });
+  const view = renderHook(useDesktopUpdate); await flush();
+  await act(async () => { await view.result.current.update(); });
+  snapshot = native({ phase: 'ready', targetId: 'e'.repeat(64), targetDesktopVersion: '0.2.6', installationAvailable: true });
+  await clock.poll();
+  assert.equal(view.result.current.updating, false);
+  assert.equal(view.result.current.updateError, 'changed');
+  assert.equal(commands.some(command => command.action === 'restart'), false);
+});
+
+test('busy work defers a clicked restart and requires another explicit click to retry', async () => {
+  const clock = timers();
+  const commands: DesktopUpdateCommand[] = [];
+  let busy = true;
+  bridge(async command => {
+    commands.push(command);
+    if (command.action === 'restart' && busy) throw new Error('updater_busy');
+    return native({ phase: command.action === 'restart' ? 'restarting' : 'ready', installationAvailable: true });
+  });
+  const view = renderHook(useDesktopUpdate); await flush();
+  await act(async () => { await view.result.current.update(); });
+  assert.equal(view.result.current.updateError, 'busy');
+  assert.equal(view.result.current.updating, false);
+  assert.equal(view.result.current.connected, true);
+  assert.equal(view.result.current.error, null, 'native refusal is not a connection failure');
+  busy = false;
+  await clock.poll(); await clock.poll();
+  assert.equal(commands.filter(command => command.action === 'restart').length, 1);
+  await act(async () => { await view.result.current.update(); });
+  assert.equal(commands.filter(command => command.action === 'restart').length, 2);
+  assert.equal(view.result.current.updateError, null);
+});
+
+test('a timed-out download is not repeated and late ready cannot restart the app', async () => {
+  const clock = timers();
+  const late = deferred<unknown>();
+  const commands: DesktopUpdateCommand[] = [];
+  let snapshot = native({ phase: 'available', installationAvailable: true });
+  bridge(async command => { commands.push(command); return command.action === 'download' ? late.promise : snapshot; });
+  const view = renderHook(useDesktopUpdate); await flush();
+  act(() => { void view.result.current.update(); }); await flush(); await clock.expire();
+  assert.equal(view.result.current.updateError, 'failed');
+  assert.equal(view.result.current.awaitingOperation, true);
+  snapshot = native({ phase: 'ready', installationAvailable: true });
+  await clock.poll();
+  await act(async () => { await view.result.current.update(); late.resolve(snapshot); });
+  await flush(); await clock.poll();
+  assert.equal(commands.filter(command => command.action === 'download').length, 1);
+  assert.equal(commands.some(command => command.action === 'restart'), false);
+  assert.equal(view.result.current.awaitingOperation, false);
+});
+
+test('bridge replacement clears a download click even when the new bridge has the same cached target', async () => {
+  timers();
+  const late = deferred<unknown>();
+  const commands: DesktopUpdateCommand[] = [];
+  bridge(async command => { commands.push(command); return command.action === 'download' ? late.promise : native({ phase: 'available', installationAvailable: true }); });
+  const view = renderHook(useDesktopUpdate); await flush();
+  act(() => { void view.result.current.update(); }); await flush();
+  bridge(async command => { commands.push(command); return native({ phase: 'ready', installationAvailable: true }); });
+  changed(); await flush();
+  await act(async () => { late.resolve(native({ phase: 'ready', installationAvailable: true })); });
+  assert.equal(view.result.current.updating, false);
+  assert.equal(view.result.current.updateError, 'changed');
+  assert.equal(commands.some(command => command.action === 'restart'), false);
+});
+
+test('a remaining consumer preserves the click while sidebar presentation changes', async () => {
+  const clock = timers();
+  let snapshot = native({ phase: 'available', installationAvailable: true });
+  const commands: DesktopUpdateCommand[] = [];
+  bridge(async command => {
+    commands.push(command);
+    if (command.action === 'download') snapshot = native({ phase: 'downloading', installationAvailable: true });
+    if (command.action === 'restart') snapshot = native({ phase: 'restarting' });
+    return snapshot;
+  });
+  const owner = renderHook(useDesktopUpdate);
+  const card = renderHook(useDesktopUpdate); await flush();
+  await act(async () => { await card.result.current.update(); });
+  card.unmount();
+  assert.equal(owner.result.current.updating, true);
+  snapshot = native({ phase: 'ready', installationAvailable: true });
+  await clock.poll(); await flush();
+  assert.equal(commands.filter(command => command.action === 'restart').length, 1);
+  owner.unmount(); assert.equal(clock.intervals.size, 0);
+});
+
+test('a fully unmounted page never resumes its click after remount', async () => {
+  const clock = timers();
+  const commands: DesktopUpdateCommand[] = [];
+  let snapshot = native({ phase: 'available', installationAvailable: true });
+  bridge(async command => { commands.push(command); if (command.action === 'download') snapshot = native({ phase: 'downloading', installationAvailable: true }); return snapshot; });
+  const first = renderHook(useDesktopUpdate); await flush();
+  await act(async () => { await first.result.current.update(); });
+  first.unmount();
+  snapshot = native({ phase: 'ready', installationAvailable: true });
+  const reopened = renderHook(useDesktopUpdate); await flush(); await clock.poll();
+  assert.equal(reopened.result.current.updating, false);
+  assert.equal(commands.some(command => command.action === 'restart'), false);
 });

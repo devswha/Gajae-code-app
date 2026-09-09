@@ -37,10 +37,26 @@ test('native injection registers exactly one page owner without freezing or send
 });
 
 const challenge = { protocolVersion: 1, kind: 'restartChallenge', attemptId: 'd'.repeat(64), draftEpoch: 1, ttlMs: 5000 };
+const restartCommand = { action: 'restart' as const, targetId: 'f'.repeat(64) };
 const received = (value: unknown) => ({ ok: true, json: async () => value }) as Response;
 const abortReply = { protocolVersion: 1, kind: 'restartAborted', attemptId: challenge.attemptId, draftEpoch: 1, snapshot: { phase: 'deferred' } };
 const draftReceipt = (): DesktopDraftFreezeReceipt => ({ token: challenge.attemptId, epoch: 1, expiresAt: Date.now() + 5000,
   scope: 'page', installerAuthority: false, drafts: [] });
+
+test('download and restart require a bounded native target; download does not freeze the draft', async t => {
+  t.after(cleanup);
+  const commands: unknown[] = [];
+  const { bridge } = install((async (_url, init) => { commands.push(JSON.parse(String(init?.body))); return received({ phase: 'downloading' }); }) as typeof fetch);
+  for (const action of ['download', 'restart']) {
+    for (const command of [{ action }, { action, targetId: '' }, { action, targetId: 'g'.repeat(64) }, { action, targetId: 'f'.repeat(64), path: '/tmp/installer' }]) {
+      await assert.rejects(bridge.request(command as never), /invalid_command/);
+    }
+  }
+  assert.equal(commands.length, 0);
+  await bridge.request({ action: 'download', targetId: 'f'.repeat(64) });
+  assert.deepEqual(commands, [{ action: 'download', targetId: 'f'.repeat(64) }]);
+  assert.equal(isComposerFrozen(), false);
+});
 
 test('native challenge, actual draft receipt and synchronous seal precede the prepared ACK; duplicate requests coalesce', async (t) => {
   t.after(cleanup);
@@ -51,7 +67,7 @@ test('native challenge, actual draft receipt and synchronous seal precede the pr
   const pendingDraft = new Promise<DesktopDraftFreezeReceipt>((resolve) => { ready = resolve; });
   const { bridge } = install((async (_url, init) => {
     const command = JSON.parse(String(init?.body)); calls.push(command.action);
-    if (command.action === 'restart') return received(challenge);
+    if (command.action === 'restart') { assert.deepEqual(command, restartCommand); return received(challenge); }
     assert.equal(command.action, 'restartPrepared');
     assert.equal(sealed, true);
     assert.deepEqual(command, { action: 'restartPrepared', attemptId: challenge.attemptId, draftEpoch: 1 });
@@ -63,8 +79,8 @@ test('native challenge, actual draft receipt and synchronous seal precede the pr
     seal: (value) => { assert.equal(value, receipt); calls.push('seal'); sealed = true; return true; },
     cancel: () => { throw new Error('a successful commit is not cancelled'); },
   });
-  const first = bridge.request({ action: 'restart' });
-  assert.equal(bridge.request({ action: 'restart' }), first);
+  const first = bridge.request(restartCommand);
+  assert.equal(bridge.request(restartCommand), first);
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls, ['restart', 'prepare']);
   ready(receipt); await first;
@@ -80,7 +96,7 @@ test('a rejected seal never sends prepared and only a confirmed native abort tha
   }) as typeof fetch);
   bridge.registerDraftOwner!({ prepare: async () => draftReceipt(), isCurrent: () => true, seal: () => false,
     cancel: (request) => { assert.equal(request.token, challenge.attemptId); cancelled++; return true; } });
-  assert.deepEqual(await bridge.request({ action: 'restart' }), { phase: 'deferred', reason: 'updater_draft_changed' });
+  assert.deepEqual(await bridge.request(restartCommand), { phase: 'deferred', reason: 'updater_draft_changed' });
   assert.deepEqual(commands, ['restart', 'restartCancel']); assert.equal(cancelled, 1);
 });
 
@@ -100,7 +116,7 @@ test('confirmed native cancellation preserves bounded draft failure diagnostics 
       return received(command.action === 'restart' ? challenge : abortReply);
     }) as typeof fetch);
     bridge.registerDraftOwner!({ ...owner, prepare: async () => { throw error; } });
-    assert.deepEqual(await bridge.request({ action: 'restart' }), { phase: 'deferred', reason });
+    assert.deepEqual(await bridge.request(restartCommand), { phase: 'deferred', reason });
     assert.deepEqual(commands, ['restart', 'restartCancel']);
   }
 });
@@ -117,7 +133,7 @@ test('Applying navigation or a lost prepared response does not cancel native han
   }) as typeof fetch);
   bridge.registerDraftOwner!({ prepare: async () => draftReceipt(), isCurrent: () => true, seal: () => { sealed = true; return true; },
     cancel: (request) => { if (request.token !== challenge.attemptId || request.epoch !== 1) return false; sealed = false; cancelled++; return true; } });
-  await assert.rejects(bridge.request({ action: 'restart' }), /response lost/u);
+  await assert.rejects(bridge.request(restartCommand), /response lost/u);
   assert.deepEqual(commands, ['restart', 'restartPrepared']);
   assert.equal(sealed, true); assert.equal(cancelled, 0);
   window.dispatchEvent(new CustomEvent('gajae:desktop-restart:copied-cookie', { detail: abortReply }));
@@ -136,7 +152,7 @@ test('an uncertain native outcome never unseals and internal ACK actions are not
   await assert.rejects(bridge.request({ action: 'restartPrepared', attemptId: challenge.attemptId, draftEpoch: 1 } as never), /invalid_command/u);
   assert.equal(requests, 0);
   bridge.registerDraftOwner!({ prepare: async () => draftReceipt(), isCurrent: () => true, seal: () => true, cancel: () => { cancelled++; return true; } });
-  assert.deepEqual(await bridge.request({ action: 'restart' }), { phase: 'recovery' });
+  assert.deepEqual(await bridge.request(restartCommand), { phase: 'recovery' });
   assert.equal(cancelled, 0);
 });
 

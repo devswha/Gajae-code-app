@@ -1,5 +1,12 @@
 # gajae-app v2 — Session Handoff (resume state)
 
+Latest updater policy: the user requested a bottom-left notice above Settings
+and explicit Update clicks instead of automatic installation. Discovery is
+checks-only; download and safe restart bind the clicked native target. Cached
+bytes/automatic=true no longer authorize a next-launch install. See
+[DESKTOP-CLICK-UPDATE.md](DESKTOP-CLICK-UPDATE.md). The delivered beta.11 DMG is
+unchanged and does not yet contain this follow-up.
+
 Latest user-test installer: **beta.11 / desktop 0.2.5**, built from `e28fa6d`,
 signed/notarized/stapled and delivered to Downloads. Final copied-app server,
 data-survival and actual isolated GUI quit/reopen/draft/image/settings checks

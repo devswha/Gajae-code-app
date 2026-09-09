@@ -44,7 +44,11 @@ test('production HTTP composition requires the desktop cookie, exact Origin and 
   assert.equal(JSON.stringify(response).includes('c'.repeat(64)), false);
   assert.equal((await call(bound, { action: 'status', path: '/Applications' })).status, 400);
   assert.equal((await call(bound, { action: 'setAutomatic', automatic: 'yes' })).status, 400);
-  assert.equal((await call(bound, { action: 'restart' })).status, 503);
+  assert.equal((await call(bound, { action: 'restart' })).status, 400);
+  assert.equal((await call(bound, { action: 'download' })).status, 400);
+  assert.equal((await call(bound, { action: 'restart', targetId: 'f'.repeat(64) })).status, 503);
+  assert.equal((await call(bound, { action: 'download', targetId: 'f'.repeat(64) })).status, 200);
+  assert.equal((await call(bound, { action: 'download', targetId: 'f'.repeat(64), url: 'https://foreign.test/update' })).status, 400);
 });
 
 test('a normal self-hosted app never exposes desktop update operations even if a relay is injected', async (t) => {

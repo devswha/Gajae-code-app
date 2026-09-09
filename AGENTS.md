@@ -156,6 +156,10 @@ is `.ts`/`.tsx`. Routing is react-router-dom 7.
   unknown dependencies. Do not add cross-module imports that violate them.
 - **Product identity is checked**: `npm run check:identity` verifies names/URLs/scheme
   against `shared/productIdentity.js`. Change identity constants there, nowhere else.
+- **Desktop updates are click-driven**: `automatic` means discovery checks only.
+  Download/restart require the native `targetId`; cached bytes alone cannot
+  authorize startup installation. Preserve one-shot manual intent consumption
+  and the draft/backend/process gates. Current contract: `docs/DESKTOP-CLICK-UPDATE.md`.
 - **Design system**: all product colors route through semantic CSS variables in
   `src/index.css` + the `@theme` color aliases in the same file. See `DESIGN.md` before
   touching UI styling; do not hardcode palette values.

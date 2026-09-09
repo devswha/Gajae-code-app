@@ -50,7 +50,7 @@ test('restart protocol constants and ID format are fixed and bounded', () => {
 
 test('public native commands and private backend controls remain separate allowlists', () => {
   for (const command of [
-    { action: 'status' }, { action: 'check' }, { action: 'restart' },
+    { action: 'status' }, { action: 'check' }, { action: 'restart', targetId: attemptId }, { action: 'download', targetId: attemptId },
     { action: 'setAutomatic', automatic: false }, { action: 'setAutomatic', automatic: true },
     prepared, { ...prepared, action: 'restartCancel' },
   ]) assert.equal(isDesktopNativeCommand(command), true, JSON.stringify(command));
@@ -75,6 +75,8 @@ test('all restart codecs require exact own fields and reject capability-bearing 
     ['restart cancel', isDesktopRestartCommand, { ...prepared, action: 'restartCancel' }],
     ['native status', isDesktopNativeCommand, { action: 'status' }],
     ['native automatic', isDesktopNativeCommand, { action: 'setAutomatic', automatic: false }],
+    ['native download', isDesktopNativeCommand, { action: 'download', targetId: attemptId }],
+    ['native restart', isDesktopNativeCommand, { action: 'restart', targetId: attemptId }],
     ['control status', isRestartControlCommand, { action: 'status' }],
     ['control prepare', isRestartControlCommand, prepare],
     ['control commit', isRestartControlCommand, commit],
@@ -102,6 +104,8 @@ test('all restart codecs require exact own fields and reject capability-bearing 
 
 test('restart attempts and frame epochs reject copied-shape or malformed identifiers', () => {
   for (const id of invalidIds) {
+    assert.equal(isDesktopNativeCommand({ action: 'download', targetId: id }), false);
+    assert.equal(isDesktopNativeCommand({ action: 'restart', targetId: id }), false);
     assert.equal(isDesktopRestartCommand({ ...prepared, attemptId: id }), false);
     assert.equal(isRestartControlCommand({ ...prepare, attemptId: id }), false);
     assert.equal(isRestartControlCommand({ ...commit, attemptId: id }), false);

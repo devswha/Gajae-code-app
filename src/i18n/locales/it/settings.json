@@ -3,11 +3,25 @@
     "updateAvailable": "Aggiornamento disponibile: {{version}}"
   },
   "desktopUpdate": {
+    "update": "Aggiorna",
+    "updating": "Aggiornamento in corso…",
+    "manualHelp": "Aggiorna avvia il download e richiede un riavvio sicuro. I controlli non scaricano né installano aggiornamenti.",
+    "awaitingOperation": "In attesa del termine dell’operazione nativa precedente. Non riprovare ancora.",
+    "targetVersion": "Versione {{version}}",
+    "showDetails": "Mostra dettagli dell’aggiornamento desktop: {{version}} — {{status}}",
+    "dismiss": "Nascondi questo avviso di aggiornamento",
+    "deferredHelp": "Termina le attività in corso e controlla di nuovo. L’installazione non verrà ritentata automaticamente.",
+    "recoveryHelp": "Il ripristino richiede attenzione nell’app desktop. Qui è possibile solo aggiornare lo stato.",
+    "updateErrors": {
+      "busy": "Le attività in corso hanno impedito il riavvio. Terminale, poi fai di nuovo clic su Aggiorna.",
+      "changed": "La destinazione dell’aggiornamento è cambiata. Controlla la versione mostrata prima di fare di nuovo clic su Aggiorna.",
+      "failed": "Non è stato possibile completare l’aggiornamento. Controlla lo stato, poi riprova."
+    },
     "reasons": {
       "discoveryFailed": "La ricerca delle versioni non è riuscita.",
       "cacheInvalid": "La verifica dell’aggiornamento nella cache non è riuscita.",
       "preparationCancelled": "La preparazione dell’aggiornamento è stata annullata.",
-      "preferencesNotPersisted": "Impossibile salvare l’impostazione degli aggiornamenti automatici."
+      "preferencesNotPersisted": "Non è stato possibile salvare l’impostazione dei controlli automatici."
     },
     "title": "Aggiornamenti desktop",
     "connecting": "Connessione al servizio di aggiornamento…",
@@ -24,8 +38,8 @@
     "knownProgress": "{{downloaded}} / {{total}} byte",
     "unknownTotal": "{{downloaded}} byte scaricati; dimensione totale sconosciuta.",
     "unknownProgress": "In attesa dell’avanzamento del download.",
-    "automatic": "Aggiornamenti automatici",
-    "automaticHelp": "Le modifiche appaiono solo dopo la conferma dell’app desktop. La disattivazione richiede l’annullamento degli aggiornamenti pianificati.",
+    "automatic": "Cerca aggiornamenti automaticamente",
+    "automaticHelp": "I controlli cercano solo nuove versioni. Download e installazione richiedono un clic su Aggiorna. Le modifiche appaiono dopo la conferma dell’app desktop.",
     "confirmingSetting": "In attesa della conferma nativa dell’impostazione…",
     "confirmingRestart": "Richiesta di riavvio sicuro…",
     "check": "Cerca aggiornamenti",
@@ -35,6 +49,7 @@
     "osPrompt": "macOS potrebbe chiedere l’approvazione dell’amministratore in una finestra di sistema. Approva o annulla lì; non inserire credenziali qui. Il riavvio può essere rinviato durante attività in corso.",
     "notes": "Note di rilascio",
     "phases": {
+      "available": "Aggiornamento disponibile",
       "disabled": "Aggiornamenti disattivati",
       "idle": "In attesa del prossimo controllo",
       "checking": "Ricerca delle versioni",

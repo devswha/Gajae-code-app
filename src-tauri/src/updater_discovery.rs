@@ -181,6 +181,34 @@ pub struct SelectedRelease {
     pub manifest: Manifest,
 }
 
+/// A click binds the exact native offer, not just its display version. Keep the
+/// domain and fixed-width little-endian IDs shared with persisted cache records.
+pub(crate) fn target_id(
+    release_id: u64,
+    manifest_asset_id: u64,
+    archive_asset_id: u64,
+    manifest_bytes: &[u8],
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"gajae-desktop-update-target-v1\0");
+    hash.update(release_id.to_le_bytes());
+    hash.update(manifest_asset_id.to_le_bytes());
+    hash.update(archive_asset_id.to_le_bytes());
+    hash.update(manifest_bytes);
+    format!("{:x}", hash.finalize())
+}
+
+impl SelectedRelease {
+    pub(crate) fn target_id(&self) -> String {
+        target_id(
+            self.release.id,
+            self.manifest_asset.id,
+            self.archive_asset.id,
+            &self.manifest_bytes,
+        )
+    }
+}
+
 /// Immutable identities from a signature-verified cache. This is not install consent.
 pub struct PreparedIdentity<'a> {
     pub release_id: u64,
@@ -1460,6 +1488,62 @@ mod tests {
         assert_eq!(
             selected.manifest_asset.download_url,
             policy.download("v2.0.0-beta.10", "desktop-update.json")
+        );
+    }
+
+    #[test]
+    fn discovery_never_fetches_an_archive_and_manual_fetch_keeps_the_offered_release() {
+        let policy = policy(Channel::Beta);
+        let fake = Fake::default();
+        let (first, first_bytes) = release(&policy, 1, "2.0.0-beta.11", "0.2.6", "13.0");
+        fake.release(&policy, &first, &first_bytes);
+        fake.page(&policy, 1, json!([first]));
+        // No archive route exists: any implicit download would fail this fake.
+        let selected = complete(&fake, &policy, &mut DiscoveryCursor::default())
+            .selected
+            .unwrap();
+        assert!(!fake
+            .calls()
+            .contains(&selected.archive_asset.api_url.to_string()));
+        let target_id = selected.target_id();
+        let (newer, newer_bytes) = release(&policy, 2, "2.0.0-beta.12", "0.2.7", "13.0");
+        fake.release(&policy, &newer, &newer_bytes);
+        fake.page(&policy, 1, json!([newer]));
+        fake.set(&selected.archive_asset.api_url, Reply::ok(b"test".to_vec()));
+        let before = fake.calls().len();
+        let bytes = tauri::async_runtime::block_on(fetch_archive_with(
+            &fake,
+            &policy,
+            &selected,
+            Duration::from_secs(5),
+        ))
+        .unwrap();
+        assert_eq!(bytes, b"test");
+        assert_eq!(selected.target_id(), target_id);
+        assert_eq!(&fake.calls()[before..], &[
+            selected.release.api_url.to_string(),
+            selected.manifest_asset.api_url.to_string(),
+            selected.archive_asset.api_url.to_string(),
+        ], "manual download must rebind the retained candidate, never list or select a newer target");
+        // A replacement asset with the SAME display versions is still refused
+        // before its archive is fetched.
+        let mut replacement = first;
+        replacement["assets"][1]["id"] = json!(99);
+        replacement["assets"][1]["url"] = json!(policy.api("/assets/99").as_str());
+        fake.release(&policy, &replacement, &first_bytes);
+        let before = fake.calls().len();
+        assert_eq!(
+            tauri::async_runtime::block_on(fetch_archive_with(
+                &fake,
+                &policy,
+                &selected,
+                Duration::from_secs(5),
+            )),
+            Err(DiscoveryError::IdentityChanged)
+        );
+        assert_eq!(
+            &fake.calls()[before..],
+            &[selected.release.api_url.to_string()]
         );
     }
 

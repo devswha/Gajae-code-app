@@ -47,10 +47,10 @@ function installDesktopUpdateBridge(token, origin, qaDiagnostics = false) {
       draftRegistration?.owner.cancel({ token: reply.attemptId, epoch: reply.draftEpoch });
     } catch { /* A retired/incompatible owner gains no editing or install authority. */ }
   };
-  const restart = async () => {
+  const restart = async (command) => {
     const registration = draftRegistration;
     if (!registration) throw Error('updater_draft_owner_unavailable');
-    const challenge = await rpc({ action: 'restart' });
+    const challenge = await rpc(command);
     if (challenge?.kind !== 'restartChallenge') return challenge;
     if (challenge.protocolVersion !== 1 || !id(challenge.attemptId)
       || !Number.isSafeInteger(challenge.draftEpoch) || challenge.draftEpoch < 1
@@ -97,11 +97,12 @@ function installDesktopUpdateBridge(token, origin, qaDiagnostics = false) {
       ensureCurrent();
       if (!command || typeof command !== 'object' || Array.isArray(command)
         || (command.action === 'setAutomatic' ? Object.keys(command).length !== 2 || typeof command.automatic !== 'boolean'
-          : Object.keys(command).length !== 1 || !['status', 'check', 'restart'].includes(command.action))) {
+          : ['download', 'restart'].includes(command.action) ? Object.keys(command).length !== 2 || !id(command.targetId)
+            : Object.keys(command).length !== 1 || !['status', 'check'].includes(command.action))) {
         return Promise.reject(Error('updater_invalid_command'));
       }
       if (command.action !== 'restart') return rpc(command);
-      if (!restartPromise) restartPromise = restart().finally(() => { restartPromise = undefined; });
+      if (!restartPromise) restartPromise = restart({ ...command }).finally(() => { restartPromise = undefined; });
       return restartPromise;
     } catch (error) { return Promise.reject(error); }
   };
