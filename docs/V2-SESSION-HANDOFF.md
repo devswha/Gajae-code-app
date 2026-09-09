@@ -44,6 +44,37 @@ must be rebuilt. See the signed QA record for the bounded patch/audit scope.
 
 Last updated: 2026-09-09 (same-source signed automatic A → B and data preservation passed). Supersedes the 2026-07-18 handoff; historical sections remain below.
 
+## Post-beta.12 checkpoint — external PRs landed (2026-09-09 afternoon)
+
+- **#43 merged (`f6a288a`), closes #42.** Persisted goal inspection is
+  read-only: `inspectGjcGoal` uses `listForResumePickerReadOnly` +
+  `captureTranscriptStrict`, validates an in-memory copy with
+  `inspectSessionTailReadOnly`, projects the current branch with
+  `parseSessionEntries`, and never constructs a `SessionManager`. Verified
+  RED (8/9 fail on the previous adapter) → GREEN (9/9), full SDK contract
+  suite 113 pass. Conflict resolution kept main's `#assertAdmission` /
+  `#withOperation` admission wrapper.
+- **#41 merged (`62fb413`).** Visible-row history pagination (tool results
+  no longer consume offsets; deep offsets reachable; unbounded `/messages`
+  reads past 5,000 visible rows are 413 `HISTORY_PAGE_TOO_LARGE`), viewport
+  anchoring across prepends, ID-aware Query structural sharing, no auto-retry
+  on failed pages. The maintainer follow-up `f2f4f16` closed the review
+  blockers: `fetchToolResult` and export page through
+  `fetchCompleteHistory` instead of the unbounded read; the provider retries
+  a changed transcript 3× before 409 `HISTORY_CHANGED`; missing transcript →
+  empty window; `fetchMore` returns `{ failed: true }` only for a real
+  failure; "Get earlier / Get all messages" stay reachable while
+  `hasMoreMessages`; pointer-down stops following only on the scrollbar
+  track; scroll anchor re-observes only on row-set change; dead locale keys
+  and `sliceTailPage` removed. Known follow-ups: per-(path,size,mtime)
+  index cache for the three-pass read; measure a ~2k-row fully loaded
+  session now that `content-visibility` is gone.
+- **CLA gap:** `@snowykr` has six merged PRs (#25, #27, #28, #35, #41, #43)
+  and no entry under `CLA.md` § Signatories; a request is on #43.
+- Still open: #44 (owner's draft Windows preview branch, 72 files,
+  conflicting, 128 commits behind main, pinned at beta.9) and #3 (needs
+  Cursor/Anthropic live skill qualification, which the owner excluded).
+
 ## Follow-up checkpoint — SDK32 and durable notification handoff
 
 `4fb43c2` remote Node 22/24 and Linux server/desktop/package/GUI checks all passed.
