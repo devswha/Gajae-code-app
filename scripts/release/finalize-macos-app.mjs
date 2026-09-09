@@ -1,29 +1,19 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, openSync, closeSync, readSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, openSync, closeSync, readSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { readAppRuntimeManifests, rebuildSignedMacosDesktop } from './rebuild-signed-macos-desktop.mjs';
 
 const rootDir = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const defaultApp = join(
   rootDir,
   'src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Gajae Code App.app',
 );
-const appIndex = process.argv.indexOf('--app');
-const appPath = appIndex >= 0 && process.argv[appIndex + 1] ? process.argv[appIndex + 1] : defaultApp;
-const entitlements = join(rootDir, 'src-tauri/entitlements.plist');
-/**
- * Ad-hoc is the default so unsigned local builds keep working. Notarization
- * requires a Developer ID identity and a secure timestamp on every Mach-O in
- * the bundle, which ad-hoc signatures cannot carry.
- */
-const identity = process.env.APPLE_SIGNING_IDENTITY?.trim() || '-';
-const adhoc = identity === '-';
-const timestamp = adhoc ? '--timestamp=none' : '--timestamp';
-
-function run(command, args, { combined = false } = {}) {
-  const result = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+function run(command, args, { combined = false, cwd, env } = {}) {
+  const result = spawnSync(command, args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(' ')} failed (${result.status}): ${result.stderr || result.stdout}`);
   }
@@ -67,7 +57,7 @@ function executableClosure(directory) {
   return files;
 }
 
-function signArguments(filePath) {
+function signArguments(filePath, { identity, timestamp, entitlements }) {
   const name = filePath.slice(filePath.lastIndexOf('/') + 1);
   const hardened = ['--force', '--sign', identity, timestamp, '--options', 'runtime'];
   return NATIVE_HOSTS.has(name) ? [...hardened, '--entitlements', entitlements] : hardened;
@@ -140,59 +130,81 @@ function restampRuntimeManifests(payloadDir, manifestPaths) {
   return [...new Set(restamped)].sort();
 }
 
-if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-  throw new Error(`macOS app finalization requires darwin-arm64; received ${process.platform}-${process.arch}.`);
-}
-if (!existsSync(appPath)) throw new Error(`App bundle not found: ${appPath}`);
-if (!existsSync(entitlements)) throw new Error(`Entitlements file not found: ${entitlements}`);
-if (!adhoc && !run('security', ['find-identity', '-v', '-p', 'codesigning']).includes(identity)) {
-  throw new Error(`Signing identity is not available in the keychain: ${identity}`);
-}
-
-const resources = join(appPath, 'Contents', 'Resources');
-const payloadDir = join(resources, 'resources', 'server-payload');
-const sidecar = join(appPath, 'Contents', 'MacOS', 'gajae-app-server');
-const desktop = join(appPath, 'Contents', 'MacOS', 'gajae-app-desktop');
-const nestedExecutables = executableClosure(resources).sort();
-const manifestPaths = assertManifestProvenance(payloadDir);
-
-for (const executable of nestedExecutables) {
-  run('codesign', [...signArguments(executable), executable]);
-}
-
-const restamped = restampRuntimeManifests(payloadDir, manifestPaths);
-
-run('codesign', [
-  '--force', '--sign', identity, timestamp, '--options', 'runtime',
-  '--entitlements', entitlements, sidecar,
-]);
-run('codesign', [
-  '--force', '--sign', identity, timestamp, '--options', 'runtime',
-  '--entitlements', entitlements, appPath,
-]);
-
-for (const executable of nestedExecutables) run('codesign', ['--verify', '--strict', executable]);
-run('codesign', ['--verify', '--strict', sidecar]);
-run('codesign', ['--verify', '--strict', desktop]);
-run('codesign', ['--verify', '--deep', '--strict', appPath]);
-run('lipo', [desktop, '-verify_arch', 'arm64']);
-run('lipo', [sidecar, '-verify_arch', 'arm64']);
-
-const sidecarEntitlements = run('codesign', ['-d', '--entitlements', ':-', sidecar], { combined: true });
-for (const entitlement of [
-  'com.apple.security.cs.allow-jit',
-  'com.apple.security.cs.allow-unsigned-executable-memory',
-  'com.apple.security.cs.disable-library-validation',
-]) {
-  if (!sidecarEntitlements.includes(`<key>${entitlement}</key>`)) {
-    throw new Error(`Sidecar is missing required entitlement: ${entitlement}`);
+/** Ad-hoc remains the default; Developer ID builds timestamp every signature. */
+export async function finalizeMacosApp({
+  appPath = defaultApp, sourceRoot = rootDir, inheritedEnv = process.env,
+  execute = run, resolveTargetDirectory, platform = process.platform, arch = process.arch,
+} = {}) {
+  const entitlements = join(sourceRoot, 'src-tauri/entitlements.plist');
+  const identity = inheritedEnv.APPLE_SIGNING_IDENTITY?.trim() || '-';
+  const adhoc = identity === '-';
+  const timestamp = adhoc ? '--timestamp=none' : '--timestamp';
+  const invoke = (command, args, options = {}) => execute(command, args, { env: inheritedEnv, ...options });
+  if (platform !== 'darwin' || arch !== 'arm64') {
+    throw new Error(`macOS app finalization requires darwin-arm64; received ${platform}-${arch}.`);
   }
+  if (!existsSync(appPath)) throw new Error(`App bundle not found: ${appPath}`);
+  if (!existsSync(entitlements)) throw new Error(`Entitlements file not found: ${entitlements}`);
+  if (!adhoc && !(await invoke('security', ['find-identity', '-v', '-p', 'codesigning'])).includes(identity)) {
+    throw new Error(`Signing identity is not available in the keychain: ${identity}`);
+  }
+
+  const resources = join(appPath, 'Contents', 'Resources');
+  const payloadDir = join(resources, 'resources', 'server-payload');
+  const sidecar = join(appPath, 'Contents', 'MacOS', 'gajae-app-server');
+  const desktop = join(appPath, 'Contents', 'MacOS', 'gajae-app-desktop');
+  const nestedExecutables = executableClosure(resources).sort();
+  await readAppRuntimeManifests(appPath);
+  const manifestPaths = assertManifestProvenance(payloadDir);
+
+  for (const executable of nestedExecutables) {
+    await invoke('codesign', [...signArguments(executable, { identity, timestamp, entitlements }), executable]);
+  }
+  await invoke('codesign', [
+    '--force', '--sign', identity, timestamp, '--options', 'runtime',
+    '--entitlements', entitlements, sidecar,
+  ]);
+
+  const restamped = restampRuntimeManifests(payloadDir, manifestPaths);
+  const rebuilt = await rebuildSignedMacosDesktop({ rootDir: sourceRoot, appPath, inheritedEnv },
+    { execute, resolveTargetDirectory });
+
+  // All nested signing/restamping is complete. Seal only the outer app now.
+  await invoke('codesign', [
+    '--force', '--sign', identity, timestamp, '--options', 'runtime',
+    '--entitlements', entitlements, appPath,
+  ]);
+
+  for (const executable of nestedExecutables) await invoke('codesign', ['--verify', '--strict', executable]);
+  await invoke('codesign', ['--verify', '--strict', sidecar]);
+  await invoke('codesign', ['--verify', '--strict', desktop]);
+  await invoke('codesign', ['--verify', '--deep', '--strict', appPath]);
+  await invoke('lipo', [desktop, '-verify_arch', 'arm64']);
+  await invoke('lipo', [sidecar, '-verify_arch', 'arm64']);
+
+  const sidecarEntitlements = await invoke('codesign', ['-d', '--entitlements', ':-', sidecar], { combined: true });
+  for (const entitlement of [
+    'com.apple.security.cs.allow-jit',
+    'com.apple.security.cs.allow-unsigned-executable-memory',
+    'com.apple.security.cs.disable-library-validation',
+  ]) {
+    if (!sidecarEntitlements.includes(`<key>${entitlement}</key>`)) {
+      throw new Error(`Sidecar is missing required entitlement: ${entitlement}`);
+    }
+  }
+
+  return {
+    ok: true,
+    app: appPath,
+    nestedExecutables: nestedExecutables.map(filePath => relative(appPath, filePath)),
+    restampedNatives: restamped,
+    payloadRuntimeManifestSha256: rebuilt.payloadRuntimeManifestSha256,
+    signature: adhoc ? 'adhoc' : identity,
+  };
 }
 
-console.log(JSON.stringify({
-  ok: true,
-  app: appPath,
-  nestedExecutables: nestedExecutables.map(filePath => relative(appPath, filePath)),
-  restampedNatives: restamped,
-  signature: adhoc ? 'adhoc' : identity,
-}, null, 2));
+if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
+  const appIndex = process.argv.indexOf('--app');
+  const appPath = appIndex >= 0 && process.argv[appIndex + 1] ? process.argv[appIndex + 1] : defaultApp;
+  console.log(JSON.stringify(await finalizeMacosApp({ appPath }), null, 2));
+}

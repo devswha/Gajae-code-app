@@ -18,7 +18,7 @@ import { GJC_CLEANUP_UNCONFIRMED_CODE, GJC_CLEANUP_UNCONFIRMED_MESSAGE, GjcClean
 import { GJC_MODEL_UNRESOLVED_CODE, GJC_MODEL_UNRESOLVED_MESSAGE, GjcModelResolutionError } from './gjc-model-resolution.js';
 import { claimProtocolStdout, GjcWorkerHost, runGjcWorkerEntrypoint, type GjcWorkerRuntime, type GjcWorkerWriter } from './gjc-worker.js';
 
-const request = (method: string, id: string, payload: Record<string, unknown> = {}, sessionId = 'scope-1') => ({ protocolVersion: GJC_WORKER_PROTOCOL_VERSION, kind: 'request' as const, id, method, payload, ...(['worker.initialize', 'worker.shutdown'].includes(method) ? {} : { sessionId }) }) as GjcWorkerRequestFrame;
+const request = (method: string, id: string, payload: Record<string, unknown> = {}, sessionId = 'scope-1') => ({ protocolVersion: GJC_WORKER_PROTOCOL_VERSION, kind: 'request' as const, id, method, payload, ...(['worker.initialize', 'worker.shutdown', 'worker.activity', 'worker.admission', 'models.catalog', 'oauth.providers', 'oauth.status', 'oauth.start', 'oauth.submit', 'oauth.cancel'].includes(method) ? {} : { sessionId }) }) as GjcWorkerRequestFrame;
 const deferred = <T>() => { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 function fakeRuntime() {
   const runs: Array<{ run: ReturnType<typeof deferred<void>>; writer?: GjcWorkerWriter }> = []; const calls: string[] = [];
@@ -44,6 +44,88 @@ async function initialized(fake = fakeRuntime()) {
   await host.handle(request('worker.initialize', 'init'));
   return { fake, frames, host };
 }
+
+test('worker observation is noninitializing, self-excluding and requires reversible runtime admission', async () => {
+  const fake = fakeRuntime();
+  let loads = 0;
+  const changes: boolean[] = [];
+  const activity = { generation: 'sdk-1', complete: true, starting: 0, queued: 0,
+    running: 0, settling: 0, approvals: 0, retained: 0, unknown: [] as string[] };
+  fake.runtime.observeActivity = () => ({ ...activity, unknown: [...activity.unknown] });
+  fake.runtime.setAdmissionFence = (closed) => { changes.push(closed); };
+  const frames: any[] = [];
+  const host = new GjcWorkerHost({ runtime: async () => { loads++; return fake.runtime; }, emit: (frame) => frames.push(frame) });
+  const call = async (method: string, id: string, payload = {}) => {
+    await host.handle(request(method, id, payload));
+    return frames.find((frame) => frame.id === id)!.payload;
+  };
+  assert.equal((await call('worker.activity', 'cold')).result.complete, false);
+  assert.equal(loads, 0);
+  await call('worker.initialize', 'initialize');
+  assert.ok((await call('worker.activity', 'open')).result.unknown.includes('worker_admission_open'));
+  await call('worker.admission', 'close', { fenceId: 'f1', closed: true });
+  const first = (await call('worker.activity', 'first')).result;
+  const second = (await call('worker.activity', 'second')).result;
+  assert.deepEqual(second, first, 'observation does not revise or count itself');
+  assert.equal(first.complete, true);
+  assert.equal(first.settling + first.running + first.starting + first.queued, 0);
+  assert.equal((await call('session.start', 'blocked', { message: 'new', options: {} })).error.code, 'worker_admission_fenced');
+  assert.equal(fake.runs.length, 0);
+  assert.equal((await call('worker.admission', 'wrong', { fenceId: 'f2', closed: false })).error.code, 'worker_admission_conflict');
+  await call('worker.admission', 'release', { fenceId: 'f1', closed: false });
+  assert.deepEqual(changes, [true, false]);
+  const accepted = host.handle(request('session.start', 'accepted', { message: 'existing', options: {} }));
+  assert.equal(fake.runs.length, 1);
+  await call('worker.admission', 'reclose', { fenceId: 'f2', closed: true });
+  assert.equal(fake.calls.length, 0, 'closing admission does not abort accepted roots');
+  assert.ok((await call('worker.activity', 'busy')).result.settling > 0);
+  fake.runs[0]!.run.resolve();
+  await accepted;
+  assert.equal((await call('worker.activity', 'settled')).result.complete, true);
+  await host.close();
+});
+
+test('runtime unknowns and missing observations remain blockers behind a worker fence', async () => {
+  const fake = fakeRuntime();
+  fake.runtime.setAdmissionFence = () => {};
+  const { host, frames } = await initialized(fake);
+  await host.handle(request('worker.admission', 'fence', { fenceId: 'f1', closed: true }));
+  await host.handle(request('worker.activity', 'missing'));
+  const missing = (frames.find((frame: any) => frame.id === 'missing') as any).payload.result;
+  assert.equal(missing.complete, false);
+  assert.deepEqual(missing.unknown, ['worker_runtime_unaccounted']);
+  fake.runtime.observeActivity = () => ({ generation: 'sdk-2', complete: false, starting: 0, queued: 0,
+    running: 0, settling: 1, approvals: 0, retained: 0, unknown: ['sdk_background_ownership_unproven'] });
+  await host.handle(request('worker.activity', 'unproven'));
+  const unproven = (frames.find((frame: any) => frame.id === 'unproven') as any).payload.result;
+  assert.deepEqual(unproven.unknown, ['sdk_background_ownership_unproven']);
+  assert.equal(unproven.settling, 1);
+  assert.equal(unproven.complete, false);
+  await host.close();
+});
+
+test('worker observation generation binds SDK-only revisions without revising on the observation itself', async () => {
+  const fake = fakeRuntime();
+  let generation = 'sdk-1';
+  fake.runtime.setAdmissionFence = () => {};
+  fake.runtime.observeActivity = () => ({ generation, complete: true, starting: 0, queued: 0,
+    running: 0, settling: 0, approvals: 0, retained: 0, unknown: [] });
+  const { host, frames } = await initialized(fake);
+  await host.handle(request('worker.admission', 'fence', { fenceId: 'f1', closed: true }));
+  const observe = async (id: string): Promise<string> => {
+    await host.handle(request('worker.activity', id));
+    const frame = frames.find((frame: any) => frame.id === id) as { payload: { result: { generation: string } } };
+    return frame.payload.result.generation;
+  };
+  const before = await observe('before');
+  assert.equal(await observe('unchanged'), before);
+  generation = 'sdk-3';
+  const after = await observe('after');
+  assert.notEqual(after, before, 'idle endpoint counts cannot conceal SDK mutations');
+  assert.equal(await observe('still-unchanged'), after);
+  assert.match(after, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u);
+  await host.close();
+});
 
 test('cleanup failure requires the app-owned brand, not a provider name, code, message or prototype', () => {
   const genuine = new GjcCleanupUnconfirmedError();

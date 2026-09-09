@@ -37,11 +37,18 @@ the filesystem profile; keep its UUID with the QA evidence. Deleting the QA
 directory alone does not erase that WebKit store. QA profiles are not portable.
 No production browser profile is inspected or copied by this mechanism.
 
-macOS 11–13 still support normal app launches, but QA mode refuses startup
-there rather than silently falling back to WebKit's default store. Other
+QA pins the automation bridge to the short `a.sock` path directly under its
+private profile root. This avoids silently truncated Unix socket names when
+the child inherits a long profile-specific `TMPDIR`. Roots that cannot fit the
+platform socket address capacity are rejected before the profile is initialized.
+Updater preparation's real-app QA is recorded separately in
+[DESKTOP-UPDATER-QA-PREPARATION.md](DESKTOP-UPDATER-QA-PREPARATION.md).
+
+The bundled runtime requires macOS 13 or later. On macOS 13, QA mode refuses
+startup rather than silently falling back to WebKit's default store. Other
 platforms reject this option. A disposable OS account remains useful for
-first-install permissions/LaunchServices testing and is required on older
-macOS versions. Profile-based GUI checks do not claim clean-machine coverage.
+first-install permissions/LaunchServices testing and is required for QA on
+macOS 13. Profile-based GUI checks do not claim clean-machine coverage.
 
 Record the source commit/tree, artifact hashes, profile UUIDs and separate
 results for launch, sign-in link, settings/project persistence, fresh-profile

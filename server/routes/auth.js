@@ -2,10 +2,11 @@ import express from 'express';
 
 import { authenticateToken } from '../middleware/auth.js';
 import { isDesktopMode } from '../middleware/desktop-auth.js';
+import { asyncHandler } from '../shared/utils.js';
 
 const router = express.Router();
 
-router.get('/user', authenticateToken, (req, res) => {
+router.get('/user', authenticateToken, asyncHandler((req, res) => {
   res.json({
     user: req.user,
     // The desktop webview is a loopback origin with no Tauri IPC; the client
@@ -13,6 +14,6 @@ router.get('/user', authenticateToken, (req, res) => {
     // the sidecar instead of window.open.
     shell: { desktop: isDesktopMode() },
   });
-});
+}));
 
 export default router;

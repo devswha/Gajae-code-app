@@ -1,4 +1,73 @@
 {
+  "about": {
+    "updateAvailable": "有可用更新：{{version}}"
+  },
+  "desktopUpdate": {
+    "update": "更新",
+    "updating": "正在更新…",
+    "manualHelp": "点击“更新”以下载并请求安全重启。检查更新不会下载或安装更新。",
+    "awaitingOperation": "正在等待上一个原生操作完成。请勿立即重试。",
+    "targetVersion": "版本 {{version}}",
+    "showDetails": "显示桌面更新详情：{{version}} — {{status}}",
+    "dismiss": "关闭此更新通知",
+    "deferredHelp": "完成正在进行的工作后再次检查。安装不会自动重试。",
+    "recoveryHelp": "请在桌面应用中处理恢复问题。此处只能刷新状态。",
+    "updateErrors": {
+      "busy": "正在进行的工作阻止了重启。完成工作后再次点击“更新”。",
+      "changed": "更新目标已更改。再次点击“更新”前请确认显示的版本。",
+      "failed": "无法完成更新。请检查状态后重试。"
+    },
+    "reasons": {
+      "discoveryFailed": "发行版搜索失败。",
+      "cacheInvalid": "缓存的更新未通过验证。",
+      "preparationCancelled": "更新准备已取消。",
+      "preferencesNotPersisted": "无法保存自动检查更新设置。"
+    },
+    "title": "桌面更新",
+    "connecting": "正在连接桌面更新服务…",
+    "unconfirmed": "尚未确认桌面更新访问权限。",
+    "lastConfirmed": "上次确认的原生状态；当前状态尚未确认。",
+    "unknownVersion": "版本未确认",
+    "incomplete": "发行版搜索尚未完成，不能据此认定已找到最新版本。",
+    "preparationOnly": "目前无法安装。更新准备完成并不代表已安装。",
+    "productVersion": "应用版本",
+    "desktopVersion": "桌面构建版本",
+    "targetProductVersion": "目标应用版本",
+    "targetDesktopVersion": "目标桌面构建版本",
+    "progress": "下载进度",
+    "knownProgress": "{{downloaded}} / {{total}} 字节",
+    "unknownTotal": "已下载 {{downloaded}} 字节；总大小未知。",
+    "unknownProgress": "正在等待下载进度。",
+    "automatic": "自动检查更新",
+    "automaticHelp": "自动检查仅查找新版本。下载和安装需要点击“更新”。设置将在桌面应用确认后显示。",
+    "confirmingSetting": "正在等待原生设置确认…",
+    "confirmingRestart": "正在请求安全重启…",
+    "check": "检查更新",
+    "refresh": "刷新状态",
+    "retry": "重新检查",
+    "restart": "更新并重启",
+    "osPrompt": "macOS 可能会在系统对话框中请求管理员批准。请在该窗口批准或取消，不要在此输入凭据。有任务运行时，重启可能会推迟。",
+    "notes": "发行说明",
+    "phases": {
+      "available": "有可用更新",
+      "disabled": "更新已禁用",
+      "idle": "等待下次检查",
+      "checking": "正在检查发行版",
+      "downloading": "正在下载更新",
+      "verifying": "正在验证更新",
+      "ready": "更新准备完成",
+      "deferred": "更新已推迟",
+      "error": "更新错误",
+      "applying": "正在应用更新",
+      "restarting": "正在重启",
+      "recovery": "需要恢复"
+    },
+    "errors": {
+      "unavailable": "无法连接已认证的桌面更新服务，当前状态未知。",
+      "invalidResponse": "桌面更新服务返回了不受支持的响应，安装控件将保持禁用。",
+      "timeout": "已停止等待响应，但原生操作可能仍在运行。重试前请刷新状态。"
+    }
+  },
   "close": "关闭设置",
   "title": "设置",
   "account": {

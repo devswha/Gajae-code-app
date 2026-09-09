@@ -40,6 +40,9 @@ const sharedFields = (message: NormalizedMessage) => ({
 const cleanUserText = (value: string) => unescapeWithMathProtection(decodeHtmlEntities(value));
 const cleanAssistantText = (value: string) => formatUsageLimitText(cleanUserText(value));
 
+// Match only the worker's routine auto-approval line, never arbitrary prose or warnings.
+const AUTO_APPROVAL_NOTICE = /^Auto-approved [^\s()]+ \((?:bypass|always allow|auto-approve edits)\)$/;
+
 /** A call's result: inline on the row, or the `tool_result` row it pairs with. */
 type AttachedResult = NonNullable<NormalizedMessage['toolResult']> | NormalizedMessage | null | undefined;
 
@@ -164,6 +167,8 @@ function convertRow(message: NormalizedMessage, attachedResult: AttachedResult):
   }
   if (message.kind === 'system_notice') {
     const content = message.content?.trim();
+    // Keep the raw record and permission policy intact; omit only this chat row.
+    if (content && (message.level ?? 'info') === 'info' && AUTO_APPROVAL_NOTICE.test(content)) return output;
     if (content) output.push({ type: 'assistant', content, timestamp: message.timestamp, isSystemNotice: true, noticeLevel: message.level ?? 'info', ...common });
     return output;
   }

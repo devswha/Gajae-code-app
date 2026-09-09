@@ -40,6 +40,17 @@ a {
   text-decoration: none;
 }
 
+a:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--foreground);
+  outline-offset: 4px;
+  border-radius: 0.25rem;
+}
+
+[id] {
+  scroll-margin-top: 2rem;
+}
+
 img {
   display: block;
   max-width: 100%;
@@ -97,13 +108,12 @@ summary {
 .nav a:hover,
 .footer-links a:hover,
 .quiet-link:hover,
-.release-meta a:hover,
 .faq a:hover {
   color: var(--foreground);
 }
 
 .hero {
-  padding: 4rem 0 7rem;
+  padding: 3rem 0 2.5rem;
 }
 
 .hero h1 {
@@ -126,8 +136,21 @@ summary {
 .cta-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.65rem;
-  margin-top: 2.25rem;
+  gap: 1.25rem 2rem;
+  margin-top: 1.5rem;
+}
+
+.platform-cta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.platform-note {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 0.75rem;
 }
 
 .button,
@@ -136,7 +159,7 @@ summary {
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  min-height: 2.5rem;
+  min-height: 2.75rem;
   padding: 0.5rem 1rem;
   border: 1px solid transparent;
   border-radius: 0.5rem;
@@ -157,57 +180,31 @@ summary {
 }
 
 .button-secondary,
-.button-icon,
 .text-button {
   border-color: var(--border);
   background: transparent;
 }
 
 .button-secondary:hover,
-.button-icon:hover,
 .text-button:hover {
   background: rgba(255, 255, 255, 0.06);
   border-color: rgba(255, 255, 255, 0.2);
 }
 
-.button-icon {
-  width: 2.5rem;
-  padding: 0;
-}
-
-.all-downloads {
-  display: inline-block;
-  margin-top: 0.65rem;
-  font-size: 0.75rem;
-}
-
-.release-meta {
+.hero-links {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem 0.6rem;
-  margin: 2rem 0 0;
-  color: var(--faint);
-  font-size: 0.75rem;
-}
-
-.release-meta span,
-.release-meta a {
-  color: var(--secondary);
-}
-
-.release-meta a {
-  text-decoration: underline;
-  text-decoration-color: rgba(255, 255, 255, 0.25);
-  text-underline-offset: 0.2em;
+  gap: 0.5rem 1.25rem;
+  margin-top: 1.25rem;
 }
 
 .product-overview {
-  padding-bottom: 10rem;
+  padding-bottom: 6rem;
 }
 
 .product-overview-copy {
   max-width: 42rem;
-  margin-bottom: 2.25rem;
+  margin-top: 2rem;
 }
 
 .product-overview-copy h2 {
@@ -275,6 +272,7 @@ summary {
 }
 
 .download-section,
+.self-host-section,
 .install-section,
 .faq-section {
   padding: 7rem 0;
@@ -301,7 +299,7 @@ summary {
 
 .download-row p {
   margin: 0.2rem 0 0;
-  color: var(--faint);
+  color: var(--secondary);
   font-size: 0.8125rem;
 }
 
@@ -312,8 +310,18 @@ summary {
   gap: 1rem;
 }
 
+.download-formats {
+  display: grid;
+  gap: 0.75rem;
+  flex-shrink: 0;
+}
+
+.download-formats .text-button {
+  min-width: 10rem;
+}
+
 .text-button {
-  min-height: 2.25rem;
+  min-height: 2.75rem;
   padding: 0.4rem 0.8rem;
 }
 
@@ -465,11 +473,11 @@ summary {
   .site-header {
     flex-direction: row;
     justify-content: space-between;
-    padding-top: 5rem;
+    padding-top: 2rem;
   }
 
   .hero {
-    padding: 4rem 0 8rem;
+    padding: 3.5rem 0 2.5rem;
   }
 
   .hero h1 {

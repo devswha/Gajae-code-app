@@ -1,14 +1,17 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { createJobTerminalPayload, isJobProjectionEvent, jobTerminalEventId, type JobProjectionEvent } from '../../shared/gjc-job-projection-protocol.js';
+import type { DesktopOwnerActivity } from '../../shared/desktopUpdateProtocol.js';
 import { getGjcWorkerSupervisor, type GjcWorkerAbortOutcome, type GjcWorkerOptions, type GjcWorkerOutcome, type GjcWorkerReapOutcome, type GjcWorkerRun, type GjcWorkerSpawnRun, type GjcWorkerWriter } from '../gjc-worker-client.js';
 import { getDatabasePath } from '../modules/database/connection.js';
+import type { DesktopWorkAdmission } from '../shared/interfaces.js';
 
 import { GjcGitClient } from './gjc-git-client.js';
-import { GjcJobsClient, GjcJobsClientError } from './gjc-jobs-client.js';
+import { createNativeJobsDesktopRestartReader, GjcJobsClient, GjcJobsClientError } from './gjc-jobs-client.js';
 
 type Lease = { owner: string; generation: number };
 type RunSnapshot = { runId: string; appSessionId?: string | null; providerSessionId?: string | null };
@@ -30,8 +33,17 @@ export type JobOrchestratorOptions = GjcWorkerOptions & {
   retainWorkspaceOnFailure?: boolean;
 };
 export type JobRunHandle = { jobId: string; runId?: string; state: string; started: Promise<void>; completion: Promise<void>; abortHandle: string };
-export type JobOrchestratorDependencies = { jobs: JobAuthority; git?: GitWorktrees; gitForProject?: (projectRoot: string) => GitWorktrees; supervisor: JobSupervisor; owner?: string; createId?: () => string; broadcast?: (jobId: string, event: JobProjectionEvent) => void; stopCompletionTimeoutMs?: number };
+export type JobOrchestratorDependencies = { jobs: JobAuthority; git?: GitWorktrees; gitForProject?: (projectRoot: string) => GitWorktrees; supervisor: JobSupervisor; owner?: string; createId?: () => string; broadcast?: (jobId: string, event: JobProjectionEvent) => void; stopCompletionTimeoutMs?: number; desktopAdmission?: DesktopWorkAdmission; initialize?: () => Promise<unknown> };
 export class GjcCapacityExhaustedError extends Error { constructor(public readonly jobId: string) { super(`GJC job ${jobId} is waiting for capacity.`); this.name = 'GjcCapacityExhaustedError'; } }
+
+const desktopContinuation = new AsyncLocalStorage<() => boolean>();
+/** Server-only continuation capability: the caller must prove a still-live owner.
+ * Never expose this through request options. Consumed at one entry, not inherited
+ * by arbitrary callbacks or new roots dispatched by that operation. */
+export function withOwnedJobDesktopContinuation<T>(ownsWork: () => boolean, action: () => T): T {
+  if (!ownsWork()) throw new Error('Job continuation no longer has a live owner.');
+  return desktopContinuation.run(ownsWork, action);
+}
 
 const safe = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 function samePayload(left: unknown, right: unknown): boolean {
@@ -49,7 +61,7 @@ function lease(value: JobSnapshot): Lease { if (!value.lease || typeof value.lea
 function worktree(value: unknown): { worktreeId: string; path: string; head?: string } { const item = safe(value) && safe(value.worktree) ? value.worktree : undefined; if (!item || typeof item.worktreeId !== 'string' || typeof item.path !== 'string') throw new Error('Invalid git worktree.create response.'); return item as { worktreeId: string; path: string; head?: string }; }
 function worktreePath(value: unknown, id: string): string | undefined { const items = Array.isArray(value) ? value : safe(value) && Array.isArray(value.items) ? value.items : []; const item = items.find((candidate) => safe(candidate) && candidate.worktreeId === id && typeof candidate.path === 'string'); return safe(item) && typeof item.path === 'string' ? item.path : undefined; }
 function sameFence(current: JobSnapshot, runId: string, expected: Lease): boolean { return current.currentRun?.runId === runId && current.lease?.owner === expected.owner && current.lease?.generation === expected.generation; }
-type PersistenceScope = { pending: Set<Promise<void>>; failure?: unknown };
+type PersistenceScope = { pending: Set<Promise<void>>; ownsWork: () => boolean; failure?: unknown };
 function failureError(error: unknown): Error { return error instanceof Error ? new Error(error.message) : new Error('Worker failed.'); }
 function confirmedReap(outcome: GjcWorkerReapOutcome | undefined): boolean {
   return outcome === 'not_started' || outcome === 'reaped';
@@ -85,16 +97,81 @@ async function terminalCompletion(run: GjcWorkerRun, timeoutMs: number): Promise
 /** Durable v5 facade: Job is a bound workspace; every dispatch creates one fenced Run. */
 export class JobOrchestrator {
   private readonly owner: string; private readonly createId: () => string; private readonly stopCompletionTimeoutMs: number;
-  private readonly queues = new Map<string, Promise<unknown>>(); private readonly activeRuns = new Map<string, { runId: string; lease: Lease; abortHandle: string; run: GjcWorkerRun }>();
+  private readonly queues = new Map<string, Promise<unknown>>(); private readonly activeRuns = new Map<string, { runId: string; lease: Lease; abortHandle: string; run: GjcWorkerRun; uncertain?: boolean }>();
+  private readonly activityEpoch = randomUUID();
+  private activityRevision = 0n;
+  private readonly activityTasks = { starting: 0, settling: 0 };
+  private desktopAdmission?: DesktopWorkAdmission;
+  private closed = false;
+  private initializationFailed = false;
   private admissionBlocked = false;
   private healthChain: Promise<void> = Promise.resolve();
   constructor(private readonly deps: JobOrchestratorDependencies) {
     this.owner = deps.owner ?? `orchestrator-${randomUUID()}`;
     this.createId = deps.createId ?? randomUUID;
     this.stopCompletionTimeoutMs = deps.stopCompletionTimeoutMs ?? STOP_COMPLETION_TIMEOUT_MS;
+    this.desktopAdmission = deps.desktopAdmission;
+    if (deps.initialize) void this.admitted('orchestrator:initialize', 'starting', deps.initialize).catch(() => {
+      this.initializationFailed = true;
+      this.activityChanged();
+    });
   }
+  getGeneration(): string { return `${this.activityEpoch}:${this.activityRevision}`; }
+  snapshotActivity(): DesktopOwnerActivity {
+    const unknown: string[] = [];
+    if (this.admissionBlocked) unknown.push('orchestrator_authority_unavailable');
+    if (this.initializationFailed) unknown.push('orchestrator_initialization_failed');
+    if (this.closed) unknown.push('orchestrator_closed');
+    const uncertain = [...this.activeRuns.values()].filter((run) => run.uncertain).length;
+    if (uncertain) unknown.push('orchestrator_settlement_unconfirmed');
+    return {
+      owner: 'orchestrator', generation: this.getGeneration(), complete: unknown.length === 0,
+      starting: this.activityTasks.starting, queued: this.queues.size, running: this.activeRuns.size,
+      settling: this.activityTasks.settling, approvals: 0, retained: uncertain, unknown,
+    };
+  }
+  configureDesktopAdmission(admission?: DesktopWorkAdmission): void {
+    this.desktopAdmission = admission;
+    this.activityChanged();
+  }
+  /** Retirement is not a proof of idle; readers of an old instance fail closed. */
+  markClosed(): void { this.closed = true; this.activityChanged(); }
+  private activityChanged(): void { this.activityRevision += 1n; }
+  private async activity<T>(kind: keyof JobOrchestrator['activityTasks'], action: () => Promise<T>): Promise<T> {
+    this.activityTasks[kind] += 1;
+    this.activityChanged();
+    try { return await action(); }
+    finally { this.activityTasks[kind] -= 1; this.activityChanged(); }
+  }
+  private async admitted<T>(source: string, kind: keyof JobOrchestrator['activityTasks'], action: () => Promise<T>, completion = false): Promise<T> {
+    const owned = completion || desktopContinuation.getStore()?.() === true;
+    const release = owned ? this.desktopAdmission?.enterCompletion(source) : this.desktopAdmission?.enter(source);
+    try { return await this.activity(kind, () => desktopContinuation.exit(action)); }
+    finally { release?.(); }
+  }
+  private forgetRun(jobId: string): void {
+    if (this.activeRuns.delete(jobId)) this.activityChanged();
+  }
+  private uncertainRun(jobId: string, runId: string): void {
+    const active = this.activeRuns.get(jobId);
+    if (active?.runId === runId && !active.uncertain) { active.uncertain = true; this.activityChanged(); }
+  }
+  private clearRuns(): void { if (this.activeRuns.size) { this.activeRuns.clear(); this.activityChanged(); } }
   private git(root: string): GitWorktrees { const client = this.deps.gitForProject?.(root) ?? this.deps.git; if (!client) throw new Error('GJC Git worktree client is unavailable.'); return client; }
-  private serial<T>(jobId: string, action: () => Promise<T>): Promise<T> { const prior = this.queues.get(jobId) ?? Promise.resolve(); const result = prior.catch(() => undefined).then(action); const tail = result.catch(() => undefined).finally(() => { if (this.queues.get(jobId) === tail) this.queues.delete(jobId); }); this.queues.set(jobId, tail); return result; }
+  private serial<T>(jobId: string, action: () => Promise<T>): Promise<T> {
+    const prior = this.queues.get(jobId) ?? Promise.resolve();
+    const result = prior.catch(() => undefined).then(() => {
+      this.activityChanged();
+      return action();
+    });
+    const tail = result.catch(() => undefined).finally(() => {
+      if (this.queues.get(jobId) === tail) this.queues.delete(jobId);
+      this.activityChanged();
+    });
+    this.queues.set(jobId, tail);
+    this.activityChanged();
+    return result;
+  }
   private params(jobId: string, current: JobSnapshot): Record<string, unknown> { return { jobId, lease: lease(current) }; }
   private async mutate(jobId: string, action: () => Promise<unknown>, confirmed: (value: JobSnapshot) => boolean): Promise<JobSnapshot> { try { return snapshot(await action()); } catch (error) { const fresh = snapshot(await this.deps.jobs.get({ jobId })); if (confirmed(fresh)) return fresh; throw error; } }
   private publish(jobId: string, event: JobProjectionEvent, writer?: GjcWorkerWriter): void {
@@ -114,8 +191,9 @@ export class JobOrchestrator {
     return result;
   }
   private trackPersistence(scope: PersistenceScope, action: () => Promise<void>): void {
-    const pending = action().catch((error) => { scope.failure ??= error; }).finally(() => { scope.pending.delete(pending); });
+    const pending = this.admitted('orchestrator:persistence', 'settling', action, scope.ownsWork()).catch((error) => { scope.failure ??= error; this.activityChanged(); }).finally(() => { scope.pending.delete(pending); this.activityChanged(); });
     scope.pending.add(pending);
+    this.activityChanged();
   }
   private async drainPersistence(scope: PersistenceScope): Promise<void> {
     while (scope.pending.size) await Promise.all([...scope.pending]);
@@ -151,7 +229,7 @@ export class JobOrchestrator {
     };
   }
   private completion(jobId: string, runId: string, expected: Lease, run: GjcWorkerRun, scope: PersistenceScope, signal?: AbortSignal): Promise<void> {
-    return run.completion.then(
+    return this.activity('settling', () => run.completion.then(
       async () => {
         await this.drainPersistence(scope);
         const outcome = await run.outcome;
@@ -162,7 +240,7 @@ export class JobOrchestrator {
           const aborted = outcome === 'aborted' || signal?.aborted;
           if (!aborted && (outcome === 'not_started' || outcome === 'reaped')) scope.failure ??= new Error('Worker stopped without completing the turn.');
           await this.finalize(jobId, fresh, runId, scope.failure ? 'failed' : aborted ? 'aborted' : 'succeeded', scope.failure ? failureError(scope.failure).message : aborted ? 'aborted' : 'completed');
-          this.activeRuns.delete(jobId);
+          this.forgetRun(jobId);
           if (scope.failure) throw failureError(scope.failure);
         });
       },
@@ -173,11 +251,11 @@ export class JobOrchestrator {
           const fresh = snapshot(await this.deps.jobs.get({ jobId }));
           if (!sameFence(fresh, runId, expected)) return;
           await this.finalize(jobId, fresh, runId, signal?.aborted ? 'aborted' : 'failed', failureError(scope.failure ?? error).message);
-          this.activeRuns.delete(jobId);
+          this.forgetRun(jobId);
         });
         throw failureError(error);
       },
-    );
+    )).catch((error) => { this.uncertainRun(jobId, runId); throw error; });
   }
   private async failRun(jobId: string, runId: string, expected: Lease, run: GjcWorkerRun | undefined, error: unknown, retainWorkspace = false): Promise<void> {
     const outcome = await settledOutcome(run);
@@ -187,24 +265,27 @@ export class JobOrchestrator {
         if (retainWorkspace && fresh.worktreeId && fresh.repositoryRoot) await this.finalize(jobId, fresh, runId, 'failed', failureError(error).message);
         else await this.cancelAdmission(jobId, fresh, error, runId);
       }
-      this.activeRuns.delete(jobId);
+      this.forgetRun(jobId);
       return;
     }
     if (outcome === 'reaped' || outcome === 'completed') {
       const fresh = snapshot(await this.deps.jobs.get({ jobId }));
       if (sameFence(fresh, runId, expected)) await this.finalize(jobId, fresh, runId, 'failed', failureError(error).message);
-      this.activeRuns.delete(jobId);
+      this.forgetRun(jobId);
       return;
     }
-    if (!run || !await this.stopRun(run)) return;
+    if (!run || !await this.stopRun(run)) { this.uncertainRun(jobId, runId); return; }
     const fresh = snapshot(await this.deps.jobs.get({ jobId }));
     if (sameFence(fresh, runId, expected)) await this.finalize(jobId, fresh, runId, 'failed', failureError(error).message);
-    this.activeRuns.delete(jobId);
+    this.forgetRun(jobId);
   }
   private async stopRun(run: GjcWorkerRun): Promise<boolean> {
     const aborted = await this.deps.supervisor.abort(run.abortHandle).catch((): GjcWorkerAbortOutcome => 'unconfirmed');
     if (aborted === 'not_started') return true;
-    if (await terminalCompletion(run, this.stopCompletionTimeoutMs)) return true;
+    if (await terminalCompletion(run, this.stopCompletionTimeoutMs)) {
+      const outcome = await settledOutcome(run);
+      if (!run.outcome || (outcome !== undefined && outcome !== 'unconfirmed')) return true;
+    }
     return confirmedReap(await this.deps.supervisor.terminate?.(run.abortHandle).catch((): GjcWorkerReapOutcome => 'unconfirmed'));
   }
   private async cancelAdmission(jobId: string, current: JobSnapshot, error: unknown, runId?: string): Promise<void> {
@@ -247,11 +328,12 @@ export class JobOrchestrator {
     let expected: Lease | undefined;
     const { signal, onPrepared: _prepared, onRun, writer: _writer, retainWorkspaceOnFailure, ...workerOptions } = options;
     let unsubscribe = () => {};
+    let dispatching = true;
     const admissionLease = lease(current);
     const cancelled = async (): Promise<JobRunHandle> => {
       const fresh = snapshot(await this.deps.jobs.get({ jobId }));
       if (sameFence(fresh, runId, admissionLease)) await this.finalize(jobId, fresh, runId, 'aborted', 'aborted before dispatch');
-      this.activeRuns.delete(jobId);
+      this.forgetRun(jobId);
       return { jobId, runId, state: 'ready', started: Promise.resolve(), completion: Promise.resolve(), abortHandle: runId };
     };
     try {
@@ -259,11 +341,17 @@ export class JobOrchestrator {
       current = await this.mutate(jobId, () => this.deps.jobs.markDispatching({ ...this.params(jobId, current), runId }), (fresh) => Boolean(fresh.dispatchCheckpoint));
       expected = lease(current);
       if (signal?.aborted) return await cancelled();
-      const scope: PersistenceScope = { pending: new Set() };
+      const scope: PersistenceScope = { pending: new Set(), ownsWork: () => dispatching || this.activeRuns.get(jobId)?.runId === runId };
       run = this.deps.supervisor.spawnRun({ runId, appSessionId, message, options: { ...workerOptions, cwd, sessionId, notificationOwner: 'terminal-adapter' }, writer: this.writer(jobId, current, runId, options.writer, scope) });
       this.activeRuns.set(jobId, { runId, lease: expected, abortHandle: run.abortHandle, run });
+      this.activityChanged();
       const ownedRun = run;
-      const abort = () => { void this.stopRun(ownedRun); };
+      // The worker promise can outlive startup failure or registry clearing.
+      // Keep its actual lifetime independently of the durable active-run map.
+      void this.activity('settling', async () => {
+        await Promise.all([ownedRun.completion.catch(() => undefined), ownedRun.outcome?.catch(() => 'unconfirmed')]);
+      });
+      const abort = () => { void this.activity('settling', () => this.stopRun(ownedRun)).catch(() => this.uncertainRun(jobId, runId)); };
       signal?.addEventListener('abort', abort, { once: true });
       unsubscribe = () => signal?.removeEventListener('abort', abort);
       onRun?.(run);
@@ -284,10 +372,15 @@ export class JobOrchestrator {
       if (signal?.aborted && expected && (!run || await this.stopRun(run))) return cancelled();
       if (expected) await this.failRun(jobId, runId, expected, run, error, retainWorkspaceOnFailure);
       throw error;
+    } finally {
+      dispatching = false;
     }
   }
-  private ensureAdmission(): void { if (this.admissionBlocked) throw new GjcJobsClientError('GJC job authority is unavailable.', 'authority_unavailable'); }
+  private ensureAdmission(): void { if (this.admissionBlocked || this.closed) throw new GjcJobsClientError('GJC job authority is unavailable.', 'authority_unavailable'); }
   async start(provider: 'gjc', appSessionId: string, projectRoot: string, message: string, options: JobOrchestratorOptions): Promise<JobRunHandle> {
+    return this.admitted('orchestrator:start', 'starting', () => this.startOwned(provider, appSessionId, projectRoot, message, options));
+  }
+  private async startOwned(provider: 'gjc', appSessionId: string, projectRoot: string, message: string, options: JobOrchestratorOptions): Promise<JobRunHandle> {
     if (provider !== 'gjc' || !appSessionId) throw new Error('GJC provider and app session are required.');
     options.signal?.throwIfAborted();
     this.ensureAdmission();
@@ -324,6 +417,9 @@ export class JobOrchestrator {
     });
   }
   async turnStart(provider: 'gjc', appSessionId: string, message: string, options: JobOrchestratorOptions): Promise<JobRunHandle> {
+    return this.admitted('orchestrator:turn-start', 'starting', () => this.turnStartOwned(provider, appSessionId, message, options));
+  }
+  private async turnStartOwned(provider: 'gjc', appSessionId: string, message: string, options: JobOrchestratorOptions): Promise<JobRunHandle> {
     if (provider !== 'gjc' || !appSessionId) throw new Error('GJC provider and app session are required.');
     options.signal?.throwIfAborted();
     this.ensureAdmission();
@@ -356,6 +452,9 @@ export class JobOrchestrator {
     });
   }
   async resume(jobId: string, appSessionId: string, message: string, options: JobOrchestratorOptions): Promise<JobRunHandle> {
+    return this.admitted('orchestrator:resume', 'starting', () => this.resumeOwned(jobId, appSessionId, message, options));
+  }
+  private async resumeOwned(jobId: string, appSessionId: string, message: string, options: JobOrchestratorOptions): Promise<JobRunHandle> {
     if (!appSessionId) throw new Error('GJC app session is required.');
     options.signal?.throwIfAborted();
     this.ensureAdmission();
@@ -385,13 +484,16 @@ export class JobOrchestrator {
     });
   }
   async appendAdminEvent(jobId: string, eventId: string, payload: unknown): Promise<void> {
-    await this.serial(jobId, async () => {
+    await this.admitted('orchestrator:admin-event', 'settling', () => this.serial(jobId, async () => {
       const event = await this.deps.jobs.appendAdminEvent({ jobId, eventId, payload });
       if (!isJobProjectionEvent(event)) throw new Error('Invalid committed job event response.');
       this.publish(jobId, event);
-    });
+    }));
   }
   async abort(target: { jobId?: string; appSessionId?: string; provider?: string } | string): Promise<boolean> {
+    return this.admitted('orchestrator:abort', 'settling', () => this.abortOwned(target), true);
+  }
+  private async abortOwned(target: { jobId?: string; appSessionId?: string; provider?: string } | string): Promise<boolean> {
     const jobId = typeof target === 'string' ? target : target.jobId ?? binding(await this.deps.jobs.bindingResolve({ provider: target.provider, appSessionId: target.appSessionId })).jobId;
     return this.serial(jobId, async () => {
       let current = snapshot(await this.deps.jobs.get({ jobId }));
@@ -403,12 +505,20 @@ export class JobOrchestrator {
       if (!stopped) return false;
       const fresh = snapshot(await this.deps.jobs.get({ jobId }));
       if (sameFence(fresh, active.runId, active.lease)) await this.finalize(jobId, fresh, active.runId, 'aborted', 'aborted');
-      this.activeRuns.delete(jobId);
+      this.forgetRun(jobId);
       return true;
     });
   }
-  async interruptForShutdown(): Promise<unknown> { const result = await this.deps.jobs.interruptForShutdown(); this.activeRuns.clear(); return result; }
+  async interruptForShutdown(): Promise<unknown> {
+    // Irreversible shutdown may clear registry entries without worker proof.
+    // Never turn that administrative clearing into a reusable idle reader.
+    this.markClosed();
+    return this.activity('settling', async () => { const result = await this.deps.jobs.interruptForShutdown(); this.clearRuns(); return result; });
+  }
   async resolveBinding(provider: string, appSessionId: string): Promise<Binding | null> {
+    return this.admitted('orchestrator:binding', 'starting', () => this.resolveBindingOwned(provider, appSessionId));
+  }
+  private async resolveBindingOwned(provider: string, appSessionId: string): Promise<Binding | null> {
     try {
       return binding(await this.deps.jobs.bindingResolve({ provider, appSessionId }));
     } catch (error) {
@@ -416,19 +526,25 @@ export class JobOrchestrator {
       throw error;
     }
   }
-  reconcile(): Promise<unknown> { return this.deps.jobs.reconcile({}); }
+  reconcile(): Promise<unknown> { return this.admitted('orchestrator:reconcile', 'settling', () => this.deps.jobs.reconcile({})); }
   authorityHealth(healthy: boolean): Promise<void> {
+    if (!healthy) { this.admissionBlocked = true; this.activityChanged(); }
+    return this.admitted('orchestrator:authority-health', 'settling', () => this.authorityHealthOwned(healthy), true);
+  }
+  private authorityHealthOwned(healthy: boolean): Promise<void> {
     const transition = async (): Promise<void> => {
       if (!healthy) {
         this.admissionBlocked = true;
+        this.activityChanged();
         const runs = [...this.activeRuns.values()];
         const stopped = await Promise.all(runs.map((run) => this.stopRun(run.run)));
-        if (stopped.every(Boolean)) this.activeRuns.clear();
+        if (stopped.every(Boolean)) this.clearRuns();
         return;
       }
       if (this.activeRuns.size) throw new GjcJobsClientError('GJC worker reaping is unconfirmed.', 'authority_unavailable');
       await this.deps.jobs.reconcile({});
       this.admissionBlocked = false;
+      this.activityChanged();
     };
     const result = this.healthChain.catch(() => undefined).then(transition);
     this.healthChain = result.catch(() => undefined);
@@ -436,7 +552,24 @@ export class JobOrchestrator {
   }
 }
 type ProductionOrchestrator = JobOrchestrator & { close(): void }; let production: ProductionOrchestrator | undefined; let productionAuthority: GjcJobsClient | undefined;
+let productionDesktopAdmission: DesktopWorkAdmission | undefined;
+export function configureGjcJobOrchestratorDesktopAdmission(admission?: DesktopWorkAdmission): void {
+  productionDesktopAdmission = admission;
+  production?.configureDesktopAdmission(admission);
+}
+/** Captures the owner once; reads never instantiate clients or query native jobs.
+ * Native durable jobs (including archived jobs) require their own parent reader. */
+export function createGjcJobOrchestratorDesktopRestartReader(orchestrator: JobOrchestrator = getProductionJobOrchestrator()): {
+  getGeneration(): string; read(): DesktopOwnerActivity;
+} {
+  return Object.freeze({ getGeneration: () => orchestrator.getGeneration(), read: () => orchestrator.snapshotActivity() });
+}
 export function getProductionJobAuthority(): JobAuthority { getProductionJobOrchestrator(); if (!productionAuthority) throw new Error('GJC job authority is unavailable.'); return productionAuthority; }
+export function getProductionNativeJobsDesktopRestartReader(): ReturnType<typeof createNativeJobsDesktopRestartReader> {
+  getProductionJobOrchestrator();
+  if (!productionAuthority) throw new Error('GJC job authority is unavailable.');
+  return createNativeJobsDesktopRestartReader(productionAuthority);
+}
 export function getProductionJobOrchestrator(): ProductionOrchestrator {
   if (production) return production;
   const database = join(dirname(getDatabasePath()), 'jobs.sqlite3');
@@ -450,9 +583,8 @@ export function getProductionJobOrchestrator(): ProductionOrchestrator {
     if (!client) { client = new GjcGitClient({ workdir: projectRoot }); clients.set(projectRoot, client); }
     return client;
   };
-  const orchestrator = new JobOrchestrator({ jobs, gitForProject, supervisor: getGjcWorkerSupervisor() }) as ProductionOrchestrator;
-  orchestrator.close = () => { jobs.close(); productionAuthority = undefined; for (const client of clients.values()) client.close(); clients.clear(); production = undefined; };
-  void mkdir(dirname(database), { recursive: true }).catch(() => {});
+  const orchestrator = new JobOrchestrator({ jobs, gitForProject, supervisor: getGjcWorkerSupervisor(), desktopAdmission: productionDesktopAdmission, initialize: () => mkdir(dirname(database), { recursive: true }) }) as ProductionOrchestrator;
+  orchestrator.close = () => { orchestrator.markClosed(); jobs.close(); productionAuthority = undefined; for (const client of clients.values()) client.close(); clients.clear(); production = undefined; };
   production = orchestrator;
   return orchestrator;
 }

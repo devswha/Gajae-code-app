@@ -4,6 +4,7 @@ import { afterEach, test } from 'node:test';
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 
 import type { Project, ProjectSession } from '../../../types/app';
+import { resetComposerFreezeForTests } from '../../../shared/composerFreeze';
 import { draftInputKey, readQueuedMessages, writeQueuedMessages } from '../utils/chatStorage';
 
 import { useChatComposerState } from './useChatComposerState';
@@ -58,6 +59,7 @@ globalThis.fetch = (async () => new Response('[]', {
 
 afterEach(() => {
   cleanup();
+  resetComposerFreezeForTests();
   localStorage.clear();
 });
 

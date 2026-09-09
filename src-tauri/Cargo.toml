@@ -1,6 +1,6 @@
 [package]
 name = "gajae-app-desktop"
-version = "0.2.3"
+version = "0.2.6"
 description = "Gajae Code App desktop shell"
 license = "MIT"
 authors = ["Gajae Code App contributors"]
@@ -9,16 +9,42 @@ rust-version = "1.85"
 build = "build.rs"
 
 [build-dependencies]
+rustls-webpki = { version = "=0.103.15", default-features = false, features = ["std"] }
+rustls-pki-types = "=1.15.1"
+base64 = "=0.22.1"
+libc = "=0.2.186"
+semver = "=1.0.26"
+sha2 = "=0.10.9"
+serde_json = "=1.0.140"
 tauri-build = { version = "=2.3.0", features = [] }
 
 [dependencies]
 tauri = { version = "=2.6.0", features = [] }
 getrandom = "0.2"
 fs2 = "=0.4.3"
+libc = "=0.2.186"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.9"
 tauri-plugin-shell = "=2.3.0"
 tauri-plugin-deep-link = "=2.3.0"
 tokio = { version = "1", features = ["sync", "time"] }
 tauri-runtime = "=2.7.0"
 tauri-runtime-wry = "=2.7.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hmac = "=0.12.1"
+rustls-webpki = { version = "=0.103.15", default-features = false, features = ["std"] }
+rustls-pki-types = "=1.15.1"
+# Pin the updater release selected for the existing Tauri 2.6/runtime
+# 2.7 graph. Keep the native reqwest client on the same minor so its
+# no-redirect/HTTPS/timeout policy uses the API selected by the plugin.
+tauri-plugin-updater = { version = "=2.6.0", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+base64 = "=0.22.1"
+futures-util = "=0.3.32"
+minisign-verify = "=0.2.5"
+semver = "=1.0.26"
+tar = "=0.4.46"
+flate2 = "=1.1.9"
+plist = "=1.7.0"

@@ -1,4 +1,73 @@
 {
+  "about": {
+    "updateAvailable": "Güncelleme mevcut: {{version}}"
+  },
+  "desktopUpdate": {
+    "update": "Güncelle",
+    "updating": "Güncelleniyor…",
+    "manualHelp": "Güncelle düğmesi indirmeyi başlatır ve güvenli yeniden başlatma ister. Denetimler güncelleme indirmez veya kurmaz.",
+    "awaitingOperation": "Önceki yerel işlemin bitmesi bekleniyor. Henüz yeniden denemeyin.",
+    "targetVersion": "Sürüm {{version}}",
+    "showDetails": "Masaüstü güncelleme ayrıntılarını göster: {{version}} — {{status}}",
+    "dismiss": "Bu güncelleme bildirimini kapat",
+    "deferredHelp": "Devam eden işleri bitirip yeniden denetleyin. Kurulum otomatik olarak yeniden denenmez.",
+    "recoveryHelp": "Kurtarma için masaüstü uygulamasında işlem yapılması gerekir. Burada yalnızca durum yenilenebilir.",
+    "updateErrors": {
+      "busy": "Devam eden işler yeniden başlatmayı engelledi. Bu işleri bitirip Güncelle düğmesine tekrar tıklayın.",
+      "changed": "Güncelleme hedefi değişti. Güncelle düğmesine tekrar tıklamadan önce gösterilen sürümü inceleyin.",
+      "failed": "Güncelleme tamamlanamadı. Durumu denetleyip yeniden deneyin."
+    },
+    "reasons": {
+      "discoveryFailed": "Sürüm araması başarısız oldu.",
+      "cacheInvalid": "Önbellekteki güncelleme doğrulanamadı.",
+      "preparationCancelled": "Güncelleme hazırlığı iptal edildi.",
+      "preferencesNotPersisted": "Otomatik denetim ayarı kaydedilemedi."
+    },
+    "title": "Masaüstü güncellemeleri",
+    "connecting": "Masaüstü güncelleyicisine bağlanılıyor…",
+    "unconfirmed": "Masaüstü güncelleyicisine erişim doğrulanmadı.",
+    "lastConfirmed": "Son doğrulanmış yerel durum; mevcut durum doğrulanmadı.",
+    "unknownVersion": "Sürüm doğrulanmadı",
+    "incomplete": "Sürüm araması tamamlanmadı. En son sürümün bulunduğu doğrulanmış değildir.",
+    "preparationOnly": "Kurulum şu anda kullanılamıyor. Hazırlanmış bir güncelleme henüz kurulmuş değildir.",
+    "productVersion": "Uygulama sürümü",
+    "desktopVersion": "Masaüstü derlemesi",
+    "targetProductVersion": "Hedef uygulama sürümü",
+    "targetDesktopVersion": "Hedef masaüstü derlemesi",
+    "progress": "İndirme ilerlemesi",
+    "knownProgress": "{{downloaded}} / {{total}} bayt",
+    "unknownTotal": "{{downloaded}} bayt indirildi; toplam boyut bilinmiyor.",
+    "unknownProgress": "İndirme ilerlemesi bekleniyor.",
+    "automatic": "Güncellemeleri otomatik denetle",
+    "automaticHelp": "Denetimler yalnızca yeni sürümleri arar. İndirme ve kurulum için Güncelle düğmesine tıklamanız gerekir. Ayarlar masaüstü uygulaması onayladıktan sonra görünür.",
+    "confirmingSetting": "Ayarın yerel olarak doğrulanması bekleniyor…",
+    "confirmingRestart": "Güvenli yeniden başlatma isteniyor…",
+    "check": "Güncellemeleri denetle",
+    "refresh": "Durumu yenile",
+    "retry": "Yeniden denetle",
+    "restart": "Güncelle ve yeniden başlat",
+    "osPrompt": "macOS kendi sistem penceresinde yönetici onayı isteyebilir. Onayı veya iptali oradan yapın; buraya kimlik bilgileri girmeyin. Etkin işler varken yeniden başlatma ertelenebilir.",
+    "notes": "Sürüm notları",
+    "phases": {
+      "available": "Güncelleme mevcut",
+      "disabled": "Güncelleyici devre dışı",
+      "idle": "Sonraki denetim bekleniyor",
+      "checking": "Sürümler denetleniyor",
+      "downloading": "Güncelleme indiriliyor",
+      "verifying": "Güncelleme doğrulanıyor",
+      "ready": "Güncelleme hazırlandı",
+      "deferred": "Güncelleme ertelendi",
+      "error": "Güncelleme hatası",
+      "applying": "Güncelleme uygulanıyor",
+      "restarting": "Yeniden başlatılıyor",
+      "recovery": "Kurtarma gerekiyor"
+    },
+    "errors": {
+      "unavailable": "Kimliği doğrulanmış masaüstü güncelleyicisine ulaşılamıyor. Mevcut durumu bilinmiyor.",
+      "invalidResponse": "Masaüstü güncelleyicisi desteklenmeyen bir yanıt döndürdü. Kurulum kontrolleri devre dışı kalır.",
+      "timeout": "Yanıt bekleme sona erdi; yerel işlem hâlâ çalışıyor olabilir. Yeniden denemeden önce durumu yenileyin."
+    }
+  },
   "close": "Ayarları kapat",
   "title": "Uygulama ayarları",
   "account": {

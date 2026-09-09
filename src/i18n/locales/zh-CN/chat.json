@@ -64,13 +64,6 @@
     "stopSpeaking": "停止",
     "loading": "加载中……"
   },
-  "sessionWorktree": {
-    "label": "运行位置",
-    "project": "项目",
-    "newWorktree": "新建工作树",
-    "worktree": "工作树",
-    "preparing": "正在准备工作树"
-  },
   "input": {
     "placeholder": "询问{{provider}}，使用/发送命令，或@添加文件……",
     "modelReasoning": {
@@ -101,6 +94,8 @@
     },
     "scrollToBottom": "跳转到最后一个",
     "queue": {
+      "reviewBeforeSending": "编辑并确认后发送",
+      "recoveryNotice": "为避免重复发送，已暂停自动发送恢复的排队消息。请编辑消息，检查内容和附件后再发送。编辑排队消息时，当前草稿会被保留。",
       "sendNext": "添加另一个消息",
       "label": "已加入队列",
       "willSend": "当前运行结束后发送",
@@ -113,6 +108,14 @@
       "images_one": "添加{{count}}张图片",
       "images_other": "{{count}}张图片已添加",
       "steerNow": "操控当前转弯"
+    },
+    "draftPersistence": {
+      "failed": "草稿保存失败。请勿关闭此窗口。",
+      "retry": "重试保存草稿",
+      "failedInline": "草稿和附件保存失败（{{reason}}）。当前输入仍然保留。请重试保存草稿。保存成功前，请勿关闭窗口或重启应用。",
+      "recoveredRetry": "草稿已保存。请检查输入内容和附件，然后再次点击发送。",
+      "recoveryStillFailed": "草稿恢复失败。当前输入和已保存的数据均已保留。",
+      "recoveryNotReady": "正在恢复草稿。输入内容已保留，请在恢复完成后重试。"
     },
     "skills": {
       "label": "选择技能",

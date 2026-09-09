@@ -23,8 +23,8 @@ import { useGoalControls } from '../hooks/useGoalControls';
 
 import GoalControls from './GoalControls';
 import ChatComposer from './ChatComposer';
-import SessionWorktreePicker from './SessionWorktreePicker';
 import ChatMessagesPane from './ChatMessagesPane';
+import ChatTasksPanel from './ChatTasksPanel';
 import CommandResultModal from './CommandResultModal';
 import type { ReasoningEffort } from './reasoningEffort';
 
@@ -92,8 +92,7 @@ function ChatInterface({
   });
 
   const { setCurrentSessionId } = session;
-  const locationSessionId = selectedSession?.id ?? session.currentSessionId;
-  const sessionLocation = useSessionLocation(locationSessionId);
+  const sessionLocation = useSessionLocation(selectedSession?.id ?? session.currentSessionId);
   const establishSession = useCallback<NonNullable<ChatInterfaceProps['onSessionEstablished']>>((id, context) => {
     setCurrentSessionId(id);
     onSessionEstablished?.(id, context);
@@ -246,7 +245,10 @@ function ChatInterface({
 
   const composerNode = (
     <ComposerSurface
-      sessionLocationControl={<SessionWorktreePicker value={composer.useWorktree} onChange={composer.setUseWorktree} sessionId={locationSessionId} location={sessionLocation.data} disabled={session.isProcessing} />}
+      composerFrozen={composer.composerFrozen}
+      voiceOwnerKey={JSON.stringify([selectedProject.projectId, selectedSession?.id || session.currentSessionId || null])}
+      draftPersistence={composer.draftPersistence}
+      onRetryDraftPersistence={composer.retryDraftPersistence}
       pendingPermissionRequests={pendingPermissionRequests}
       handlePermissionDecision={composer.handlePermissionDecision}
       isLoading={session.isProcessing}
@@ -321,6 +323,7 @@ function ChatInterface({
     <PermissionContext.Provider value={permissionContextValue}>
       <div className="flex h-full min-h-0 flex-col">
         {!historicalSession && (session.currentSessionId || selectedSession?.id) && <GoalControls key={`${selectedProject.projectId}:${session.currentSessionId ?? selectedSession?.id}`} {...goalControls} />}
+        <ChatTasksPanel sessionId={selectedSession?.id ?? session.currentSessionId ?? undefined} sessionStore={sessionStore} />
         {showLanding ? (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center px-4 pb-[10vh] sm:px-6">
             <div className="w-full max-w-184">

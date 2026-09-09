@@ -203,9 +203,18 @@ The system uses Tailwind's 4px spacing scale. Existing values like `p-2`, `gap-2
 - **Accessibility**: disclosure buttons expose `aria-expanded` and `aria-controls`; all icon-only actions have names and titles, and every control preserves a visible focus ring.
 - **Responsive behavior**: desktop and mobile preserve the same information order and one scroll owner, with touch-sized primary rows on mobile.
 
+### Desktop Update Notice
+
+- **Placement**: a compact `bg-card`, `border-border`, `rounded-lg` card sits immediately above Settings in the fixed sidebar footer. The collapsed rail keeps an accessible update-details icon immediately above its bottom Settings control; opening details only expands the sidebar, without a modal or automatic focus change.
+- **Visibility**: only confirmed native snapshots with a target introduce a notice. Web, disabled, idle, and no-target states stay hidden. Dismissal is page-memory-only and scoped to the native target, so a different target can appear. About remains available for a dismissed target.
+- **Actions**: Update is an explicit click, for available or prepared targets with native installation support. The shared hook owns download and one safe, target-bound restart. Automatic means discovery checks only; rendering, checking, or opening the sidebar never installs anything. Busy, changed-target, and failed operations explain the next user action and never auto-retry.
+- **Status**: translated polite live text accompanies download/verification progress; unknown totals remain indeterminate. Pending or unresolved operations lock mutations. Disconnected snapshots are labelled as last-confirmed and cannot enable mutations. Read-only status refresh remains available when no request is pending, including connection failures and recovery; recovery never offers installation controls.
+- **Accessibility**: owned Button controls retain visible focus rings and translated names; release metadata remains plain text. The About panel keeps installed/target versions, bounded keyboard-readable notes, manual-update guidance, and the OS-approval caveat.
+
 ### Chat Pane
 
 - **Structure**: `ChatMessagesPane` owns scroll; `ChatComposer` is fixed at the bottom of the chat column.
+- **Session tasks**: a collapsible, read-only task card sits above the transcript whenever the current session has a plan. Its progress stays visible when collapsed; the expanded list has a bounded, keyboard-focusable scroll area so long plans do not push the composer off screen. Tasks no longer occupy a workspace-panel tab.
 - **Performance**: message rows use `contain`, `content-visibility: auto`, and intrinsic sizes to reduce long-transcript layout cost.
 - **States**: loading, empty provider selection, older-message loaders, load-all overlay, grouped tool messages, new-message scroll button.
 - **Layout**: message and composer width align at `max-w-[54.25rem]`.

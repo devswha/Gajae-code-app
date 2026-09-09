@@ -5,6 +5,8 @@ import type { AutomationTools } from '@gajae-code/coding-agent/sdk/session';
 import type { ExtensionUIContext } from '@gajae-code/coding-agent/extensibility/extensions/types';
 import * as z from 'zod/v4';
 
+import type { GjcPermissionMode } from './gjc-permission-policy.js';
+
 const browserActionSchema = z.object({
   verb: z.enum(['navigate', 'back', 'forward', 'reload', 'click', 'type', 'fill', 'select', 'press', 'scroll', 'wait', 'observe', 'extract', 'screenshot']),
   ref: z.number().int().positive().optional(),
@@ -28,7 +30,7 @@ const browserSchema = z.object({
   action: z.enum(['open', 'close', 'act', 'run']),
   url: z.string().optional(),
   actions: z.array(browserActionSchema).max(25).optional(),
-  code: z.string().max(64 * 1024).optional(),
+  code: z.string().max(64 * 1024).describe('JavaScript in the current page context, not Node.js or Puppeteer. Top-level await is supported; the last expression is returned.').optional(),
   timeout: z.number().int().min(1).max(300_000).optional(),
 });
 
@@ -78,6 +80,7 @@ function bridgeRequest(
   signal?: AbortSignal,
   timeoutMs = 310_000,
 ): Promise<unknown> {
+  if (signal?.aborted) return Promise.reject(new Error('Automation request was cancelled.'));
   if (!transport) return Promise.reject(new Error('App automation bridge is unavailable.'));
   const id = `tool-${randomUUID()}`;
   return new Promise((resolve, reject) => {
@@ -96,6 +99,7 @@ function bridgeRequest(
     signal?.addEventListener('abort', abort, { once: true });
     socket.setTimeout(timeoutMs, () => finish(new Error('Automation request timed out.')));
     socket.on('connect', () => {
+      if (settled) return;
       socket.write(`${JSON.stringify({ ...request, id, token: transport.token })}\n`);
     });
     socket.on('data', (chunk) => {
@@ -214,6 +218,7 @@ export function createGjcAutomationTools(
   appSessionId: string,
   ui: Pick<ExtensionUIContext, 'select'>,
   transport?: GjcAutomationBridgeTransport,
+  permissionMode: GjcPermissionMode = 'ask',
 ): AutomationTools {
   const ensureBrowserAccess = async (url: string | undefined, signal?: AbortSignal): Promise<void> => {
     const check = await bridgeRequest(transport, {
@@ -224,6 +229,9 @@ export function createGjcAutomationTools(
     }, signal) as BrowserAuthorization;
     if (check.granted || !check.origin) return;
 
+    // The trusted run policy covers this prompt, but must not create grants
+    // that survive a later run switching back to Ask (even in this session).
+    if (permissionMode === 'bypass') return;
     const choice = await ui.select(
       `Allow the agent to use ${check.origin}?`,
       [ALLOW_ONCE, ALLOW_ALWAYS, DENY],
@@ -317,6 +325,7 @@ export function createGjcAutomationTools(
     }, signal) as ComputerAuthorization;
     if (check.granted || !check.application) return;
 
+    if (permissionMode === 'bypass') return;
     const choice = await ui.select(
       `Allow the agent to control ${check.label ?? check.application}?`,
       [ALLOW_ONCE, ALLOW_ALWAYS, DENY],

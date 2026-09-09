@@ -7,6 +7,7 @@ import { githubTokensDb } from '@/modules/database/index.js';
 import { createProject } from '@/modules/projects/services/project-management.service.js';
 import type { WorkspacePathValidationResult } from '@/shared/types.js';
 import { AppError, validateWorkspacePath } from '@/shared/utils.js';
+import { enterInternalActivity, markInternalActivityUncertain } from '@/shared/desktop-internal-activity.js';
 
 type CloneProjectInput = { workspacePath: string; githubUrl: string; githubTokenId?: number | null; newGithubToken?: string | null; userId: number | string };
 type CloneCompletePayload = { project: Record<string, unknown>; message: string };
@@ -144,6 +145,20 @@ const cloneDependencies: CloneProjectDependencies = {
 };
 
 export async function startCloneProject(input: CloneProjectInput, handlers: CloneProjectEventHandlers, dependencies: CloneProjectDependencies = cloneDependencies): Promise<CloneProjectOperation> {
+  const release = enterInternalActivity('clone:start');
+  try {
+    const operation = await startCloneProjectOwned(input, handlers, dependencies);
+    // Returning the handle or disconnecting its HTTP waiter is not settlement.
+    const waitForCompletion = operation.waitForCompletion.finally(release);
+    void waitForCompletion.catch(() => {});
+    return { waitForCompletion, cancel: operation.cancel };
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
+async function startCloneProjectOwned(input: CloneProjectInput, handlers: CloneProjectEventHandlers, dependencies: CloneProjectDependencies): Promise<CloneProjectOperation> {
   const workspacePath = input.workspacePath.trim();
   const githubUrl = input.githubUrl.trim();
   requireCloneInput(workspacePath, 'WORKSPACE_PATH_REQUIRED');
@@ -164,9 +179,13 @@ export async function startCloneProject(input: CloneProjectInput, handlers: Clon
   }
 
   const workspace = await dependencies.createCloneWorkspace(destination);
-  const cleanup = () => workspace.cleanup().catch((error: unknown) => {
-    dependencies.logError('Failed to clean up clone staging directory:', error);
-  });
+  const cleanup = async () => {
+    try { await workspace.cleanup(); }
+    catch (error) {
+      markInternalActivityUncertain('clone:cleanup_failed');
+      dependencies.logError('Failed to clean up clone staging directory:', error);
+    }
+  };
   let child: GitCloneProcess;
   try {
     handlers.onProgress(`Cloning into '${name}'...`);
@@ -176,19 +195,24 @@ export async function startCloneProject(input: CloneProjectInput, handlers: Clon
     throw error;
   }
   let stderr = '';
+  let processFailure: AppError | undefined;
+  let closed = false;
+  let cancelled = false;
   const reportOutput = (chunk: Buffer | string, isErrorOutput: boolean): void => {
     const message = chunk.toString().replaceAll(workspace.path, destination).trim();
     if (isErrorOutput) stderr = message;
-    if (message) handlers.onProgress(message);
+    if (message && !closed) {
+      try { handlers.onProgress(message); }
+      catch (error) { processFailure ??= new AppError(messageFor(error), { code: 'GIT_EXECUTION_FAILED', statusCode: 500 }); }
+    }
   };
   child.stdout?.on('data', (chunk: Buffer | string) => reportOutput(chunk, false));
   child.stderr?.on('data', (chunk: Buffer | string) => reportOutput(chunk, true));
 
   const completion = new Promise<void>((resolve, reject) => {
-    let settled = false;
     const finish = (failure?: AppError) => {
-      if (settled) return;
-      settled = true;
+      if (closed) return;
+      closed = true;
       const complete = async () => {
         try {
           if (failure) throw failure;
@@ -213,10 +237,19 @@ export async function startCloneProject(input: CloneProjectInput, handlers: Clon
     child.on('error', (error) => {
       const missingGit = error.code === 'ENOENT';
       const failure = { code: missingGit ? 'GIT_NOT_FOUND' : 'GIT_EXECUTION_FAILED', statusCode: 500 };
-      finish(new AppError(missingGit ? 'Git is not installed or not in PATH' : error.message, failure));
+      processFailure ??= new AppError(missingGit ? 'Git is not installed or not in PATH' : error.message, failure);
     });
-    child.on('close', (exitCode) => finish(exitCode === 0 ? undefined : new AppError(cloneFailureMessage(stderr, token), { code: 'GIT_CLONE_FAILED', statusCode: 500 })));
+    // Neither spawn/kill error nor cancellation acknowledgement proves close.
+    // Never clean staging while Git can still be writing into it.
+    child.on('close', (exitCode) => finish(processFailure ?? (exitCode === 0 && !cancelled ? undefined : new AppError(cloneFailureMessage(stderr, token), { code: 'GIT_CLONE_FAILED', statusCode: 500 }))));
   });
 
-  return { waitForCompletion: completion, cancel: () => child.kill() };
+  return {
+    waitForCompletion: completion,
+    cancel: () => {
+      if (closed) return;
+      const release = enterInternalActivity('clone:cancel', true);
+      try { cancelled = true; child.kill(); } finally { release(); }
+    },
+  };
 }

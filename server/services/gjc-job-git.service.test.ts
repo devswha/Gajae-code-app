@@ -1,15 +1,26 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { execFile as execFileCallback } from 'node:child_process';
+import childProcess, { execFile as execFileCallback } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import { promisify } from 'node:util';
 
+import { configureInternalDesktopAdmission, enterInternalActivity, getInternalActivityGeneration, snapshotInternalActivity, withInternalActivity } from '../shared/desktop-internal-activity.js';
 
+import { DesktopRestartAuthority } from './desktop-restart-authority.js';
 import { GjcJobGitService } from './gjc-job-git.service.js';
 
 const execFile = promisify(execFileCallback);
+let desktopAuthority: DesktopRestartAuthority | undefined;
+const sources: string[] = [];
+configureInternalDesktopAdmission({
+  enter(source) { sources.push(source); return desktopAuthority?.enter(source) ?? (() => {}); },
+  enterCompletion(source) { sources.push(source); return desktopAuthority?.enterCompletion(source) ?? (() => {}); },
+});
 
 test('job git status resolves only the stored managed worktree', async () => {
   const calls: Record<string, unknown>[] = [];
@@ -156,4 +167,183 @@ test('job git summaries allow 50 unique job IDs and reject larger batches', asyn
   );
   assert.equal(Object.keys(await service.summaries(Array.from({ length: 50 }, (_, index) => `job-${index}`))).length, 50);
   await assert.rejects(service.summaries(Array.from({ length: 51 }, (_, index) => `job-${index}`)), { code: 'invalid_request' });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => { resolve = yes; });
+  return { promise, resolve };
+}
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+class GitProcess extends EventEmitter {
+  stdout = new PassThrough();
+  stderr = new PassThrough();
+  kills = 0;
+  kill() { this.kills++; return true; }
+}
+function mockGit(t: test.TestContext, respond?: (child: GitProcess, args: string[]) => void) {
+  const children: GitProcess[] = [];
+  const commands: string[][] = [];
+  const spawned = deferred<void>();
+  const mocked = t.mock.method(childProcess, 'spawn', (command: string, args: string[]) => {
+    assert.equal(command, 'git');
+    const child = new GitProcess();
+    children.push(child); commands.push(args); spawned.resolve();
+    if (respond) queueMicrotask(() => respond(child, args));
+    return child as never;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { mocked.mock.restore(); syncBuiltinESMExports(); });
+  return { children, commands, spawned: spawned.promise };
+}
+function activityFixture(t: test.TestContext) {
+  sources.length = 0;
+  const authority = new DesktopRestartAuthority({ requiredOwners: ['internal-producers'], ownerReaders: {
+    'internal-producers': { getGeneration: getInternalActivityGeneration, read: snapshotInternalActivity },
+  } });
+  desktopAuthority = authority;
+  t.after(() => { desktopAuthority = undefined; });
+  return authority;
+}
+const storedJob = { jobId: 'job-a', repositoryRoot: '/fixture/repo', worktreeId: 'worktree-a', branch: 'job/job-a', baseCommit: 'base' };
+function serviceFixture(overrides: Partial<ConstructorParameters<typeof GjcJobGitService>[0]> = {}) {
+  const events: Record<string, unknown>[] = [];
+  let reads = 0;
+  const service = new GjcJobGitService({
+    get: async () => { reads++; return storedJob; },
+    appendAdminEvent: async (event) => { events.push(event); return {}; },
+    ...overrides,
+  }, () => ({
+    list: async () => ({ items: [{ worktreeId: 'worktree-a', path: '/fixture/worktree', branch: 'job/job-a' }] }),
+    status: async () => ({ clean: false }), diff: async () => ({ patch: '' }),
+  }));
+  return { service, events, reads: () => reads };
+}
+
+test('internal activity is pure, monotonic, source-labelled and retained across callback settlement', async (t) => {
+  const authority = activityFixture(t);
+  const before = snapshotInternalActivity();
+  assert.equal(before.owner, 'internal-producers');
+  assert.deepEqual(snapshotInternalActivity(), before);
+  assert.equal(getInternalActivityGeneration(), before.generation);
+  const finish = deferred<void>();
+  const pending = withInternalActivity('git-service:test', () => {
+    assert.equal(snapshotInternalActivity().running, 1);
+    return finish.promise;
+  });
+  const busy = snapshotInternalActivity();
+  assert.deepEqual(sources, ['git-service:test']);
+  assert.equal((await authority.prepare({ attemptId: 'internal-test', epoch: 'epoch-1' })).ok, false);
+  finish.resolve();
+  await pending;
+  const after = snapshotInternalActivity();
+  assert.deepEqual({ ...after, generation: before.generation }, before);
+  assert.ok(BigInt(after.generation.split(':').at(-1)!) > BigInt(busy.generation.split(':').at(-1)!));
+  const release = enterInternalActivity('git-service:idempotent');
+  release(); const generation = getInternalActivityGeneration(); release();
+  assert.equal(getInternalActivityGeneration(), generation);
+  await assert.rejects(withInternalActivity('git-service:failure', () => { throw new Error('sync failed'); }), /sync failed/);
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('all public Git roots are fenced before authority reads, lifecycle writes, or subprocesses', async (t) => {
+  const authority = activityFixture(t); const f = serviceFixture(); const git = mockGit(t);
+  const prepared = await authority.prepare({ attemptId: 'git-roots', epoch: 'epoch-1' });
+  assert.equal(prepared.ok, true);
+  for (const action of [
+    () => f.service.resolve('job-a'), () => f.service.status('job-a'), () => f.service.diff('job-a'),
+    () => f.service.summaries(['job-a']), () => f.service.publish('job-a'), () => f.service.hasCommits('job-a'),
+    () => f.service.commit('job-a', 'commit', ['changed.txt']),
+    () => f.service.createPullRequest('job-a', async () => assert.fail('PR callback must not run')), () => f.service.prContext('job-a'),
+  ]) await assert.rejects(action(), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.equal(f.reads(), 0); assert.deepEqual(f.events, []); assert.deepEqual(git.commands, []);
+  if (prepared.ok) assert.equal((await authority.commit(prepared.token, 'epoch-1')).ok, true);
+});
+
+test('a Git root counts binding preparation before its first await', async (t) => {
+  const authority = activityFixture(t); const binding = deferred<typeof storedJob>();
+  const f = serviceFixture({ get: () => binding.promise });
+  const status = f.service.status('job-a');
+  assert.equal(snapshotInternalActivity().running, 1);
+  assert.equal((await authority.snapshot()).ingress, 1);
+  assert.equal((await authority.prepare({ attemptId: 'git-binding', epoch: 'epoch-1' })).ok, false);
+  binding.resolve(storedJob); await status;
+  assert.deepEqual(sources, ['git-service:status']);
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('a mocked publish error waits for child close and failed-event persistence without an updater kill', async (t) => {
+  const authority = activityFixture(t); const git = mockGit(t);
+  const persistence = deferred<void>(); const persisting = deferred<void>();
+  const events: string[] = [];
+  const f = serviceFixture({ appendAdminEvent: async ({ eventId }) => {
+    events.push(String(eventId));
+    if (String(eventId).endsWith('.failed')) { persisting.resolve(); await persistence.promise; }
+    return {};
+  } });
+  const pending = f.service.publish('job-a');
+  const rejected = assert.rejects(pending, /child error before close/);
+  await git.spawned;
+  assert.equal(git.commands[0][0], 'push'); // Intercepted above; no real push is executed.
+  const child = git.children[0];
+  let settled = false; void pending.catch(() => {}).then(() => { settled = true; });
+  child.emit('error', new Error('child error before close'));
+  child.emit('exit', 1);
+  await tick();
+  assert.equal(settled, false); assert.equal(events.length, 1);
+  assert.equal((await authority.prepare({ attemptId: 'git-close', epoch: 'epoch-1' })).ok, false);
+  assert.equal(child.kills, 0);
+  child.emit('close', 0);
+  await persisting.promise;
+  assert.equal(settled, false); assert.equal(snapshotInternalActivity().running, 1);
+  persistence.resolve(); await rejected; await tick();
+  assert.equal((await authority.snapshot()).idle, true);
+  assert.equal(child.kills, 0);
+});
+
+test('commit private continuations retain one root through every mocked child and its admin event', async (t) => {
+  const authority = activityFixture(t);
+  const git = mockGit(t, (child, args) => {
+    if (args[0] === 'status') child.stdout.write(' M changed.txt\n');
+    if (args[0] === 'rev-parse') child.stdout.write('fixture-commit\n');
+    child.emit('close', 0);
+  });
+  const persisting = deferred<void>(); const persisted = deferred<void>();
+  const f = serviceFixture({ appendAdminEvent: async () => { persisting.resolve(); await persisted.promise; return {}; } });
+  const pending = f.service.commit('job-a', 'message', ['changed.txt']);
+  await persisting.promise;
+  assert.deepEqual(git.commands.map((args) => args[0]), ['status', 'add', 'commit', 'rev-parse']);
+  assert.deepEqual(sources, ['git-service:commit']);
+  assert.equal(snapshotInternalActivity().running, 1);
+  assert.equal((await authority.prepare({ attemptId: 'git-persistence', epoch: 'epoch-1' })).ok, false);
+  persisted.resolve();
+  assert.equal((await pending).commit, 'fixture-commit');
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('a PR facade promise and its final admin event stay inside the accepted Git root', async (t) => {
+  const authority = activityFixture(t);
+  const git = mockGit(t, (child, args) => {
+    child.stdout.write(args[0] === 'rev-list' ? 'commit\n' : args[0] === 'symbolic-ref' ? 'refs/remotes/origin/main\n' : 'https://example.invalid/repo.git\n');
+    child.emit('close', 0);
+  });
+  const created = deferred<string>(); const creating = deferred<void>();
+  const recorded = deferred<void>(); const recording = deferred<void>();
+  const f = serviceFixture({ appendAdminEvent: async ({ eventId }) => {
+    if (String(eventId).endsWith('.completed')) { recording.resolve(); await recorded.promise; }
+    return {};
+  } });
+  const pending = f.service.createPullRequest('job-a', async (context) => {
+    assert.deepEqual(context, { branch: 'job/job-a', baseBranch: 'main', remoteUrl: 'https://example.invalid/repo.git' });
+    creating.resolve(); return created.promise;
+  });
+  await creating.promise;
+  assert.equal(snapshotInternalActivity().running, 1);
+  assert.equal((await authority.prepare({ attemptId: 'pr-facade', epoch: 'epoch-1' })).ok, false);
+  assert.deepEqual(git.commands.map((args) => args[0]), ['rev-list', 'symbolic-ref', 'remote']);
+  created.resolve('fixture-pr'); await recording.promise;
+  assert.equal(snapshotInternalActivity().running, 1);
+  recorded.resolve(); assert.equal(await pending, 'fixture-pr');
+  assert.deepEqual(sources, ['git-service:pull-request']);
+  assert.equal((await authority.snapshot()).idle, true);
 });

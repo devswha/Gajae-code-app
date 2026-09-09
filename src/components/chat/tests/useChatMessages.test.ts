@@ -5,6 +5,7 @@ import type { NormalizedMessage } from '../../../stores/useSessionStore';
 import { normalizedToChatMessages } from '../hooks/useChatMessages';
 import { isToolCallRunning } from '../utils/toolActivity';
 import { assignMessageKeys } from '../utils/messageKeys';
+import { buildPaneList, isTurnWorkBlockItem } from '../utils/turnWork';
 
 /*
  * The conversion is what the transcript renders from, and the pane's rows
@@ -138,4 +139,86 @@ test('partial tool results preserve their running state through chat conversion'
     assert.equal(isToolCallRunning(finished), false);
     if (toolName === 'Task') assert.equal(finished.subagentState?.isComplete, true);
   }
+});
+
+test('routine auto-approval info notices are omitted for every automatic policy', () => {
+  for (const reason of ['bypass', 'always allow', 'auto-approve edits']) {
+    for (const tool of ['bash', 'edit', 'eval', 'mcp__files__read', 'browser.open']) {
+      for (const level of [undefined, 'info'] as const) {
+        const notice = row({ kind: 'system_notice', level, content: `  Auto-approved ${tool} (${reason})\n` });
+        assert.deepEqual(normalizedToChatMessages([notice]), [], `${tool}: ${reason}: ${level}`);
+      }
+    }
+  }
+});
+
+test('hiding a notice does not delete raw records or disturb projection identity', () => {
+  const notice = Object.freeze(row({ kind: 'system_notice', level: 'info', content: 'Auto-approved bash (bypass)' }));
+  const user = row({ role: 'user', content: 'Run the check' });
+  const answer = row({ role: 'assistant', content: 'The check passed' });
+  const transcript = [user, notice, answer];
+  const first = normalizedToChatMessages(transcript);
+  const again = normalizedToChatMessages(transcript);
+  assert.deepEqual(first.map((message) => message.content), ['Run the check', 'The check passed']);
+  assert.equal(transcript.length, 3);
+  assert.equal(transcript[1], notice);
+  assert.equal(notice.content, 'Auto-approved bash (bypass)');
+  assert.equal(again[0], first[0]);
+  assert.equal(again[1], first[1]);
+});
+
+test('warning and error notices remain visible even when they use the same words', () => {
+  for (const level of ['warning', 'error'] as const) {
+    const notice = row({ kind: 'system_notice', level, content: 'Auto-approved bash (bypass)' });
+    const [message] = normalizedToChatMessages([notice]);
+    assert.equal(message.content, notice.content);
+    assert.equal(message.isSystemNotice, true);
+    assert.equal(message.noticeLevel, level);
+  }
+});
+
+test('user text, assistant text, streaming text and tool output are never matched as notices', () => {
+  const content = 'Auto-approved bash (bypass)';
+  const rows = [
+    row({ role: 'user', content }),
+    row({ role: 'assistant', content }),
+    row({ kind: 'stream_delta', content }),
+    row({ kind: 'error', content }),
+    row({ kind: 'tool_result', content }),
+    row({ kind: 'interactive_prompt', content }),
+  ];
+  const messages = normalizedToChatMessages(rows);
+  assert.equal(messages.length, rows.length);
+  assert.ok(messages.every((message) => message.content === content));
+  assert.equal(messages[3].type, 'error');
+  assert.equal(messages[5].isInteractivePrompt, true);
+});
+
+test('other info notices and mixed or unfamiliar notice text remain visible', () => {
+  for (const content of [
+    'Permission approval is required.',
+    'The provider reconnected.',
+    'Auto-approved bash (bypass)\nReview the next permission request.',
+    'Auto-approved bash (bypass) — additional context',
+    'Auto-approved bash (unknown policy)',
+    'Auto-approved (bypass)',
+    'Quoted: Auto-approved bash (bypass)',
+  ]) {
+    const [message] = normalizedToChatMessages([row({ kind: 'system_notice', level: 'info', content })]);
+    assert.equal(message.content, content);
+    assert.equal(message.isSystemNotice, true);
+  }
+});
+
+test('an omitted auto-approval notice does not split consecutive tool work into empty rows', () => {
+  const messages = normalizedToChatMessages([
+    row({ role: 'user', content: 'Check it' }),
+    row({ kind: 'tool_use', toolId: 'read', toolName: 'read', toolInput: { path: 'a.ts' } }),
+    row({ kind: 'system_notice', level: 'info', content: 'Auto-approved bash (bypass)' }),
+    row({ kind: 'tool_use', toolId: 'bash', toolName: 'bash', toolInput: { command: 'npm test' } }),
+    row({ role: 'assistant', content: 'Done' }),
+  ]);
+  const blocks = buildPaneList(messages, 'balanced').filter(isTurnWorkBlockItem);
+  assert.equal(blocks.length, 1);
+  assert.deepEqual(blocks[0].messages.map((message) => message.toolName), ['read', 'bash']);
 });

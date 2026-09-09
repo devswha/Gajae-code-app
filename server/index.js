@@ -10,18 +10,36 @@ import express from 'express';
 import mime from 'mime-types';
 import Database from 'better-sqlite3';
 
-import { AppError, WORKSPACES_ROOT, getOpenCodeDatabasePath, validateWorkspacePath } from '@/shared/utils.js';
+import {
+    AppError, WORKSPACES_ROOT, asyncHandler, getHttpActivityGeneration,
+    getOpenCodeDatabasePath, snapshotHttpActivity, validateWorkspacePath,
+} from '@/shared/utils.js';
+import {
+    configureInternalDesktopAdmission,
+    enterInternalActivity,
+    getInternalActivityGeneration,
+    markInternalActivityUncertain,
+    snapshotInternalActivity,
+} from '@/shared/desktop-internal-activity.js';
 import {
     openProjectFileForWrite,
     resolveProjectEntryForMutation,
     resolveProjectFileForRead,
     resolveProjectFileForWrite
 } from '@/shared/project-file-containment.js';
-import { closeSessionsWatcher, configureSessionWorktrees, initializeSessionsWatcher } from '@/modules/providers/index.js';
+import {
+    closeSessionsWatcher,
+    configureSessionWorktrees,
+    configureSessionsWatcherDesktopAdmission,
+    getSessionsWatcherActivityGeneration,
+    initializeSessionsWatcher,
+    snapshotSessionsWatcherActivity,
+} from '@/modules/providers/index.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
 import { GjcJobProjectionService } from './modules/websocket/services/gjc-job-projection.service.js';
+import { chatRunRegistry } from './modules/websocket/index.js';
 import { drainWebSocketClients } from './modules/websocket/services/websocket-drain.service.js';
 import { createGjcTerminalNotificationAdapter } from './modules/notifications/services/gjc-terminal-notification-adapter.service.js';
 import { findAppRoot, getModuleDir } from './utils/runtime-paths.js';
@@ -31,13 +49,28 @@ import {
     steerGjcRun,
     getPendingGjcApprovalsForSession,
     getGjcWorkerSupervisor,
+    createGjcWorkerDesktopRestartReader,
     resolveGjcToolApproval,
     shutdownGjcWorker,
     spawnGjcRun,
 } from './gjc-worker-client.js';
-import { getProductionJobAuthority, getProductionJobOrchestrator } from './services/gjc-job-orchestrator.js';
+import {
+    configureGjcJobOrchestratorDesktopAdmission,
+    createGjcJobOrchestratorDesktopRestartReader,
+    getProductionJobAuthority,
+    getProductionJobOrchestrator,
+    getProductionNativeJobsDesktopRestartReader,
+} from './services/gjc-job-orchestrator.js';
 import { readSessionLocation, resolveSessionWorkspacePath, validateSessionRepository } from './services/session-worktree-paths.js';
-import { abortSessionWorktreeRun, prepareSessionWorktreeRun, sessionWorktreeWorkerHandle } from './services/session-worktree-runtime.js';
+import {
+    abortSessionWorktreeRun,
+    configureSessionWorktreeDesktopAdmission,
+    createSessionWorktreeDesktopRestartReader,
+    prepareSessionWorktreeRun,
+    sessionWorktreeWorkerHandle,
+} from './services/session-worktree-runtime.js';
+import { configureNativeDesktopRestartAdmission, createNativeDesktopRestartReader } from './services/gjc-git-client.js';
+import { createProjectUploadStorage, streamProjectFile } from './services/project-file-transfer.js';
 import { getProductionGjcJobGitService } from './services/gjc-job-git.service.js';
 import {
     stripAnsiSequences,
@@ -49,9 +82,19 @@ import gitRoutes from './routes/git.js';
 import authRoutes from './routes/auth.js';
 import settingsRoutes from './routes/settings.js';
 import { createGjcAppFactory } from './app-factory.js';
+import { DesktopUpdateRelay } from './services/desktop-update-relay.js';
+import { createDesktopRestartRuntime } from './services/desktop-restart-runtime.js';
+import { DesktopRestartBackend } from './services/desktop-restart-backend.js';
+import { listenForStartup } from './services/server-listener.js';
+import { getShellActivityGeneration, snapshotShellActivity } from './modules/websocket/services/shell-websocket.service.js';
 import { isWorkspaceRoot } from './modules/projects/index.js';
 import projectModuleRoutes from './modules/projects/projects.routes.js';
 import notificationRoutes from './modules/notifications/notifications.routes.js';
+import {
+    configureNotificationDesktopAdmission,
+    getNotificationActivityGeneration,
+    snapshotNotificationActivity,
+} from './modules/notifications/index.js';
 import userRoutes from './routes/user.js';
 import systemRoutes from './routes/system.js';
 import providerRoutes from './modules/providers/provider.routes.js';
@@ -61,7 +104,11 @@ import { initializeDatabase, projectsDb, sessionsDb } from './modules/database/i
 import {
     automationRoutes,
     automationService,
+    configureDesktopRestartAdmission as configureAutomationDesktopAdmission,
+    createAutomationDesktopRestartReader,
     createBrowserAutomationRouter,
+    createBrowserDesktopRestartReader,
+    createComputerDesktopRestartReader,
     handleBrowserConnection,
 } from './modules/automation/index.js';
 import { validateApiKey, authenticateToken, authenticateWebSocket } from './middleware/auth.js';
@@ -109,6 +156,43 @@ const gjcJobProjection = new GjcJobProjectionService({
 const gjcTerminalNotificationAdapter = createGjcTerminalNotificationAdapter({
     authority: gjcJobAuthority,
 });
+// This is not exposed as a browser prepare/commit endpoint. Unimplemented
+// ownership readers remain explicit blockers; native install stays disabled.
+const desktopRestartBackend = new DesktopRestartBackend();
+const desktopRestartAdmission = createDesktopRestartRuntime({
+    chat: { getGeneration: chatRunRegistry.getGeneration, read: chatRunRegistry.snapshotActivity },
+    worktrees: createSessionWorktreeDesktopRestartReader(),
+    orchestrator: createGjcJobOrchestratorDesktopRestartReader(gjcJobOrchestrator),
+    'native-jobs': getProductionNativeJobsDesktopRestartReader(),
+    'gjc-worker': createGjcWorkerDesktopRestartReader(),
+    automation: createAutomationDesktopRestartReader(),
+    browser: createBrowserDesktopRestartReader(),
+    computer: createComputerDesktopRestartReader(),
+    shell: { getGeneration: getShellActivityGeneration, read: snapshotShellActivity },
+    'native-clients': createNativeDesktopRestartReader(),
+    watchers: { getGeneration: getSessionsWatcherActivityGeneration, read: snapshotSessionsWatcherActivity },
+    notifications: { getGeneration: getNotificationActivityGeneration, read: snapshotNotificationActivity },
+    'http-callbacks': { getGeneration: getHttpActivityGeneration, read: snapshotHttpActivity },
+    'internal-producers': { getGeneration: getInternalActivityGeneration, read: snapshotInternalActivity },
+    'ui-drafts': desktopRestartBackend.draftReader,
+}, {
+    owner: 'gjc-worker',
+    close: (fenceId) => getGjcWorkerSupervisor().fenceForDesktopRestart(fenceId),
+    release: (fenceId) => getGjcWorkerSupervisor().releaseDesktopRestartFence(fenceId),
+});
+desktopRestartBackend.attachAuthority(desktopRestartAdmission);
+// Install the same admission authority before startup catch-up, listeners, or
+// watcher initialization can accept work. Readers never perform configuration.
+configureGjcJobOrchestratorDesktopAdmission(desktopRestartAdmission);
+configureSessionWorktreeDesktopAdmission(desktopRestartAdmission);
+configureNativeDesktopRestartAdmission(desktopRestartAdmission);
+configureAutomationDesktopAdmission(desktopRestartAdmission);
+configureSessionsWatcherDesktopAdmission(desktopRestartAdmission);
+configureNotificationDesktopAdmission(desktopRestartAdmission);
+configureInternalDesktopAdmission(desktopRestartAdmission);
+getGjcWorkerSupervisor().configureDesktopRestartAdmission({
+    acquire: (source) => ({ release: desktopRestartAdmission.enter(source) }),
+});
 function gjcSpawn(message, options, writer) {
     return spawnGjcRun(message, {
         ...options,
@@ -131,6 +215,8 @@ function steerGjcChatRun(runId, message) {
 }
 
 const { app, server, wss } = createGjcAppFactory({
+    desktopRestartAdmission,
+    desktopUpdateRelay: new DesktopUpdateRelay({ restart: desktopRestartBackend }),
     authority: gjcJobAuthority,
     orchestrator: gjcJobOrchestrator,
     gitService: getProductionGjcJobGitService(
@@ -257,7 +343,7 @@ const expandWorkspacePath = (inputPath) => {
 };
 
 // Browse filesystem endpoint for project suggestions - uses existing getFileTree
-app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
+app.get('/api/browse-filesystem', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { path: dirPath } = req.query;
 
@@ -335,9 +421,9 @@ app.get('/api/browse-filesystem', authenticateToken, async (req, res) => {
         console.error('Error browsing filesystem:', error);
         res.status(500).json({ error: 'Failed to browse filesystem' });
     }
-});
+}));
 
-app.post('/api/create-folder', authenticateToken, async (req, res) => {
+app.post('/api/create-folder', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { path: folderPath } = req.body;
         if (!folderPath) {
@@ -375,10 +461,10 @@ app.post('/api/create-folder', authenticateToken, async (req, res) => {
         console.error('Error creating folder:', error);
         res.status(500).json({ error: 'Failed to create folder' });
     }
-});
+}));
 
 // Read file content endpoint
-app.get('/api/projects/:projectId/file', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/file', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { filePath } = req.query;
@@ -424,10 +510,10 @@ app.get('/api/projects/:projectId/file', authenticateToken, async (req, res) => 
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // Serve raw file bytes for previews and downloads.
-app.get('/api/projects/:projectId/files/content', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/files/content', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { path: filePath } = req.query;
@@ -470,16 +556,9 @@ app.get('/api/projects/:projectId/files/content', authenticateToken, async (req,
         const mimeType = mime.lookup(readablePath) || 'application/octet-stream';
         res.setHeader('Content-Type', mimeType);
 
-        // Stream the file
-        const fileStream = fs.createReadStream(readablePath);
-        fileStream.pipe(res);
-
-        fileStream.on('error', (error) => {
-            console.error('Error streaming file:', error);
-            if (!res.headersSent) {
-                res.status(500).json({ error: 'Error reading file' });
-            }
-        });
+        // Keep the admission lease until the source descriptor actually closes,
+        // including a disconnected viewer or a source read error.
+        await streamProjectFile(fs.createReadStream(readablePath), res);
 
     } catch (error) {
         console.error('Error serving binary file:', error);
@@ -487,10 +566,10 @@ app.get('/api/projects/:projectId/files/content', authenticateToken, async (req,
             res.status(error.statusCode || 500).json({ error: error.message });
         }
     }
-});
+}));
 
 // Save file content endpoint
-app.put('/api/projects/:projectId/file', authenticateToken, async (req, res) => {
+app.put('/api/projects/:projectId/file', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { filePath, content } = req.body;
@@ -564,9 +643,9 @@ app.put('/api/projects/:projectId/file', authenticateToken, async (req, res) => 
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
-app.get('/api/projects/:projectId/files', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/files', authenticateToken, asyncHandler(async (req, res) => {
     try {
 
         // Using fsPromises from import
@@ -597,7 +676,7 @@ app.get('/api/projects/:projectId/files', authenticateToken, async (req, res) =>
         console.error('[ERROR] File tree error:', error.message);
         res.status(error.statusCode || 500).json({ error: error.message });
     }
-});
+}));
 
 // ============================================================================
 // FILE OPERATIONS API ENDPOINTS
@@ -647,7 +726,7 @@ function validateFilename(name) {
 }
 
 // POST /api/projects/:projectId/files/create - Create new file or directory
-app.post('/api/projects/:projectId/files/create', authenticateToken, async (req, res) => {
+app.post('/api/projects/:projectId/files/create', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { path: parentPath, type, name } = req.body;
@@ -722,10 +801,10 @@ app.post('/api/projects/:projectId/files/create', authenticateToken, async (req,
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // PUT /api/projects/:projectId/files/rename - Rename file or directory
-app.put('/api/projects/:projectId/files/rename', authenticateToken, async (req, res) => {
+app.put('/api/projects/:projectId/files/rename', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { oldPath, newName } = req.body;
@@ -803,10 +882,10 @@ app.put('/api/projects/:projectId/files/rename', authenticateToken, async (req, 
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // DELETE /api/projects/:projectId/files - Delete file or directory
-app.delete('/api/projects/:projectId/files', authenticateToken, async (req, res) => {
+app.delete('/api/projects/:projectId/files', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId } = req.params;
         const { path: targetPath } = req.body;
@@ -869,7 +948,7 @@ app.delete('/api/projects/:projectId/files', authenticateToken, async (req, res)
             res.status(500).json({ error: error.message });
         }
     }
-});
+}));
 
 // POST /api/projects/:projectId/files/upload - Upload files
 // Dynamic import of multer for file uploads
@@ -882,19 +961,9 @@ const uploadFilesHandler = async (req, res) => {
     const stagingDir = await fsPromises.mkdtemp(path.join(uploadStagingRoot, 'request-'));
     await fsPromises.chmod(stagingDir, 0o700);
 
+    const ownedStorage = createProjectUploadStorage(stagingDir);
     const uploadMiddleware = multer({
-        storage: multer.diskStorage({
-            destination: (req, file, cb) => {
-                cb(null, stagingDir);
-            },
-            filename: (req, file, cb) => {
-                // Use a unique temp name, but preserve original name in file.originalname
-                // Note: file.originalname may contain path separators for folder uploads
-                const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-                // For temp file, just use a safe unique name without the path
-                cb(null, `upload-${uniqueSuffix}`);
-            }
-        }),
+        storage: ownedStorage.storage,
         limits: {
             fileSize: MAX_FILE_UPLOAD_SIZE_BYTES,
             files: MAX_FILE_UPLOAD_COUNT
@@ -906,6 +975,7 @@ const uploadFilesHandler = async (req, res) => {
     await new Promise((resolve) => {
         uploadMiddleware.array('files', MAX_FILE_UPLOAD_COUNT)(req, res, async (err) => {
         try {
+            await ownedStorage.settle();
             if (err) {
                 console.error('Multer error:', err);
                 if (err.code === 'LIMIT_FILE_SIZE') {
@@ -916,6 +986,7 @@ const uploadFilesHandler = async (req, res) => {
                 }
                 return res.status(500).json({ error: err.message });
             }
+            if (req.aborted) return;
             const { projectId } = req.params;
             const { targetPath, relativePaths, requestedFileCount: requestedFileCountRaw } = req.body;
 
@@ -1047,6 +1118,7 @@ const uploadFilesHandler = async (req, res) => {
             }
         } finally {
             try {
+                await ownedStorage.settle();
                 await fsPromises.rm(stagingDir, { recursive: true, force: true });
             } catch (cleanupError) {
                 console.error('Failed to clean upload staging directory:', cleanupError);
@@ -1057,14 +1129,14 @@ const uploadFilesHandler = async (req, res) => {
     });
 };
 
-app.post('/api/projects/:projectId/files/upload', authenticateToken, uploadFilesHandler);
+app.post('/api/projects/:projectId/files/upload', authenticateToken, asyncHandler(uploadFilesHandler));
 
 // Chat image uploads moved to POST /api/assets/images (server/modules/assets),
 // which stores them in the global ~/.gajae-app/assets folder.
 
 // Get token usage for a specific session. `projectId` is the DB primary key;
 // the Claude branch below resolves it to an absolute path via the DB.
-app.get('/api/projects/:projectId/sessions/:sessionId/token-usage', authenticateToken, async (req, res) => {
+app.get('/api/projects/:projectId/sessions/:sessionId/token-usage', authenticateToken, asyncHandler(async (req, res) => {
     try {
         const { projectId, sessionId } = req.params;
         const homeDir = os.homedir();
@@ -1336,7 +1408,7 @@ app.get('/api/projects/:projectId/sessions/:sessionId/token-usage', authenticate
         console.error('Error reading session token usage:', error);
         res.status(500).json({ error: 'Failed to read session token usage' });
     }
-});
+}));
 
 // Serve React app for all other routes (excluding static files)
 app.get('*', (req, res) => {
@@ -1576,17 +1648,110 @@ async function removeLocalServerMarker() {
 
 // Initialize database and start server
 async function startServer() {
+    const releaseStartup = enterInternalActivity('server:startup');
+    let startupFlight = Promise.resolve();
+    let jobsInitialized = false;
+    let shutdownStarted = false;
+    let shutdownExitCode = 0;
+    const shutdownRuntimeServices = async (exitCode = 0) => {
+        shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+        if (shutdownStarted) {
+            return;
+        }
+        shutdownStarted = true;
+        // Normal quit is not a restart-idle observation. Once this path
+        // starts, no reversible preparation may certify an idle runtime.
+        markInternalActivityUncertain('runtime_shutdown_started');
+        await startupFlight.catch(() => { });
+        // Persist interruption before any slower observer cleanup. Otherwise
+        // a not-yet-started worker can cancel admission back to ready while
+        // watcher shutdown awaits, erasing the interrupted-resume contract.
+        // A committed native restart has already proved every durable job
+        // idle and closed all ingress. Do not start a fresh native mutation
+        // after that commit; normal Quit still records interruption first.
+        let gjcShutdownFenced = desktopRestartAdmission.state === 'committed' || !jobsInitialized;
+        try {
+            if (!gjcShutdownFenced)
+                await gjcJobOrchestrator.interruptForShutdown();
+            gjcShutdownFenced = true;
+        }
+        catch (err) {
+            console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);
+        }
+        // Join the actual watcher startup/synchronization/exit lifetime.
+        // The old eager close ran before the asynchronous listen callback,
+        // and never closed the watcher that callback subsequently started.
+        try {
+            await closeSessionsWatcher();
+        }
+        catch (err) {
+            console.error('[Watcher] Shutdown is unconfirmed; refusing normal process exit:', err?.message || err);
+            process.exitCode = 1;
+            return;
+        }
+        await drainWebSocketClients(wss.clients);
+        server.close();
+        wss.close();
+        server.closeAllConnections?.();
+        try {
+            await shutdownGjcWorker();
+        }
+        catch (err) {
+            console.error('[GJC Worker] Worker tree reap failed during shutdown; refusing normal process exit:', err?.message || err);
+            process.exitCode = 1;
+            setInterval(() => { }, 60 * 60 * 1000);
+            return;
+        }
+        try {
+            await automationService.shutdown();
+        }
+        catch (err) {
+            console.error('[Automation] Sidecar shutdown failed:', err?.message || err);
+            process.exitCode = 1;
+            setInterval(() => { }, 60 * 60 * 1000);
+            return;
+        }
+        if (gjcShutdownFenced) {
+            try {
+                gjcJobOrchestrator.close();
+            }
+            catch (err) {
+                console.error('[GJC Jobs] Error closing authority clients during shutdown:', err?.message || err);
+            }
+        }
+        try {
+            await removeLocalServerMarker();
+        }
+        catch (err) {
+            console.error('[Local Server] Error removing server marker during shutdown:', err?.message || err);
+        }
+        process.exit(shutdownExitCode);
+    };
+    process.on('SIGTERM', () => void shutdownRuntimeServices());
+    process.on('SIGINT', () => void shutdownRuntimeServices());
+    const onServerError = (error) => {
+        console.error('[ERROR] HTTP/WebSocket server failed:', error);
+        void shutdownRuntimeServices(1);
+    };
+    server.on('error', onServerError);
+    wss.on('error', onServerError);
     try {
         // Initialize authentication database
-        await initializeDatabase();
-        await automationService.startBridge();
+        await (startupFlight = initializeDatabase());
+        if (shutdownStarted)
+            return;
+        await (startupFlight = automationService.startBridge());
+        if (shutdownStarted)
+            return;
+        jobsInitialized = true;
         try {
-            await gjcJobOrchestrator.reconcile();
-        } catch (error) {
+            await (startupFlight = gjcJobOrchestrator.reconcile());
+        }
+        catch (error) {
             console.error('[GJC Jobs] Authority reconciliation failed:', error?.message || error);
         }
-
-
+        if (shutdownStarted)
+            return;
         // Fail-closed exposure guard: desktop traffic stays on loopback unless
         // a trusted private-network override is explicitly configured.
         const exposure = evaluateExposure({
@@ -1595,114 +1760,73 @@ async function startServer() {
         });
         if (exposure.level === 'block') {
             console.error(`${c.warn('[SECURITY]')} ${exposure.message}`);
-            process.exit(1);
+            throw new Error(exposure.message);
         }
         if (exposure.level === 'warn') {
             console.warn(`${c.warn('[SECURITY]')} ${exposure.message}`);
         }
-
         // Check if running in production mode (dist folder exists)
         const distIndexPath = path.join(APP_ROOT, 'dist', 'index.html');
         const isProduction = fs.existsSync(distIndexPath);
-
         console.log('');
-
         if (isProduction) {
-            console.log(`${c.info('[INFO]')} To run in production mode, go to http://${DISPLAY_HOST}:${SERVER_PORT}`);            
+            console.log(`${c.info('[INFO]')} To run in production mode, go to http://${DISPLAY_HOST}:${SERVER_PORT}`);
         }
-
         console.log(`${c.info('[INFO]')} To run in development mode with hot-module replacement, go to http://${DISPLAY_HOST}:${VITE_PORT}`);
-   
-        server.listen(SERVER_PORT, HOST, async () => {
-            const address = server.address();
-            const port = typeof address === 'object' && address ? address.port : Number.parseInt(String(SERVER_PORT), 10);
-            const appRoot = APP_ROOT;
-            await writeLocalServerMarker(port).catch((error) => {
-                console.warn('[WARN] Could not write local server marker:', error.message);
-            });
-
-            if (process.env.GJC_DESKTOP === '1') {
-                console.log(JSON.stringify({
-                    kind: 'gajae-desktop-ready',
-                    pid: process.pid,
-                    host: HOST,
-                    port,
-                    protocolVersion: 1,
-                    version: RUNNING_VERSION,
-                }));
-            }
-
-            console.log('');
-            console.log(c.dim('═'.repeat(63)));
-            console.log(`  ${c.bright('Gajae Code App Server - Ready')}`);
-            console.log(c.dim('═'.repeat(63)));
-            console.log('');
-            console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + port)}`);
-            console.log(`${c.info('[INFO]')} App root: ${c.dim(appRoot)}`);
-            console.log(`${c.tip('[TIP]')}  Run "gajae-app status" for full configuration details`);
-            console.log('');
-
-            // Start watching the projects folder for changes
-            await initializeSessionsWatcher();
-
-
-        });
-
-        await closeSessionsWatcher();
-        let shutdownStarted = false;
-        const shutdownRuntimeServices = async () => {
-            if (shutdownStarted) {
-                return;
-            }
-            shutdownStarted = true;
-
-            let gjcShutdownFenced = false;
-            try {
-                await gjcJobOrchestrator.interruptForShutdown();
-                gjcShutdownFenced = true;
-            } catch (err) {
-                console.error('[GJC Jobs] Shutdown fence failed; forcing worker tree reap while preserving authority failure evidence:', err?.message || err);
-            }
-
-            await drainWebSocketClients(wss.clients);
-            server.close();
-            wss.close();
-            server.closeAllConnections?.();
-
-            try {
-                await shutdownGjcWorker();
-            } catch (err) {
-                console.error('[GJC Worker] Worker tree reap failed during shutdown; refusing normal process exit:', err?.message || err);
-                process.exitCode = 1;
-                setInterval(() => {}, 60 * 60 * 1000);
-                return;
-            }
-
-            try {
-                await automationService.shutdown();
-            } catch (err) {
-                console.error('[Automation] Sidecar shutdown failed:', err?.message || err);
-            }
-
-            if (gjcShutdownFenced) {
+        // Reserve the asynchronous listen callback before releasing startup.
+        // Native readiness can be observed before marker/watcher setup finishes.
+        const releaseReady = enterInternalActivity('server:listen-ready', true);
+        try {
+            await (startupFlight = listenForStartup(server, wss, Number(SERVER_PORT), HOST, async () => {
+                if (shutdownStarted)
+                    return;
                 try {
-                    gjcJobOrchestrator.close();
-                } catch (err) {
-                    console.error('[GJC Jobs] Error closing authority clients during shutdown:', err?.message || err);
+                    const address = server.address();
+                    const port = typeof address === 'object' && address ? address.port : Number.parseInt(String(SERVER_PORT), 10);
+                    const appRoot = APP_ROOT;
+                    await writeLocalServerMarker(port).catch((error) => {
+                        console.warn('[WARN] Could not write local server marker:', error.message);
+                    });
+                    if (shutdownStarted)
+                        return;
+                    if (process.env.GJC_DESKTOP === '1') {
+                        console.log(JSON.stringify({
+                            kind: 'gajae-desktop-ready',
+                            pid: process.pid,
+                            host: HOST,
+                            port,
+                            protocolVersion: 1,
+                            version: RUNNING_VERSION,
+                        }));
+                    }
+                    console.log('');
+                    console.log(c.dim('═'.repeat(63)));
+                    console.log(`  ${c.bright('Gajae Code App Server - Ready')}`);
+                    console.log(c.dim('═'.repeat(63)));
+                    console.log('');
+                    console.log(`${c.info('[INFO]')} Server URL:  ${c.bright('http://' + DISPLAY_HOST + ':' + port)}`);
+                    console.log(`${c.info('[INFO]')} App root: ${c.dim(appRoot)}`);
+                    console.log(`${c.tip('[TIP]')}  Run "gajae-app status" for full configuration details`);
+                    console.log('');
+                    // Start watching the projects folder for changes
+                    await initializeSessionsWatcher();
                 }
-            }
-            try {
-                await removeLocalServerMarker();
-            } catch (err) {
-                console.error('[Local Server] Error removing server marker during shutdown:', err?.message || err);
-            }
-            process.exit(0);
-        };
-        process.on('SIGTERM', () => void shutdownRuntimeServices());
-        process.on('SIGINT', () => void shutdownRuntimeServices());
-    } catch (error) {
+                catch (error) {
+                    markInternalActivityUncertain('server_ready_failed');
+                    console.error('[ERROR] Server readiness setup failed:', error);
+                }
+            }));
+        }
+        finally {
+            releaseReady();
+        }
+    }
+    catch (error) {
         console.error('[ERROR] Failed to start server:', error);
-        process.exit(1);
+        await shutdownRuntimeServices(1);
+    }
+    finally {
+        releaseStartup();
     }
 }
 

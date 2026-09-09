@@ -1,4 +1,34 @@
+export type { BrowserTabState, BrowserSessionState } from '../../../shared/browserSessionState.js';
+
 export const BROWSER_PROTOCOL_VERSION = 1 as const;
+
+/** Child-owned observation, bound to one initialize handshake and request tail. */
+export type BrowserChildActivity = {
+  version: 1;
+  epoch: string;
+  revision: number;
+  requestSequence: number;
+  starting: number;
+  queued: number;
+  running: number;
+  callbacks: number;
+  settling: number;
+  retained: number;
+  browserAlive: boolean;
+  unknown: readonly string[];
+};
+
+export function isBrowserChildActivity(value: unknown): value is BrowserChildActivity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const activity = value as Record<string, unknown>;
+  const identifier = (field: unknown): field is string => typeof field === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(field);
+  return Object.keys(activity).length === 12 && activity.version === 1 && identifier(activity.epoch)
+    && ['revision', 'requestSequence', 'starting', 'queued', 'running', 'callbacks', 'settling', 'retained']
+      .every((key) => Number.isSafeInteger(activity[key]) && (activity[key] as number) >= 0)
+    && typeof activity.browserAlive === 'boolean'
+    && Array.isArray(activity.unknown) && activity.unknown.length <= 32 && activity.unknown.every(identifier);
+}
 
 export type BrowserCommand =
   | { action: 'navigate'; url: string; waitUntil?: BrowserWaitUntil }
@@ -29,21 +59,6 @@ export type BrowserInput =
   | { kind: 'text'; text: string }
   | { kind: 'viewport'; width: number; height: number };
 
-export type BrowserTabState = {
-  id: string;
-  title: string;
-  url: string;
-  loading: boolean;
-  canGoBack: boolean;
-  canGoForward: boolean;
-};
-
-export type BrowserSessionState = {
-  sessionId: string;
-  activeTabId: string | null;
-  tabs: BrowserTabState[];
-};
-
 export type BrowserRequestMethod =
   | 'initialize'
   | 'status'
@@ -63,6 +78,8 @@ export type BrowserRequestFrame = {
   method: BrowserRequestMethod;
   sessionId?: string;
   payload: Record<string, unknown>;
+  /** Monotonic within this parent-owned sidecar transport. */
+  sequence?: number;
 };
 
 export type BrowserResponseFrame = {

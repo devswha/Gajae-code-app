@@ -6,6 +6,7 @@ import { isAbsolute } from 'node:path';
 import express from 'express';
 
 import { sessionsDb } from '../modules/database/repositories/sessions.db.js';
+import { asyncHandler } from '../shared/utils.js';
 
 const PLATFORM_OPENERS = {
   darwin: { command: 'open', args: (target) => [target] },
@@ -26,7 +27,7 @@ function defaultOpener(target) {
 export function createSystemRouter({ opener = defaultOpener } = {}) {
   const router = express.Router();
 
-  router.post('/open-file', async (req, res) => {
+  router.post('/open-file', asyncHandler(async (req, res) => {
     const target = req.body?.path;
     if (typeof target !== 'string' || !isAbsolute(target)) {
       return res.status(400).json({ error: 'An absolute path is required.' });
@@ -45,7 +46,7 @@ export function createSystemRouter({ opener = defaultOpener } = {}) {
       console.error('Failed to open file externally:', error);
       return res.status(500).json({ error: 'Failed to open the file' });
     }
-  });
+  }));
 
   /**
    * The desktop shell's webview loads the server's loopback origin, where
@@ -54,7 +55,7 @@ export function createSystemRouter({ opener = defaultOpener } = {}) {
    * machine as the person, so it hands the URL to the OS browser. Only
    * https: is accepted: this is for web pages, not for schemes.
    */
-  router.post('/open-url', async (req, res) => {
+  router.post('/open-url', asyncHandler(async (req, res) => {
     const target = safeExternalUrl(req.body?.url);
     if (!target) {
       return res.status(400).json({ error: 'An https URL is required.' });
@@ -67,11 +68,11 @@ export function createSystemRouter({ opener = defaultOpener } = {}) {
       console.error('Failed to open URL externally:', error);
       return res.status(500).json({ error: 'Failed to open the link' });
     }
-  });
+  }));
 
   // Workspace Browser also visits local HTTP development servers. Keep that
   // explicit action separate from the HTTPS-only sign-in/docs link contract.
-  router.post('/open-browser-url', async (req, res) => {
+  router.post('/open-browser-url', asyncHandler(async (req, res) => {
     const target = safeBrowserUrl(req.body?.url);
     if (!target) return res.status(400).json({ error: 'An HTTP or HTTPS page URL is required.' });
     try {
@@ -81,7 +82,7 @@ export function createSystemRouter({ opener = defaultOpener } = {}) {
       console.error('Failed to open browser page externally:', error);
       return res.status(500).json({ error: 'Failed to open the page' });
     }
-  });
+  }));
 
   /**
    * Everything a bug report about a session needs, in one paste: the DB row,
@@ -89,7 +90,7 @@ export function createSystemRouter({ opener = defaultOpener } = {}) {
    * screenshot and a retelling; this makes "Copy debug info" carry the
    * evidence instead. Text on purpose: it goes into a chat message.
    */
-  router.post('/debug-bundle', async (req, res) => {
+  router.post('/debug-bundle', asyncHandler(async (req, res) => {
     const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
     try {
       const bundle = await buildDebugBundle(sessionId || null);
@@ -98,7 +99,7 @@ export function createSystemRouter({ opener = defaultOpener } = {}) {
       console.error('Failed to assemble the debug bundle:', error);
       res.status(500).json({ error: 'Failed to assemble the debug bundle' });
     }
-  });
+  }));
 
   return router;
 }

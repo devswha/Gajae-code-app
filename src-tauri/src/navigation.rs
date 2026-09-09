@@ -40,7 +40,13 @@ impl LoopbackOrigin {
 
 pub fn plugin() -> TauriPlugin<tauri::Wry> {
     Builder::new("desktop-navigation")
-        .on_navigation(|webview, url| webview.app_handle().state::<LoopbackOrigin>().permits(url))
+        .on_navigation(|webview, url| {
+            #[cfg(target_os = "macos")]
+            if !crate::updater_restart::permits_navigation(webview.app_handle(), url) {
+                return false;
+            }
+            webview.app_handle().state::<LoopbackOrigin>().permits(url)
+        })
         .build()
 }
 

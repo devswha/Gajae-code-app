@@ -1,4 +1,73 @@
 {
+  "about": {
+    "updateAvailable": "Aggiornamento disponibile: {{version}}"
+  },
+  "desktopUpdate": {
+    "update": "Aggiorna",
+    "updating": "Aggiornamento in corso…",
+    "manualHelp": "Aggiorna avvia il download e richiede un riavvio sicuro. I controlli non scaricano né installano aggiornamenti.",
+    "awaitingOperation": "In attesa del termine dell’operazione nativa precedente. Non riprovare ancora.",
+    "targetVersion": "Versione {{version}}",
+    "showDetails": "Mostra dettagli dell’aggiornamento desktop: {{version}} — {{status}}",
+    "dismiss": "Nascondi questo avviso di aggiornamento",
+    "deferredHelp": "Termina le attività in corso e controlla di nuovo. L’installazione non verrà ritentata automaticamente.",
+    "recoveryHelp": "Il ripristino richiede attenzione nell’app desktop. Qui è possibile solo aggiornare lo stato.",
+    "updateErrors": {
+      "busy": "Le attività in corso hanno impedito il riavvio. Terminale, poi fai di nuovo clic su Aggiorna.",
+      "changed": "La destinazione dell’aggiornamento è cambiata. Controlla la versione mostrata prima di fare di nuovo clic su Aggiorna.",
+      "failed": "Non è stato possibile completare l’aggiornamento. Controlla lo stato, poi riprova."
+    },
+    "reasons": {
+      "discoveryFailed": "La ricerca delle versioni non è riuscita.",
+      "cacheInvalid": "La verifica dell’aggiornamento nella cache non è riuscita.",
+      "preparationCancelled": "La preparazione dell’aggiornamento è stata annullata.",
+      "preferencesNotPersisted": "Non è stato possibile salvare l’impostazione dei controlli automatici."
+    },
+    "title": "Aggiornamenti desktop",
+    "connecting": "Connessione al servizio di aggiornamento…",
+    "unconfirmed": "L’accesso agli aggiornamenti desktop non è stato confermato.",
+    "lastConfirmed": "Ultimo stato nativo confermato; lo stato attuale non è confermato.",
+    "unknownVersion": "Versione non confermata",
+    "incomplete": "La ricerca delle versioni è incompleta. Non è confermata l’individuazione della versione più recente.",
+    "preparationOnly": "L’installazione non è attualmente disponibile. Un aggiornamento preparato non è ancora installato.",
+    "productVersion": "Versione dell’app",
+    "desktopVersion": "Build desktop",
+    "targetProductVersion": "Versione di destinazione dell’app",
+    "targetDesktopVersion": "Build desktop di destinazione",
+    "progress": "Avanzamento del download",
+    "knownProgress": "{{downloaded}} / {{total}} byte",
+    "unknownTotal": "{{downloaded}} byte scaricati; dimensione totale sconosciuta.",
+    "unknownProgress": "In attesa dell’avanzamento del download.",
+    "automatic": "Cerca aggiornamenti automaticamente",
+    "automaticHelp": "I controlli cercano solo nuove versioni. Download e installazione richiedono un clic su Aggiorna. Le modifiche appaiono dopo la conferma dell’app desktop.",
+    "confirmingSetting": "In attesa della conferma nativa dell’impostazione…",
+    "confirmingRestart": "Richiesta di riavvio sicuro…",
+    "check": "Cerca aggiornamenti",
+    "refresh": "Aggiorna stato",
+    "retry": "Ripeti ricerca",
+    "restart": "Aggiorna e riavvia",
+    "osPrompt": "macOS potrebbe chiedere l’approvazione dell’amministratore in una finestra di sistema. Approva o annulla lì; non inserire credenziali qui. Il riavvio può essere rinviato durante attività in corso.",
+    "notes": "Note di rilascio",
+    "phases": {
+      "available": "Aggiornamento disponibile",
+      "disabled": "Aggiornamenti disattivati",
+      "idle": "In attesa del prossimo controllo",
+      "checking": "Ricerca delle versioni",
+      "downloading": "Download dell’aggiornamento",
+      "verifying": "Verifica dell’aggiornamento",
+      "ready": "Aggiornamento preparato",
+      "deferred": "Aggiornamento rinviato",
+      "error": "Errore di aggiornamento",
+      "applying": "Applicazione dell’aggiornamento",
+      "restarting": "Riavvio in corso",
+      "recovery": "Ripristino necessario"
+    },
+    "errors": {
+      "unavailable": "Il servizio di aggiornamento desktop autenticato non è raggiungibile. Lo stato attuale è sconosciuto.",
+      "invalidResponse": "Il servizio di aggiornamento ha restituito una risposta non supportata. I controlli di installazione restano disabilitati.",
+      "timeout": "Attesa della risposta terminata; l’operazione nativa potrebbe essere ancora in corso. Aggiorna lo stato prima di riprovare."
+    }
+  },
   "close": "Chiudi impostazioni",
   "title": "Opzioni",
   "account": {

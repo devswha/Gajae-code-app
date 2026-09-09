@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { cleanup, render, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, within } from '@testing-library/react';
 import { createInstance } from 'i18next';
 import { createElement, type ComponentProps } from 'react';
 import type { DropzoneInputProps, DropzoneRootProps } from 'react-dropzone';
@@ -85,10 +85,40 @@ function composer(props: ComposerProps) {
   return createElement(I18nextProvider, { i18n }, createElement(ChatComposer, props));
 }
 
+test('the chat toolbar does not expose a project or worktree selector', async () => {
+  await i18n.changeLanguage('en');
+  const view = render(composer(composerProps()));
+  assert.equal(view.queryByRole('combobox', { name: 'Run location' }), null);
+  assert.equal(view.queryByText('New worktree'), null);
+  assert.equal(view.queryByText('Project', { exact: true }), null);
+});
+
 function slot(container: HTMLElement, name: string) {
   const element = container.querySelector<HTMLElement>(`[data-slot="prompt-input${name ? `-${name}` : ''}"]`);
   assert.ok(element, `missing prompt input ${name || 'form'}`);
   return element;
+}
+
+for (const language of ['en', 'ko']) {
+  test(`${language} draft storage failure exposes a real retry action without sending`, async () => {
+    await i18n.changeLanguage(language);
+    let retries = 0;
+    let sends = 0;
+    const view = render(composer(composerProps({
+      draftPersistence: { phase: 'error', reason: 'conflict' },
+      onRetryDraftPersistence: async () => { retries += 1; return true; },
+      onSubmit: () => { sends += 1; },
+      queuedDrafts: [{ id: 'recovered', content: 'Review me', images: [], requiresReview: true }],
+    })));
+    const warning = view.getByRole('alert');
+    assert.ok(warning.textContent?.includes(i18n.t('input.draftPersistence.failed', { ns: 'chat' })));
+    const retry = within(warning).getByRole('button', { name: i18n.t('input.draftPersistence.retry', { ns: 'chat' }) });
+    await act(async () => { fireEvent.click(retry); });
+    assert.equal(retries, 1);
+    assert.equal(sends, 0);
+    assert.ok(view.getByText(`· ${i18n.t('input.queue.reviewBeforeSending', { ns: 'chat' })}`));
+    assert.equal(view.queryByText(i18n.t('input.queue.willSend', { ns: 'chat' })), null);
+  });
 }
 
 // happy-dom does not calculate flex geometry. These assertions protect the
@@ -136,11 +166,11 @@ for (const language of ['en', 'ko']) {
   });
 }
 
-test('model and permission slots retain their widths as metadata loads beside a hidden hint', async () => {
+test('model and permission slots retain bounded sizing as metadata loads beside a hidden hint', async () => {
   await i18n.changeLanguage('en');
   const props = composerProps({ input: 'Draft message' });
   const view = render(composer({
-    ...props, modelOptions: [], modelPresetOptions: [], modelPresetsLoading: true, permissions: null,
+    ...props, modelPreset: 'default', modelOptions: [], modelPresetOptions: [], modelPresetsLoading: true, permissions: null,
   }));
   const tools = slot(view.container, 'tools');
   const model = within(tools).getByRole('button', { name: 'Model and reasoning settings' });
@@ -148,10 +178,13 @@ test('model and permission slots retain their widths as metadata loads beside a 
   const permissionSlot = tools.children[3];
   const skills = within(tools).getByRole('button', { name: english.input.skills.label });
 
-  assert.ok(modelSlot.classList.contains('w-40'));
-  assert.ok(modelSlot.classList.contains('sm:w-56'));
+  assert.ok(modelSlot.classList.contains('w-fit'));
   assert.ok(modelSlot.classList.contains('max-w-full'), 'model slot must fit a narrow tools row');
+  assert.ok(modelSlot.classList.contains('sm:max-w-56'));
+  assert.equal(modelSlot.classList.contains('w-40'), false);
+  assert.equal(modelSlot.classList.contains('sm:w-56'), false);
   assert.ok(modelSlot.classList.contains('shrink-0'));
+  assert.ok(model.querySelector('.w-24'), 'loading model slot must keep a visible skeleton width');
   assert.ok(permissionSlot.classList.contains('w-28'));
   assert.ok(permissionSlot.classList.contains('shrink-0'));
   assert.equal(permissionSlot.getAttribute('aria-hidden'), 'true');

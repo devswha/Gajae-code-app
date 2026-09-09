@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "gjcSdk": "0.16.4",
   "bun": "1.4.0",
   "natives": "0.16.4",
@@ -57,5 +57,175 @@
         }
       ]
     }
+  },
+  "sdkLifecycle": {
+    "id": "gjc-sdk-lifecycle-v1",
+    "packages": {
+      "@gajae-code/coding-agent": "0.16.4",
+      "@gajae-code/agent-core": "0.16.4",
+      "@gajae-code/ai": "0.16.4"
+    },
+    "files": [
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/session.ts",
+        "sha256": "6bc35899fa1386ab4887537eb0bdd068289291d588b0ce4cd1f1660d4075841c"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/session/agent-session.ts",
+        "sha256": "838658da725233a0628bf813fc4ca9ff7f060e056636cebcfe6eb03b9a1ecc29"
+      },
+      {
+        "package": "@gajae-code/agent-core",
+        "path": "src/run-resource-ledger.ts",
+        "sha256": "ef54970d42a667e786a92c622d5e89d2d624e3e30ee37842aedddd546efcf390"
+      },
+      {
+        "package": "@gajae-code/agent-core",
+        "path": "src/agent-loop.ts",
+        "sha256": "efccd78060495147b0475aabb69fe10c5cefdabe7bf88b618b16c0ad49e6eab6"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/config/model-registry.ts",
+        "sha256": "60529fec5306da95d08127b014ee7b13e83adf6a5e6ebdfff3df53010fff4f67"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/config/model-preset-registry.ts",
+        "sha256": "0a7f77c3d3a1cdf09db189d22bfefd4129de6adf3dc5cf72a18b6ef0a7b77835"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/auth-storage.ts",
+        "sha256": "a005e9f1d9d3dc515ae04668ab364aef497f7fbce093d12fac97182981240581"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/config/settings.ts",
+        "sha256": "9e31c89d986f2f200ec6fb35dd4d68be9f3f5987d80eead57bf1a9d1d8303f38"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/utils/event-stream.ts",
+        "sha256": "eb81b0961f3ef800905efb80245049c88b5a0c498e0b79a23caafedc8e519559"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/utils/idle-iterator.ts",
+        "sha256": "fbc6742abee2bcf20d22fa174ba7d21e688fde5cec13b32401fe36225ea90fd3"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/stream.ts",
+        "sha256": "404db53024a885ef16e6749911964b228d6670d3796e00acfe245956dad28a22"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/register-builtins.ts",
+        "sha256": "abceac1f4e6e107da1f0bef71000ba4085508c1f56812127ecf6d556ee751a9d"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/amazon-bedrock.ts",
+        "sha256": "972549a554509bc2c2e1f0723c197aadd339c10c8345c0b78420b8499821fd65"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/anthropic.ts",
+        "sha256": "eee1c52fdd77f53dad676297560ca5722553088cf9888e7300e3d77507e4eefc"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/azure-openai-responses.ts",
+        "sha256": "403196951817447052fbe2f0b059679923f64ce2f1322bcdc44cc1b0a3ff0075"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/cursor.ts",
+        "sha256": "3c8cbb82d7e210b126a627292e492ba010ffabe37f408b4dcfe017f2db0593ba"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/google-gemini-cli.ts",
+        "sha256": "0a6d88064e796dfb9890af1e88a5ea49b5844128c8a4900b4bc43f765693677b"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/google-shared.ts",
+        "sha256": "8348e5dfdc0771292695295738024f339219ffa12d121644ce5b756b49a7871d"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/kiro-api-key.ts",
+        "sha256": "b687ff7b23bcd08640652dc910303d1534069569a162082be5e6604baba17d2e"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/kiro-codewhisperer.ts",
+        "sha256": "1769145787803a0da584b18ada0393364a576d764f7853e3cd05cf3f63be02fb"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/ollama.ts",
+        "sha256": "d2b1272d91d46b92fd494605b78d0619c8f072b45e68ba8f2ef25cfc5aab7df0"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/openai-completions.ts",
+        "sha256": "b0ba241c2645acf199dfcab65091d755286b06e5aea949d3eb9512fe25a74323"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/openai-responses.ts",
+        "sha256": "bb6991c117a20f2e38ca7d018db3c781c74bbe2c0843b698ef38929929099d26"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/openai-codex-responses.ts",
+        "sha256": "961ea9317a7852759c43555ef8a72901025cb17f6de2bfb86e72446197cc87eb"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/openai-anthropic-shim.ts",
+        "sha256": "ac5bef1d48b06dbf714fb0afa908d3c57e437050e628d6d37ebf33ee06ea6adb"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/gitlab-duo.ts",
+        "sha256": "9a742a461ebe03e0a13f55a756a32ac146518312ce21f5e64f022919b5d15f71"
+      },
+      {
+        "package": "@gajae-code/ai",
+        "path": "src/providers/pi-native-client.ts",
+        "sha256": "64be63baba7dfeac15bfa1a4779d1cf8d3be6c8f9ef14f92ca8ea0b28c829d49"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/host/host.ts",
+        "sha256": "12e497ea081ca73337288cd5ea84f85d8be141372547665bd355beb6628e19ae"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/host/session-runtime.ts",
+        "sha256": "62ba771a376315285efb28ab50676a0ed2d0e1c64e637738bd04eed4e6430cff"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/host/websocket-transport.ts",
+        "sha256": "33ec5a5eb9b7bcee8828205990be0843095f490a8ccecc3166ad94ef844d65a2"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/prompt-deadline-manager.ts",
+        "sha256": "6c5867ff16c5dfc7a550a0c3dfa67309a9ae234cf23253ab7739c55dd790e295"
+      },
+      {
+        "package": "@gajae-code/coding-agent",
+        "path": "src/sdk/host/query/revision-store.ts",
+        "sha256": "db47586d7c821a7c7d5aaf9b2ea6c1dacf2a5c83919babda8a22b4017d6c6e21"
+      }
+    ]
   }
 }

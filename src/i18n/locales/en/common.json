@@ -116,7 +116,13 @@
     "tasks": {
       "empty": "Nothing planned yet",
       "emptyHint": "When the agent keeps a todo list in this session, it shows here.",
-      "progress": "{{done}} of {{total}} done"
+      "progress": "{{done}} of {{total}} done",
+      "status": {
+        "pending": "Pending",
+        "in_progress": "In progress",
+        "completed": "Completed",
+        "abandoned": "Abandoned"
+      }
     },
     "browser": {
       "address": "Web address",

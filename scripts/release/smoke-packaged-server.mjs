@@ -158,6 +158,7 @@ export function launch(target, dataDirectory, projectDir) {
 }
 
 async function nativeClosureSmoke(target) {
+  await extractZipPatchSmoke(target);
   const source = `
     import { createRequire } from 'node:module';
     import { createHash } from 'node:crypto';
@@ -222,6 +223,27 @@ async function nativeClosureSmoke(target) {
       : reject(new Error(`Packaged native closure smoke failed (${code}): ${stderr || stdout}`)));
   });
   if (target.serverArchive) await workerInitializationSmoke(target);
+}
+
+// Execute the verifier shipped in the extracted payload, not a checkout
+// import. This check precedes native/module loading in every packaged smoke.
+export async function extractZipPatchSmoke(target) {
+  await assertOutOfTree(target.cwd, 'extract-zip packaged patch smoke');
+  await new Promise((resolve, reject) => {
+    const child = spawn(target.command, ['scripts/apply-extract-zip-patch.mjs', '--check'], {
+      cwd: target.cwd, env: target.env, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    const timer = setTimeout(() => { child.kill(); reject(new Error('Packaged extract-zip patch check timed out.')); }, 30_000);
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.stderr.on('data', chunk => { output += chunk; });
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error('Packaged extract-zip patch check failed (' + code + '): ' + output));
+    });
+  });
 }
 
 export async function workerInitializationSmoke(target, { timeoutMs = 45_000 } = {}) {

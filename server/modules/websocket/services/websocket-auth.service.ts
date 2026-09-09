@@ -2,6 +2,7 @@ import type { VerifyClientCallbackSync } from 'ws';
 
 import { hasValidApiKey } from '@/middleware/auth.js';
 import { isAllowedRequestOrigin } from '@/shared/request-origin.js';
+import type { DesktopWorkAdmission } from '@/shared/interfaces.js';
 import type { AuthenticatedWebSocketRequest } from '@/shared/types.js';
 
 import { parseAllowedHosts } from '../../../../shared/networkHosts.js';
@@ -17,6 +18,7 @@ type WebSocketAuthDependencies = Readonly<{
   desktopAuth?: { authenticateWebSocket: (request: { headers: { origin?: string; cookie?: string } }) => boolean };
   /** Raw `ALLOWED_HOSTS`; defaults to the process environment. */
   allowedHosts?: string | undefined;
+  desktopRestartAdmission?: DesktopWorkAdmission;
 }>;
 
 function acceptsOrigin(request: AuthenticatedWebSocketRequest, configuredHosts?: string): boolean {
@@ -56,7 +58,17 @@ export function verifyWebSocketClient(info: Parameters<VerifyClientCallbackSync<
   // here too, before any chat, terminal, or browser socket gains owner access.
   if (!hasValidApiKey(upgradeRequest)) return false;
 
-  const owner = dependencies.authenticateWebSocket();
+  let release: (() => void) | undefined;
+  let owner: AuthenticatedOwner | null;
+  try {
+    release = dependencies.desktopRestartAdmission?.enter('ws:authenticate');
+    owner = dependencies.authenticateWebSocket();
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'DESKTOP_RESTART_FENCED') return false;
+    throw error;
+  } finally {
+    release?.();
+  }
   if (!owner) {
     console.log('[WARN] Rejected WebSocket upgrade: no authenticated user');
     return false;

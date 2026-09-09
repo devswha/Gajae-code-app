@@ -23,10 +23,11 @@ import { chatRunRegistry } from '../modules/websocket/services/chat-run-registry
 import { connectedClients } from '../modules/websocket/services/websocket-state.service.js';
 
 import { GjcGitClient } from './gjc-git-client.js';
-import { JobOrchestrator, type GitWorktrees, type JobSupervisor } from './gjc-job-orchestrator.js';
+import { DesktopRestartAuthority } from './desktop-restart-authority.js';
+import { createGjcJobOrchestratorDesktopRestartReader, JobOrchestrator, type GitWorktrees, type JobSupervisor } from './gjc-job-orchestrator.js';
 import { GjcJobsClient } from './gjc-jobs-client.js';
 import { readSessionLocation, resolveSessionWorkspacePath, validateSessionRepository } from './session-worktree-paths.js';
-import { abortSessionWorktreeRun, prepareSessionWorktreeRun, sessionWorktreeWorkerHandle } from './session-worktree-runtime.js';
+import { abortSessionWorktreeRun, configureSessionWorktreeDesktopAdmission, createSessionWorktreeDesktopRestartReader, prepareSessionWorktreeRun, sessionWorktreeWorkerHandle } from './session-worktree-runtime.js';
 
 const execFile = promisify(execFileCallback);
 const runOptions = { model: 'openai-codex/gpt-6-astra', effort: 'xhigh' };
@@ -127,6 +128,136 @@ async function fixture(t: test.TestContext, options: { delayPreparation?: boolea
   });
   return { root, repository, project, created, jobs, git, supervisor, orchestrator, messages, writer, workers, makeTicket, preparation, isPreparing: () => preparing };
 }
+
+function worktreeDesktopAuthority(t: test.TestContext, orchestrator: JobOrchestrator) {
+  const reader = createSessionWorktreeDesktopRestartReader();
+  const authority = new DesktopRestartAuthority({
+    requiredOwners: ['worktrees', 'orchestrator'],
+    ownerReaders: { worktrees: reader, orchestrator: createGjcJobOrchestratorDesktopRestartReader(orchestrator) },
+  });
+  configureSessionWorktreeDesktopAdmission(authority);
+  orchestrator.configureDesktopAdmission(authority);
+  t.after(() => configureSessionWorktreeDesktopAdmission());
+  return { authority, reader };
+}
+const worktreeDesktopTick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+test('desktop worktree reader is pure and unused ticket disposal closes its single-use admission', async (t) => {
+  const f = await fixture(t);
+  const { authority, reader } = worktreeDesktopAuthority(t, f.orchestrator);
+  const before = reader.read();
+  assert.equal(before.owner, 'worktrees');
+  assert.deepEqual(reader.read(), before);
+  assert.equal(reader.getGeneration(), before.generation);
+  assert.equal(f.workers.length, 0);
+  const ticket = f.makeTicket();
+  assert.equal(reader.read().starting, before.starting + 1);
+  assert.notEqual(reader.getGeneration(), before.generation);
+  assert.equal((await authority.prepare({ attemptId: 'unused-ticket', epoch: 'desktop-1' })).ok, false);
+  ticket.dispose();
+  const after = reader.read();
+  ticket.dispose();
+  assert.deepEqual(reader.read(), after);
+  assert.deepEqual({ ...after, generation: before.generation }, before);
+  await assert.rejects(ticket.run('disposed', runOptions, f.writer), /disposed/);
+  assert.equal((await authority.snapshot()).idle, true);
+  const prepared = await authority.prepare({ attemptId: 'new-ticket-fenced', epoch: 'desktop-1' });
+  assert.equal(prepared.ok, true);
+  assert.throws(() => prepareSessionWorktreeRun(f.created.sessionId, () => f.orchestrator), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.equal(f.workers.length, 0);
+  if (prepared.ok) authority.cancel(prepared.token);
+});
+
+test('disposal and chat registry clearing during paused preparation cannot hide the worktree lifetime', async (t) => {
+  const f = await fixture(t, { delayPreparation: true });
+  const { authority, reader } = worktreeDesktopAuthority(t, f.orchestrator);
+  const ticket = f.makeTicket();
+  const running = ticket.run('paused preparation', runOptions, f.writer);
+  await until(f.isPreparing);
+  ticket.dispose();
+  chatRunRegistry.clearAll();
+  assert.ok(reader.read().running > 0 && reader.read().settling > 0);
+  assert.equal((await authority.prepare({ attemptId: 'disposed-preparation', epoch: 'desktop-1' })).ok, false);
+  assert.equal(ticket.aborted, false);
+  f.preparation.resolve();
+  await until(() => f.workers.length === 1);
+  assert.equal(sessionWorktreeWorkerHandle(ticket.abortHandle), f.workers[0].input.runId);
+  f.workers[0].input.writer.send({ kind: 'complete', exitCode: 0 });
+  assert.equal((await authority.snapshot()).idle, false);
+  assert.equal(f.messages.some((message) => (message as { kind?: string }).kind === 'complete'), false);
+  f.workers[0].finish();
+  await running;
+  await worktreeDesktopTick();
+  assert.equal(sessionWorktreeWorkerHandle(ticket.abortHandle), undefined);
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('a live ticket may continue during a paused prepare while new roots remain fenced', async (t) => {
+  const f = await fixture(t);
+  // This accepted owner predates authority injection, so the reader (rather
+  // than a retained ingress lease) must protect the entire transfer.
+  const ticket = f.makeTicket();
+  const { authority } = worktreeDesktopAuthority(t, f.orchestrator);
+  const preparing = authority.prepare({ attemptId: 'owned-continuation', epoch: 'desktop-1' });
+  assert.equal(authority.state, 'preparing');
+  const running = ticket.run('owned continuation', runOptions, f.writer);
+  const rejected = assert.rejects(f.orchestrator.start('gjc', 'other-session', f.repository, 'new root', { writer: f.writer }), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.throws(() => prepareSessionWorktreeRun(f.created.sessionId, () => f.orchestrator), { code: 'DESKTOP_RESTART_FENCED' });
+  assert.equal((await preparing).ok, false);
+  await rejected;
+  await until(() => f.workers.length === 1);
+  assert.equal(ticket.aborted, false);
+  f.workers[0].finish();
+  await running;
+  ticket.dispose();
+  await worktreeDesktopTick();
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('a disposed failed-start ticket stays owned until the actual worker promise settles', async (t) => {
+  const f = await fixture(t);
+  const completed = deferred<void>(); const outcome = deferred<GjcWorkerOutcome>();
+  const supervisor: JobSupervisor = {
+    spawnRun: (input) => ({ started: Promise.reject(new Error('paused worker startup failure')), completion: completed.promise, outcome: outcome.promise, phase: () => 'request_issued', abortHandle: input.runId }),
+    abort: async () => 'unconfirmed', terminate: async () => 'reaped',
+  };
+  const orchestrator = new JobOrchestrator({ jobs: f.jobs, git: f.git, supervisor, stopCompletionTimeoutMs: 1 });
+  const { authority, reader } = worktreeDesktopAuthority(t, orchestrator);
+  const ticket = f.makeTicket(orchestrator);
+  const running = ticket.run('startup failure', runOptions, f.writer);
+  await assert.rejects(running, /paused worker startup failure/);
+  ticket.dispose();
+  assert.ok(reader.read().retained > 0 && reader.read().settling > 0);
+  assert.ok(sessionWorktreeWorkerHandle(ticket.abortHandle));
+  assert.equal((await authority.snapshot()).idle, false);
+  outcome.resolve('reaped');
+  completed.resolve();
+  await worktreeDesktopTick();
+  assert.equal(sessionWorktreeWorkerHandle(ticket.abortHandle), undefined);
+  assert.equal((await authority.snapshot()).idle, true);
+});
+
+test('worktree abort timeout does not release cancellation or preparation ownership', async (t) => {
+  const f = await fixture(t, { delayPreparation: true });
+  const { authority, reader } = worktreeDesktopAuthority(t, f.orchestrator);
+  const ticket = f.makeTicket();
+  const running = ticket.run('cancel paused preparation', runOptions, f.writer);
+  await until(f.isPreparing);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const aborting = abortSessionWorktreeRun(ticket.abortHandle);
+  t.mock.timers.tick(5000);
+  assert.equal(await aborting, false);
+  t.mock.timers.reset();
+  ticket.dispose();
+  assert.ok(reader.read().running > 0 && reader.read().settling > 0);
+  assert.equal((await authority.prepare({ attemptId: 'abort-timeout', epoch: 'desktop-1' })).ok, false);
+  f.preparation.resolve();
+  await running;
+  await worktreeDesktopTick();
+  assert.equal(ticket.aborted, true);
+  assert.equal(f.workers.length, 0);
+  assert.equal((await authority.snapshot()).idle, true);
+});
 
 test('worktree session keeps canonical project policy, actual cwd, and provider identity across turns and reload', async (t) => {
   const f = await fixture(t);
@@ -353,6 +484,12 @@ test('unconfirmed worker termination retains native ownership and cannot report 
   assert.equal(ticket.aborted, false);
   await assert.rejects(f.makeTicket().run('must not start', runOptions, f.writer), { code: 'RUN_IN_PROGRESS' });
   assert.equal(f.workers.length, 1);
+  ticket.dispose();
+  const reader = createSessionWorktreeDesktopRestartReader();
+  assert.equal(reader.read().complete, false);
+  assert.ok(reader.read().unknown.includes('worktree_stop_unconfirmed'));
+  assert.ok(reader.read().retained > 0);
+  assert.equal(sessionWorktreeWorkerHandle(ticket.abortHandle), f.workers[0].input.runId);
 });
 
 test('an unsuccessful worker completion never becomes a successful native turn', async (t) => {

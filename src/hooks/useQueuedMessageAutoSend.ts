@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 
 import { classifyCommandInput, isAutoSendable } from '../components/chat/commandDispatchPolicy';
 import { readQueuedMessages, subscribeQueuedMessages, type StoredQueuedMessage, writeQueuedMessages } from '../components/chat/utils/chatStorage';
+import { beginComposerOperation, isComposerFrozen, subscribeComposerFreeze } from '../shared/composerFreeze';
 
 import type { MarkSessionProcessing, SessionActivityMap } from './useSessionProtection';
 
@@ -29,6 +30,9 @@ export function decideQueuedDispatch(
   if (queued === null || queued === undefined) return hold('no-draft');
   if (!socketOpen) return hold('socket-closed');
   if (queued.pendingSteer) return hold('awaiting-steer');
+  // This background path has no attachment upload/review surface. Text-only
+  // durable queues retain their existing automatic dispatch behavior.
+  if (queued.attachmentCount || queued.requiresReview) return hold('needs-session-ui');
 
   const command = classifyCommandInput(queued.content);
   if (!isAutoSendable(command)) return hold('needs-session-ui');
@@ -53,6 +57,7 @@ export function useQueuedMessageAutoSend({
 }: UseQueuedMessageAutoSendArgs) {
   const knownProcessing = useRef<ReadonlySet<string>>(new Set());
   const waitingForConnection = useRef(new Set<string>());
+  const dispatching = useRef(false);
 
   useEffect(() => {
     const active = new Set(processingSessions.keys());
@@ -60,39 +65,54 @@ export function useQueuedMessageAutoSend({
     knownProcessing.current = active;
     completed.forEach((sessionId) => waitingForConnection.current.add(sessionId));
     const dispatchWaiting = () => {
-      const socketOpen = ws !== null && ws.readyState === WebSocket.OPEN;
-      for (const sessionId of waitingForConnection.current) {
-        // The visible composer owns its queue, and a newly running session
-        // must wait for that run to finish before it earns another dispatch.
-        if (active.has(sessionId) || sessionId === activeSessionId) {
-          waitingForConnection.current.delete(sessionId);
-          continue;
+      if (isComposerFrozen() || dispatching.current) return;
+      dispatching.current = true;
+      try {
+        const socketOpen = ws !== null && ws.readyState === WebSocket.OPEN;
+        for (const sessionId of waitingForConnection.current) {
+          // The visible composer owns its queue, and a newly running session
+          // must wait for that run to finish before it earns another dispatch.
+          if (active.has(sessionId) || sessionId === activeSessionId) {
+            waitingForConnection.current.delete(sessionId);
+            continue;
+          }
+          const queued = readQueuedMessages(sessionId);
+          const dispatch = decideQueuedDispatch(queued[0], socketOpen);
+          if (dispatch.action === 'hold') {
+            if (dispatch.reason !== 'socket-closed' && dispatch.reason !== 'awaiting-steer') waitingForConnection.current.delete(sessionId);
+            continue;
+          }
+          const finishOperation = beginComposerOperation('queue-dispatch');
+          if (!finishOperation) return;
+          try {
+            const sent = sendMessage({
+              type: 'chat.send',
+              sessionId,
+              content: dispatch.content,
+              options: { ...dispatch.options, images: [] },
+            });
+            if (sent === false) continue;
+            waitingForConnection.current.delete(sessionId);
+            writeQueuedMessages(sessionId, queued.slice(1));
+            markSessionProcessing(sessionId, { statusText: null, canInterrupt: true });
+          } finally { finishOperation(); }
         }
-        const queued = readQueuedMessages(sessionId);
-        const dispatch = decideQueuedDispatch(queued[0], socketOpen);
-        if (dispatch.action === 'hold') {
-          if (dispatch.reason !== 'socket-closed' && dispatch.reason !== 'awaiting-steer') waitingForConnection.current.delete(sessionId);
-          continue;
-        }
-        const sent = sendMessage({
-          type: 'chat.send',
-          sessionId,
-          content: dispatch.content,
-          options: { ...dispatch.options, images: [] },
-        });
-        if (sent === false) continue;
-        waitingForConnection.current.delete(sessionId);
-        writeQueuedMessages(sessionId, queued.slice(1));
-        markSessionProcessing(sessionId, { statusText: null, canInterrupt: true });
-      }
+      } finally { dispatching.current = false; }
     };
     dispatchWaiting();
     const unsubscribe = subscribeQueuedMessages((sessionId) => {
       if (waitingForConnection.current.has(sessionId)) dispatchWaiting();
     });
+    let listening = true;
+    // Let the mutation that revoked a freeze finish before re-reading its queue.
+    const unsubscribeFreeze = subscribeComposerFreeze(() => {
+      if (!isComposerFrozen()) queueMicrotask(() => { if (listening) dispatchWaiting(); });
+    });
     ws?.addEventListener('open', dispatchWaiting);
     return () => {
+      listening = false;
       unsubscribe();
+      unsubscribeFreeze();
       ws?.removeEventListener('open', dispatchWaiting);
     };
   }, [activeSessionId, markSessionProcessing, processingSessions, sendMessage, ws]);
