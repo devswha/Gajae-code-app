@@ -1,5 +1,14 @@
 # macOS 자동 업데이트 — 남은 작업 인계
 
+## 배포 키 로컬 준비 — 2026-09-09
+
+사용자가 공식 보안 입력창으로 암호화 키를 생성하고 동일 비밀번호를 login
+Keychain에 저장했다. 해당 Keychain 값으로 실제 Tauri 서명 및 native verifier
+검증을 통과했고, 변조된 파일/다른 공개키는 거부됐다. 키는 프로젝트 밖에
+보관하며 재생성하지 않는다. **독립 외장 백업은 아직 미완료**이고 공개 앱에
+이 키를 연결하거나 배포하지 않았다. 위치·공개 fingerprint·검증 범위는
+[UPDATER-KEY-CUSTODY.md](../scripts/release/UPDATER-KEY-CUSTODY.md)를 따른다.
+
 ## 최신 서명 QA 상태
 
 `f69ec4f`의 동일 소스 release-mode A/B가 Developer ID 서명·공증·Gatekeeper

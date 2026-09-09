@@ -1,5 +1,10 @@
 # Release signing readiness
 
+Production updater-key local provisioning was verified on September 9, 2026;
+independent backup remains pending. See [UPDATER-KEY-CUSTODY.md](UPDATER-KEY-CUSTODY.md)
+before generating or replacing any key. This does not configure hosted secrets
+or complete public-release acceptance.
+
 Run from the reviewed release checkout with Node 22. These checks do not sign,
 submit, publish, dispatch workflows, export credentials or modify a keychain.
 The checker uses only Node built-ins, so it can run before `npm ci`.

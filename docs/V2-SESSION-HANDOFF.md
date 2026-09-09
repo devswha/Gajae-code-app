@@ -1,5 +1,10 @@
 # gajae-app v2 — Session Handoff (resume state)
 
+Production updater key: local encrypted-file + login-Keychain provisioning and
+sign/verify/negative checks passed on September 9. Do not regenerate it.
+Independent external backup and release gates remain open. Exact local metadata
+and limits: [UPDATER-KEY-CUSTODY.md](../scripts/release/UPDATER-KEY-CUSTODY.md).
+
 Latest signed qualification: [DESKTOP-UPDATER-SIGNED-QA.md](DESKTOP-UPDATER-SIGNED-QA.md).
 Same-source f69ec4f release-mode A/B are notarized and Gatekeeper-accepted. The
 actual signed next-launch automatic A → B transition, Off/on behavior, byte-exact
