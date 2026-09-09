@@ -5,7 +5,7 @@ import type { JobProjectionErrorCode, JobProjectionEvent, JobSnapshot, JobState,
 import type { LLMProvider } from '../types/app';
 import { authenticatedFetch } from '../utils/api';
 
-import { buildRefreshMessagesUrl } from './sessionMessageFetch';
+import { buildRefreshMessagesUrl, shareMessageWindow } from './sessionMessageFetch';
 
 type MessageKind = 'text' | 'tool_use' | 'tool_result' | 'thinking' | 'stream_delta' | 'stream_end' | 'error' | 'complete' | 'status' | 'permission_request' | 'permission_cancelled' | 'session_created' | 'interactive_prompt' | 'task_notification' | 'system_notice';
 export interface NormalizedMessage {
@@ -28,6 +28,7 @@ export interface SessionSlot {
   total: number; hasMore: boolean; offset: number; tokenUsage: unknown;
 }
 export type MessagesWindow = { messages: NormalizedMessage[]; total: number; hasMore: boolean; offset: number; tokenUsage?: unknown };
+export type FetchMoreResult = { failed: false; addedCount: number; hasMore: boolean; total: number } | { failed: true } | null;
 export type JobProjectionSlot = { snapshot: JobSnapshot | null; lastAppliedSequence: number; eventsBySequence: Map<number, JobProjectionEvent>; orderedTail: JobProjectionEvent[]; status: 'idle' | 'subscribed' | 'error'; error: JobProjectionErrorCode | 'protocol_violation' | null };
 
 const EMPTY: NormalizedMessage[] = [];
@@ -232,6 +233,12 @@ async function reconcile(sessionId: string, slot: SessionSlot): Promise<Messages
 
 export function useSessionStore() {
   const queryClient = useQueryClient();
+  // Defaults must exist before imperative writes, including inactive session windows.
+  const configuredClient = useRef<QueryClient | null>(null);
+  if (configuredClient.current !== queryClient) {
+    queryClient.setQueryDefaults(['messages'], { structuralSharing: shareMessageWindow });
+    configuredClient.current = queryClient;
+  }
   const slots = useRef(new Map<string, SessionSlot>());
   const jobs = useRef(new Map<string, JobProjectionSlot>());
   const activeSession = useRef<string | null>(null);
@@ -330,27 +337,34 @@ export function useSessionStore() {
       const params = new URLSearchParams(); if (options.limit !== null && options.limit !== undefined) { params.set('limit', String(options.limit)); params.set('offset', String(options.offset ?? 0)); } if (!slot._includeImages) params.set('includeImages', 'false');
       const response = await authenticatedFetch(`/api/providers/sessions/${encodeURIComponent(id)}/messages${params.size ? `?${params}` : ''}`); if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const body = await response.json(); const data = body?.data ?? body; const messages: NormalizedMessage[] = data.messages || [];
-      if (ticket !== slot._fetchSeq) return slot;
+      if (ticket !== slot._fetchSeq) return null;
       queryClient.setQueryData<MessagesWindow>(['messages', id], { messages: withoutRepeatedIds(messages), total: data.total ?? messages.length, hasMore: Boolean(data.hasMore), offset: (options.offset ?? 0) + messages.length, tokenUsage: data.tokenUsage || slot.tokenUsage });
       if (slot.status === 'loading' && slot._loadingTicket === ticket) slot.status = 'idle'; refreshMerged(slot); emitSession(id); return slot;
     } catch (error) {
-      console.error(`[SessionStore] fetch failed for ${id}:`, error); if (ticket === slot._fetchSeq && slot.status === 'loading' && slot._loadingTicket === ticket) { slot.status = 'error'; emitSession(id); } return slot;
+      console.error(`[SessionStore] fetch failed for ${id}:`, error); if (ticket === slot._fetchSeq && slot.status === 'loading' && slot._loadingTicket === ticket) { slot.status = 'error'; emitSession(id); } return null;
     } finally { slot._pendingRequests -= 1; if (slot._loadingTicket === ticket) slot._loadingTicket = null; evict(); }
   }, [begin, emitSession, evict, queryClient]);
 
-  const fetchMore = useCallback(async (id: string, options: { limit?: number; includeImages?: boolean } = {}) => {
+  // `null` means nothing happened (no older rows, a page already in flight, or
+  // a newer fetch superseded this one); only a failed request reports `failed`.
+  const fetchMore = useCallback(async (id: string, options: { limit?: number; includeImages?: boolean } = {}): Promise<FetchMoreResult> => {
     const slot = slots.current.get(id) ?? newSlot(id, queryClient); if (typeof options.includeImages === 'boolean') slot._includeImages = options.includeImages;
-    if (!slot.hasMore || slot._fetchMoreTicket !== null) { remember(id, slot); return slot; }
+    if (!slot.hasMore || slot._fetchMoreTicket !== null) { remember(id, slot); return null; }
     const offset = slot.offset; const ticket = ++slot._fetchSeq; slot._fetchMoreTicket = ticket; slot._pendingRequests += 1; remember(id, slot); if (slot.status === 'loading') slot._loadingTicket = ticket;
     try {
       const params = new URLSearchParams({ limit: String(options.limit ?? 20), offset: String(offset) }); if (!slot._includeImages) params.set('includeImages', 'false');
       const response = await authenticatedFetch(`/api/providers/sessions/${encodeURIComponent(id)}/messages?${params}`); if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const body = await response.json(); const data = body?.data ?? body; const older: NormalizedMessage[] = data.messages || [];
-      if (ticket !== slot._fetchSeq || slot._fetchMoreTicket !== ticket || slot.offset !== offset) return slot;
-      queryClient.setQueryData<MessagesWindow>(['messages', id], { messages: withoutRepeatedIds([...older, ...slot.serverMessages]), total: slot.total, hasMore: Boolean(data.hasMore), offset: offset + older.length, tokenUsage: slot.tokenUsage });
-      if (slot.status === 'loading' && slot._loadingTicket === ticket) slot.status = 'idle'; refreshMerged(slot); emitSession(id); return slot;
+      if (ticket !== slot._fetchSeq || slot._fetchMoreTicket !== ticket || slot.offset !== offset) return null;
+      const beforeCount = slot.serverMessages.length;
+      const messages = withoutRepeatedIds([...older, ...slot.serverMessages]);
+      queryClient.setQueryData<MessagesWindow>(['messages', id], { messages, total: data.total ?? slot.total, hasMore: Boolean(data.hasMore), offset: offset + older.length, tokenUsage: slot.tokenUsage });
+      if (slot.status === 'loading' && slot._loadingTicket === ticket) slot.status = 'idle';
+      refreshMerged(slot);
+      emitSession(id);
+      return { failed: false, addedCount: messages.length - beforeCount, hasMore: slot.hasMore, total: slot.total };
     } catch (error) {
-      console.error(`[SessionStore] fetchMore failed for ${id}:`, error); if (ticket === slot._fetchSeq && slot.status === 'loading' && slot._loadingTicket === ticket) { slot.status = 'idle'; emitSession(id); } return slot;
+      console.error(`[SessionStore] fetchMore failed for ${id}:`, error); if (ticket === slot._fetchSeq && slot.status === 'loading' && slot._loadingTicket === ticket) { slot.status = 'idle'; emitSession(id); } return { failed: true };
     } finally { slot._pendingRequests -= 1; if (slot._fetchMoreTicket === ticket) slot._fetchMoreTicket = null; if (slot._loadingTicket === ticket) slot._loadingTicket = null; evict(); }
   }, [emitSession, evict, queryClient, remember]);
 

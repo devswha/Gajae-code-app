@@ -128,13 +128,11 @@
   "session": {
     "loading": {
       "olderMessages": "正在取得較早的訊息…",
+      "olderMessagesFailed": "無法取得較早的訊息。",
+      "retry": "重試",
       "sessionMessages": "正在取得對話中的訊息…"
     },
     "messages": {
-      "showingOf": "顯示 {{shown}} 共計 {{total}} 筆訊息",
-      "loadedCount": "已載入訊息：{{shown}} 筆",
-      "scrollToLoad": "向上捲動以查看更多",
-      "showingLast": "顯示最新 {{count}} 筆共計 {{total}} 筆訊息",
       "loadEarlier": "取得較早的訊息",
       "loadAll": "取得所有訊息",
       "loadFullToolOutput": "取得完整的輸出",

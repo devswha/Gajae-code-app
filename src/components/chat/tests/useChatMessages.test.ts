@@ -4,6 +4,7 @@ import test from 'node:test';
 import type { NormalizedMessage } from '../../../stores/useSessionStore';
 import { normalizedToChatMessages } from '../hooks/useChatMessages';
 import { isToolCallRunning } from '../utils/toolActivity';
+import { assignMessageKeys } from '../utils/messageKeys';
 import { buildPaneList, isTurnWorkBlockItem } from '../utils/turnWork';
 
 /*
@@ -40,6 +41,8 @@ test('a call converts again when its result lands, whether inline or as its own 
   const call = row({ id: 'c', kind: 'tool_use', toolId: 't1', toolName: 'read', toolInput: { path: 'a.ts' } });
   const pending = normalizedToChatMessages([call])[0];
   assert.equal(pending.toolResult, null);
+  assert.equal(pending.id, 'c');
+  assert.equal(pending.toolId, 't1');
 
   const result = row({ id: 'r', kind: 'tool_result', toolId: 't1', content: 'contents', isError: false });
   const [paired, ...rest] = normalizedToChatMessages([call, result]);
@@ -61,6 +64,37 @@ test('a call converts again when its result lands, whether inline or as its own 
   const [own] = normalizedToChatMessages([inline]);
   assert.notEqual(own, pending);
   assert.equal(own.toolResult?.content, 'inline');
+  for (const message of [paired, superseded, own]) {
+    assert.equal(message.id, 'c', 'the tool call retains its persisted row ID when its result changes');
+    assert.equal(message.toolId, 't1', 'row identity does not replace the tool pairing ID');
+  }
+});
+
+test('prepending text with the same timestamp and content prefix keeps distinct row IDs and keys', () => {
+  const prefix = 'The same leading text that exceeds the forty-eight character key preview: ';
+  const existing = row({ id: 'existing', role: 'assistant', content: `${prefix}existing` });
+  const first = normalizedToChatMessages([existing]);
+  const firstKeys = assignMessageKeys(first);
+  const older = row({ id: 'older', role: 'assistant', content: `${prefix}older` });
+  const prepended = normalizedToChatMessages([older, existing]);
+  const prependedKeys = assignMessageKeys(prepended);
+
+  assert.equal(older.timestamp, existing.timestamp);
+  assert.deepEqual(prepended.map((message) => message.id), ['older', 'existing']);
+  assert.equal(prepended[1], first[0]);
+  assert.equal(prependedKeys(prepended[1]), firstKeys(first[0]));
+  assert.notEqual(prependedKeys(prepended[0]), prependedKeys(prepended[1]));
+});
+
+test('changing a text row replaces its output without changing its ID or key', () => {
+  const original = row({ id: 'answer', role: 'assistant', content: 'Before' });
+  const first = normalizedToChatMessages([original]);
+  const updated = normalizedToChatMessages([{ ...original, content: 'After' }]);
+
+  assert.notEqual(updated[0], first[0]);
+  assert.equal(updated[0].content, 'After');
+  assert.equal(updated[0].id, original.id);
+  assert.equal(assignMessageKeys(updated)(updated[0]), assignMessageKeys(first)(first[0]));
 });
 
 test('a text row that yields two messages yields the same two next time', () => {
@@ -70,9 +104,26 @@ test('a text row that yields two messages yields the same two next time', () => 
   });
   const first = normalizedToChatMessages([notice]);
   assert.deepEqual(first.map((message) => message.content), ['Done', 'All green']);
+  assert.deepEqual(first.map((message) => message.id), ['n', 'n:result']);
   const second = normalizedToChatMessages([notice]);
   assert.equal(second[0], first[0]);
   assert.equal(second[1], first[1]);
+
+  const updated = normalizedToChatMessages([{
+    ...notice,
+    content: '<task-notification><status>failed</status><summary>Failed</summary><result>One failure</result></task-notification>',
+  }]);
+  assert.deepEqual(updated.map((message) => message.content), ['Failed', 'One failure']);
+  assert.deepEqual(updated.map((message) => message.id), first.map((message) => message.id));
+  assert.notEqual(updated[0], first[0]);
+  assert.notEqual(updated[1], first[1]);
+
+  const summaryOnly = normalizedToChatMessages([{
+    ...notice,
+    content: '<task-notification><status>running</status><summary>Working</summary></task-notification>',
+  }]);
+  assert.equal(summaryOnly.length, 1);
+  assert.equal(summaryOnly[0].id, first[0].id, 'the summary keeps its identity when a result appears or disappears');
 });
 
 test('partial tool results preserve their running state through chat conversion', () => {

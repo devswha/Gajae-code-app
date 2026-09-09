@@ -1,7 +1,7 @@
 import path from 'node:path';
 
 import { sessionsDb } from '@/modules/database/index.js';
-import { providerRegistry } from '@/modules/providers/provider.registry.js';
+import { fetchCompleteHistory } from '@/modules/providers/services/sessions.service.js';
 import { sessionTranscriptWorkspace } from '@/modules/providers/services/session-worktrees.service.js';
 import type { LLMProvider, NormalizedMessage } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
@@ -192,10 +192,8 @@ export async function exportSessionTranscript(
   let messages: NormalizedMessage[] = [];
   const executionCwd = session.provider_session_id ? sessionTranscriptWorkspace(sessionId, projectPath) : null;
   if (session.provider_session_id) {
-    const provider = providerRegistry.resolveProvider(session.provider as LLMProvider);
-    const history = await provider.sessions.fetchHistory(sessionId, {
-      limit: null,
-      offset: 0,
+    const history = await fetchCompleteHistory(sessionId, {
+      provider: session.provider as LLMProvider,
       projectPath: executionCwd!,
       providerSessionId: session.provider_session_id,
     });

@@ -128,13 +128,11 @@
   "session": {
     "loading": {
       "olderMessages": "Frühere Nachrichten abrufen…",
+      "olderMessagesFailed": "Frühere Nachrichten konnten nicht abgerufen werden.",
+      "retry": "Erneut versuchen",
       "sessionMessages": "Konversationsnachrichten werden abgerufen…"
     },
     "messages": {
-      "showingOf": "Anzeige von {{shown}} von {{total}}-Nachrichten",
-      "loadedCount": "Geladene Nachrichten: {{shown}}",
-      "scrollToLoad": "Scrollen Sie nach oben, um mehr zu erfahren",
-      "showingLast": "Anzeige der neuesten {{count}}-Meldungen von {{total}}",
       "loadEarlier": "Erhalten Sie frühere Nachrichten",
       "loadAll": "Erhalten Sie alle Nachrichten",
       "loadFullToolOutput": "Erhalten Sie eine vollständige Ausgabe",

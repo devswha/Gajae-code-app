@@ -128,13 +128,11 @@
   "session": {
     "loading": {
       "olderMessages": "Retrieving earlier messages…",
+      "olderMessagesFailed": "Earlier messages could not be retrieved.",
+      "retry": "Retry",
       "sessionMessages": "Retrieving conversation messages…"
     },
     "messages": {
-      "showingOf": "Displaying {{shown}} of {{total}} messages",
-      "loadedCount": "Loaded messages: {{shown}}",
-      "scrollToLoad": "Scroll upward for more",
-      "showingLast": "Displaying the latest {{count}} messages of {{total}}",
       "loadEarlier": "Get earlier messages",
       "loadAll": "Get all messages",
       "loadFullToolOutput": "Get complete output",

@@ -36,7 +36,8 @@ export default function LoadAllMessagesOverlay({
 
   return (
     <div
-      className={`pointer-events-none sticky top-2 z-20 flex justify-center ${!isLoadingAllMessages ? 'load-all-overlay-auto-fade' : ''}`}
+      data-load-all-overlay
+      className={`pointer-events-none absolute inset-x-0 top-2 z-20 flex justify-center ${!isLoadingAllMessages ? 'load-all-overlay-auto-fade' : ''}`}
       style={!isLoadingAllMessages ? { animation: 'loadAllOverlayAutoFade 2500ms ease forwards' } : undefined}
     >
       <style>{loadAllOverlayAnimationStyle}</style>
@@ -54,7 +55,7 @@ export default function LoadAllMessagesOverlay({
           disabled={isLoadingAllMessages}
         >
           {isLoadingAllMessages && (
-            <div className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+            <div className="h-3 w-3 animate-spin rounded-full border-2 border-primary-foreground/30 border-t-primary-foreground" />
           )}
           <span>
             {isLoadingAllMessages

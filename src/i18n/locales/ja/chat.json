@@ -64,7 +64,6 @@
     "stopSpeaking": "停止。",
     "loading": "読み込み中…"
   },
-
   "input": {
     "placeholder": "/ でコマンド、@ でファイル指定、または {{provider}} に何でも聞いてください...。",
     "modelReasoning": {
@@ -129,13 +128,11 @@
   "session": {
     "loading": {
       "olderMessages": "過去のメッセージを読み込んでいます...。",
+      "olderMessagesFailed": "過去のメッセージを読み込めませんでした。",
+      "retry": "再試行",
       "sessionMessages": "セッションメッセージを読み込んでいます...。"
     },
     "messages": {
-      "showingOf": "{{total}}件中{{shown}}件を表示。",
-      "loadedCount": "読み込み済みメッセージ: {{shown}}件",
-      "scrollToLoad": "上にスクロールしてさらに読み込む。",
-      "showingLast": "最新{{count}}件を表示（全{{total}}件）。",
       "loadEarlier": "過去のメッセージを読み込む。",
       "loadAll": "すべてのメッセージを取得。",
       "loadFullToolOutput": "完全な出力を読み込む。",

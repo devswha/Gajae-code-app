@@ -26,6 +26,7 @@ const readTaskNotice = (content: string): TaskNotice | null => {
 };
 
 const sharedFields = (message: NormalizedMessage) => ({
+  id: message.id,
   sessionId: message.sessionId,
   displayText: message.displayText,
   commandName: message.commandName,
@@ -116,7 +117,7 @@ function convertRow(message: NormalizedMessage, attachedResult: AttachedResult):
       isTaskNotification: true, taskStatus: notice.status, ...common,
     });
     if (notice.result) {
-      output.push({ type: 'assistant', content: cleanAssistantText(notice.result), timestamp: message.timestamp, ...common });
+      output.push({ type: 'assistant', content: cleanAssistantText(notice.result), timestamp: message.timestamp, ...common, id: message.id ? `${message.id}:result` : undefined });
     }
     return output;
   }

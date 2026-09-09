@@ -5,90 +5,15 @@ import type { IProviderSessions } from '@/shared/interfaces.js';
 import type { AnyRecord, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage } from '@/shared/types.js';
 import { assignTranscriptTurns, type TranscriptTurnRecord } from '@/modules/providers/list/gjc/gjc-transcript-turns.js';
 import { readGjcTranscriptMessage } from '@/modules/providers/list/gjc/gjc-transcript-message.js';
-import { createNormalizedMessage, generateMessageId, readObjectRecord, sliceTailPage } from '@/shared/utils.js';
+import { AppError, createNormalizedMessage, generateMessageId, readObjectRecord } from '@/shared/utils.js';
 
 const PROVIDER = 'gjc';
 
 const MAX_JSONL_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_BUFFERED_HISTORY_RECORDS = 5_000;
 const MAX_BUFFERED_HISTORY_BYTES = 64 * 1024 * 1024;
-const PAGINATION_RECORD_HEADROOM = 100;
-
-type BufferedNormalizedMessage = {
-  message: NormalizedMessage;
-  byteLength: number;
-};
-
-/**
- * Retains only the newest normalized transcript records. The byte limit accounts
- * for the serialized record, which bounds the retained message strings and
- * structured tool payloads without retaining an unbounded JSONL transcript.
- */
-class NormalizedMessageRingBuffer {
-  private entries: Array<BufferedNormalizedMessage | undefined> = [];
-  private startIndex = 0;
-  private bufferedBytes = 0;
-
-  truncated = false;
-
-  constructor(
-    private readonly maxRecords: number,
-    private readonly maxBytes: number,
-  ) {}
-
-  push(message: NormalizedMessage): void {
-    const byteLength = Buffer.byteLength(JSON.stringify(message), 'utf8');
-
-    if (byteLength > this.maxBytes) {
-      this.truncated = true;
-      return;
-    }
-
-    while (
-      this.entries.length - this.startIndex >= this.maxRecords
-      || this.bufferedBytes + byteLength > this.maxBytes
-    ) {
-      const oldest = this.entries[this.startIndex];
-      if (!oldest) {
-        break;
-      }
-      this.entries[this.startIndex] = undefined;
-      this.startIndex += 1;
-      this.bufferedBytes -= oldest.byteLength;
-      this.truncated = true;
-    }
-
-    this.entries.push({ message, byteLength });
-    this.bufferedBytes += byteLength;
-
-    if (this.startIndex >= 1_024) {
-      this.entries = this.entries.slice(this.startIndex);
-      this.startIndex = 0;
-    }
-  }
-
-  get messages(): NormalizedMessage[] {
-    const messages: NormalizedMessage[] = [];
-    for (let index = this.startIndex; index < this.entries.length; index += 1) {
-      const entry = this.entries[index];
-      if (entry) {
-        messages.push(entry.message);
-      }
-    }
-    return messages;
-  }
-}
-
-function getHistoryBufferRecordLimit(limit: number | null, offset: number): number {
-  if (limit === null) {
-    return MAX_BUFFERED_HISTORY_RECORDS;
-  }
-
-  return Math.min(
-    MAX_BUFFERED_HISTORY_RECORDS,
-    Math.max(PAGINATION_RECORD_HEADROOM, limit + offset + PAGINATION_RECORD_HEADROOM),
-  );
-}
+const HISTORY_READ_ATTEMPTS = 3;
+type HistoryRow = { ordinal: number; time: number; kind: NormalizedMessage['kind']; toolId?: string };
 
 /**
  * Streams newline-delimited UTF-8 text while discarding a line as soon as it
@@ -197,20 +122,11 @@ async function readTranscriptLineage(sessionFilePath: string): Promise<Transcrip
  * its own intermediate record with a unique id so multi-part turns never collide.
  */
 async function streamGjcSessionMessages(
-  sessionId: string,
+  sessionFilePath: string,
+  turns: ReturnType<typeof assignTranscriptTurns>,
   onMessage: (message: AnyRecord) => void,
 ): Promise<void> {
   try {
-    const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
-
-    if (!sessionFilePath) {
-      console.warn(`gjc session file not found for session ${sessionId}`);
-      return;
-    }
-
-    // Which turn each record belongs to, and how that turn ended. Both come from
-    // the transcript, so a reloaded conversation reports what it reported live.
-    const turns = assignTranscriptTurns(await readTranscriptLineage(sessionFilePath));
 
     for await (const line of readBoundedJsonlLines(sessionFilePath)) {
       if (!line.trim()) {
@@ -354,12 +270,15 @@ async function streamGjcSessionMessages(
               break;
           }
         }
-      } catch {
-        // Skip malformed lines.
+      } catch (error) {
+        if (error instanceof AppError) throw error;
+        // Skip malformed lines, not explicit page safety failures.
       }
     }
   } catch (error) {
-    console.error(`Error reading gjc session messages for ${sessionId}:`, error);
+    if (error instanceof AppError) throw error;
+    console.error('Error reading gjc session messages:', error);
+    throw error;
   }
 }
 
@@ -494,72 +413,92 @@ export class GjcSessionsProvider implements IProviderSessions {
     const { limit = null, offset = 0 } = options;
     const normalizedOffset = Math.max(0, offset);
     const normalizedLimit = limit === null ? null : Math.max(0, limit);
-    const messageBuffer = new NormalizedMessageRingBuffer(
-      getHistoryBufferRecordLimit(normalizedLimit, normalizedOffset),
-      MAX_BUFFERED_HISTORY_BYTES,
-    );
-
-    try {
-      await streamGjcSessionMessages(sessionId, (rawMessage) => {
-        for (const message of this.normalizeHistoryEntry(rawMessage, sessionId)) {
-          messageBuffer.push(message);
-        }
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[GjcProvider] Failed to load session ${sessionId}:`, message);
-      return {
-        messages: [],
-        total: 0,
-        hasMore: false,
-        offset: normalizedOffset,
-        limit: normalizedLimit,
-      };
-    }
-
-    const normalized = messageBuffer.messages.sort(
-      (a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime(),
-    );
-
-    const toolResultMap = new Map<string, NormalizedMessage>();
-    for (const msg of normalized) {
-      if (msg.kind === 'tool_result' && msg.toolId) {
-        toolResultMap.set(msg.toolId, msg);
+    const sessionFilePath = sessionsDb.getSessionById(sessionId)?.jsonl_path;
+    const empty = { messages: [], total: 0, hasMore: false, offset: normalizedOffset, limit: normalizedLimit };
+    if (!sessionFilePath) return empty;
+    // A live writer appends between the index and payload passes often enough
+    // that one changed revision is routine, not a client-visible failure.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.readHistoryPage(sessionFilePath, sessionId, normalizedLimit, normalizedOffset);
+      } catch (error) {
+        if (error instanceof AppError && error.code === 'HISTORY_CHANGED' && attempt < HISTORY_READ_ATTEMPTS) continue;
+        if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return empty;
+        throw error;
       }
     }
-    for (const msg of normalized) {
-      if (msg.kind === 'tool_use' && msg.toolId && toolResultMap.has(msg.toolId)) {
-        const toolResult = toolResultMap.get(msg.toolId);
-        if (toolResult) {
-          // The standalone tool_result row is dropped below, so anything the
-          // UI needs has to be copied here. `toolUseResult` carries the
-          // runtime's typed details; omitting it silently made a reloaded
-          // transcript poorer than the turn that produced it.
-          msg.toolResult = {
-            content: toolResult.content,
-            isError: toolResult.isError,
-            ...(toolResult.toolUseResult === undefined
-              ? {}
-              : { toolUseResult: toolResult.toolUseResult }),
-          };
-        }
+  }
+
+  private async readHistoryPage(
+    sessionFilePath: string,
+    sessionId: string,
+    normalizedLimit: number | null,
+    normalizedOffset: number,
+  ): Promise<FetchHistoryResult> {
+    const revision = await fsSync.promises.stat(sessionFilePath);
+    const turns = assignTranscriptTurns(await readTranscriptLineage(sessionFilePath));
+    // Index only small descriptors. Tool-result rows must not consume visible
+    // pagination offsets or evict older messages from a payload ring.
+    const index: HistoryRow[] = [];
+    await streamGjcSessionMessages(sessionFilePath, turns, raw => {
+      for (const message of this.normalizeHistoryEntry(raw, sessionId)) {
+        const time = Date.parse(message.timestamp);
+        index.push({ ordinal: index.length, time: Number.isFinite(time) ? time : 0, kind: message.kind, toolId: message.toolId });
       }
+    });
+    const chronological = index.sort((a, b) => a.time - b.time || a.ordinal - b.ordinal);
+    const visible = chronological.filter(row => row.kind !== 'tool_result');
+    const end = Math.max(0, visible.length - normalizedOffset);
+    if (normalizedLimit === null && end > MAX_BUFFERED_HISTORY_RECORDS) {
+      throw new AppError('History is too large to load at once; use paginated history.', { code: 'HISTORY_PAGE_TOO_LARGE', statusCode: 413 });
     }
+    const start = Math.max(0, end - Math.min(normalizedLimit ?? MAX_BUFFERED_HISTORY_RECORDS, MAX_BUFFERED_HISTORY_RECORDS));
+    const selected = visible.slice(start, end);
+    const wanted = new Set(selected.map(row => row.ordinal));
+    const resultsByTool = new Map<string, number>();
+    const selectedTools = new Set(selected.filter(row => row.kind === 'tool_use' && row.toolId).map(row => row.toolId!));
+    for (const row of chronological) {
+      if (row.kind === 'tool_result' && row.toolId && selectedTools.has(row.toolId)) resultsByTool.set(row.toolId, row.ordinal);
+    }
+    for (const ordinal of resultsByTool.values()) wanted.add(ordinal);
 
-    // Tool results render inside their call, never as standalone timeline rows.
-    // When the bounded ring has discarded older rows, `total` is a lower bound;
-    // `hasMore` remains true so callers know the complete history was not retained.
-    const visibleMessages = normalized.filter((msg) => msg.kind !== 'tool_result');
-    const { page, hasMore: pageHasMore } = sliceTailPage(
-      visibleMessages,
-      normalizedLimit,
-      normalizedOffset,
-    );
-
+    // A second streaming pass retains only the page and its attached results,
+    // independent of how far back the user has paged. No growing payload cache.
+    const payloads = new Map<number, NormalizedMessage>();
+    let ordinal = 0;
+    let bytes = 0;
+    if (wanted.size) await streamGjcSessionMessages(sessionFilePath, turns, raw => {
+      for (const message of this.normalizeHistoryEntry(raw, sessionId)) {
+        const position = ordinal++;
+        if (!wanted.has(position)) continue;
+        bytes += Buffer.byteLength(JSON.stringify(message), 'utf8');
+        if (bytes > MAX_BUFFERED_HISTORY_BYTES) {
+          throw new AppError('History page exceeds the payload limit; request fewer messages.', { code: 'HISTORY_PAGE_TOO_LARGE', statusCode: 413 });
+        }
+        payloads.set(position, message);
+      }
+    });
+    const after = await fsSync.promises.stat(sessionFilePath);
+    if (after.size !== revision.size || after.mtimeMs !== revision.mtimeMs) {
+      throw new AppError('Transcript changed while reading history; retry the request.', { code: 'HISTORY_CHANGED', statusCode: 409 });
+    }
+    const messages = selected.map(row => {
+      const message = payloads.get(row.ordinal)!;
+      const resultOrdinal = row.toolId ? resultsByTool.get(row.toolId) : undefined;
+      const result = resultOrdinal === undefined ? undefined : payloads.get(resultOrdinal);
+      if (message.kind === 'tool_use' && result) {
+        message.toolResult = {
+          content: result.content,
+          isError: result.isError,
+          ...(result.toolUseResult === undefined ? {} : { toolUseResult: result.toolUseResult }),
+        };
+      }
+      return message;
+    });
     return {
-      messages: page,
-      total: visibleMessages.length,
-      hasMore: pageHasMore || messageBuffer.truncated,
+      messages,
+      total: visible.length,
+      hasMore: start > 0,
       offset: normalizedOffset,
       limit: normalizedLimit,
       tokenUsage: null,

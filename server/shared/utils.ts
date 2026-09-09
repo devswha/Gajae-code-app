@@ -229,13 +229,6 @@ export function createCompleteMessage(opts: { provider: NormalizedMessage['provi
   });
 }
 
-export function sliceTailPage<T>(items: T[], limit: number | null, offset: number): { page: T[]; hasMore: boolean } {
-  const endingAt = Math.max(0, items.length - Math.max(0, offset));
-  if (limit === null) return { page: items.slice(0, endingAt), hasMore: false };
-  const beginningAt = Math.max(0, endingAt - Math.max(0, limit));
-  return { page: items.slice(beginningAt, endingAt), hasMore: beginningAt > 0 };
-}
-
 export const readObjectRecord = (value: any): AnyRecord | null => (
   value && typeof value === 'object' && !Array.isArray(value) ? value as AnyRecord : null
 );

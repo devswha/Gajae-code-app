@@ -1,10 +1,13 @@
+import { useState } from 'react';
 import type { ReactNode } from 'react';
 
 import type { ChatMessage, CodeEditorDiffInfo, Provider } from '../types/types';
 import type { Project } from '../../../types/app';
 import { assignMessageKeys } from '../utils/messageKeys';
+import { reconcilePaneItemIdentities } from '../utils/paneItemIdentity';
 import { isToolGroupItem } from '../utils/toolGrouping';
 import type { MessageListItem } from '../utils/toolGrouping';
+import { DEFAULT_TOOL_OUTPUT_DENSITY } from '../utils/toolOutputDensity';
 import type { ToolOutputDensity } from '../utils/toolOutputDensity';
 
 import MessageComponent from './MessageComponent';
@@ -35,18 +38,28 @@ interface GroupedMessageListProps extends MessageRenderProps {
  * cards inside a folded turn are exactly the cards the pane would have shown.
  */
 export default function GroupedMessageList({ items, prevMessage, ...renderProps }: GroupedMessageListProps) {
-  const { density } = renderProps;
+  const { density = DEFAULT_TOOL_OUTPUT_DENSITY } = renderProps;
   const getMessageKey = assignMessageKeys(items.flatMap((item) => (isToolGroupItem(item) ? item.messages : [item])));
+  const [identityState, setIdentityState] = useState(() => ({
+    items,
+    density,
+    identities: reconcilePaneItemIdentities(items, density, getMessageKey),
+  }));
+  let identities = identityState.identities;
+  if (identityState.items !== items || identityState.density !== density) {
+    identities = reconcilePaneItemIdentities(items, density, getMessageKey, identityState.identities);
+    setIdentityState({ items, density, identities });
+  }
   const rendered: ReactNode[] = [];
   let previous = prevMessage;
 
-  for (const item of items) {
+  for (const [index, item] of items.entries()) {
     const before = previous;
     if (isToolGroupItem(item)) {
       previous = item.messages[item.messages.length - 1] || previous;
       rendered.push(
         <ToolGroupContainer
-          key={`tool-group-${density}-${getMessageKey(item.messages[0])}`}
+          key={identities[index].key}
           group={item}
           prevMessage={before}
           {...renderProps}
@@ -58,7 +71,7 @@ export default function GroupedMessageList({ items, prevMessage, ...renderProps 
     previous = item;
     rendered.push(
       <MessageComponent
-        key={getMessageKey(item)}
+        key={identities[index].key}
         message={item}
         prevMessage={before}
         createDiff={renderProps.createDiff}

@@ -50,20 +50,29 @@ export function useChatFollowScroll({ scrollContainerRef, enabled }: UseChatFoll
       const touchY = event.touches[0]?.clientY;
       if (touchStartY !== null && touchY !== undefined && touchY > touchStartY) stopFollowing();
     };
+    const onPointerDown = (event: PointerEvent) => {
+      // Only a grab of the vertical scrollbar track (past the client box) is a
+      // scroll intent; the pane's own gutter and padding also report the node.
+      if (event.target === node && event.offsetX >= node.clientWidth) stopFollowing();
+    };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (document.activeElement === node && ['ArrowUp', 'PageUp', 'Home'].includes(event.key)) stopFollowing();
+      const target = event.target;
+      const editing = target instanceof HTMLElement && (target.matches('input, textarea, select') || target.isContentEditable);
+      if (!editing && ['ArrowUp', 'PageUp', 'Home'].includes(event.key)) stopFollowing();
     };
 
     node.addEventListener('scroll', handleScroll, { passive: true });
     node.addEventListener('wheel', onWheel, { passive: true });
     node.addEventListener('touchstart', onTouchStart, { passive: true });
     node.addEventListener('touchmove', onTouchMove, { passive: true });
+    node.addEventListener('pointerdown', onPointerDown, { passive: true });
     node.addEventListener('keydown', onKeyDown);
     return () => {
       node.removeEventListener('scroll', handleScroll);
       node.removeEventListener('wheel', onWheel);
       node.removeEventListener('touchstart', onTouchStart);
       node.removeEventListener('touchmove', onTouchMove);
+      node.removeEventListener('pointerdown', onPointerDown);
       node.removeEventListener('keydown', onKeyDown);
     };
   }, [handleScroll, scrollContainerRef, setFollowing]);

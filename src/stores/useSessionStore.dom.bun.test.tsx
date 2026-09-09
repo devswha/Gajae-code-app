@@ -223,11 +223,45 @@ test('fetchMore serializes a captured offset and deduplicates only matching mess
       total: 4,
       hasMore: false,
     }));
-    await Promise.all([firstPage, duplicatePage]);
+    const [accepted, duplicate] = await Promise.all([firstPage, duplicatePage]);
+    assert.deepEqual(accepted, { failed: false, addedCount: 1, hasMore: false, total: 4 });
+    assert.equal(duplicate, null);
 
     const slot = store.getSessionSlot('session')!;
     assert.deepEqual(slot.serverMessages.map(message => message.id), ['old-1', 'new-1', 'new-2']);
     assert.equal(slot.offset, 4, 'the offset advances by the accepted response window');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('failed, empty and superseded older pages never report an insertion', async () => {
+  const originalFetch = globalThis.fetch;
+  const pending: PendingRequest[] = [];
+  globalThis.fetch = ((url: string) => new Promise<Response>((resolve) => pending.push({ url, resolve }))) as typeof fetch;
+  try {
+    const store = createStore();
+    const initial = store.fetchFromServer('session', { limit: 1 });
+    const saved = { id: 'saved', sessionId: 'session', timestamp: '2026-01-01T00:00:00Z', kind: 'text', provider: 'gjc' };
+    pending.shift()!.resolve(response({ messages: [saved], total: 3, hasMore: true }));
+    await initial;
+    const failed = store.fetchMore('session');
+    pending.shift()!.resolve(new Response('', { status: 500 }));
+    assert.deepEqual(await failed, { failed: true }, 'a failed request is distinguishable from a superseded one');
+    assert.equal(store.getSessionSlot('session')!.offset, 1);
+
+    const obsolete = store.fetchMore('session');
+    const oldRequest = pending.shift()!;
+    const refresh = store.refreshFromServer('session');
+    pending.shift()!.resolve(response({ messages: [saved], total: 3, hasMore: true }));
+    await refresh;
+    oldRequest.resolve(response({ messages: [{ ...saved, id: 'old' }], total: 3, hasMore: true }));
+    assert.equal(await obsolete, null);
+
+    const empty = store.fetchMore('session');
+    pending.shift()!.resolve(response({ messages: [], total: 1, hasMore: false }));
+    assert.deepEqual(await empty, { failed: false, addedCount: 0, hasMore: false, total: 1 });
+    assert.deepEqual(store.getMessages('session').map(row => row.id), ['saved']);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -479,7 +513,7 @@ test('getMessages reflects a completed fetch and keeps empty reads identity-stab
     assert.equal(preFetch.length, 0);
     assert.equal(store.getMessages('session'), preFetch);
 
-    let request: Promise<SessionSlot>;
+    let request: ReturnType<SessionStore['fetchFromServer']>;
     act(() => {
       request = store.fetchFromServer('session', { limit: 20, offset: 0 });
     });

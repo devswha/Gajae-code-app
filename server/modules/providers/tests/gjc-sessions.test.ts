@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { appendFile, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +8,8 @@ import test from 'node:test';
 import { appConfigDb, closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
 import { GjcSessionSynchronizer } from '@/modules/providers/list/gjc/gjc-session-synchronizer.provider.js';
 import { GjcSessionsProvider } from '@/modules/providers/list/gjc/gjc-sessions.provider.js';
-import { sessionsService } from '@/modules/providers/services/sessions.service.js';
+import { exportSessionTranscript } from '@/modules/providers/services/session-export.service.js';
+import { fetchCompleteHistory, sessionsService } from '@/modules/providers/services/sessions.service.js';
 
 const patchHomeDir = (nextHomeDir: string) => {
   const original = os.homedir;
@@ -443,7 +445,7 @@ test('gjc sessions provider returns a folded tool call for the newest one-messag
   }
 });
 
-test('gjc sessions provider keeps only the bounded normalized history tail', { concurrency: false }, async () => {
+test('gjc sessions provider bounds page payloads without hiding older history', { concurrency: false }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gjc-session-ring-history-'));
   const workspacePath = path.join(tempRoot, 'workspace');
   const sessionsDir = path.join(tempRoot, '.gjc', 'agent', 'sessions', '-workspace');
@@ -458,6 +460,15 @@ test('gjc sessions provider keeps only the bounded normalized history tail', { c
     const lines = [
       JSON.stringify({ type: 'session', version: 3, id: 'gjc-ring-history', timestamp: '2026-07-09T00:00:00.000Z', cwd: workspacePath }),
     ];
+    // The oldest visible row is a tool call whose result only the paged walk can reach.
+    lines.push(JSON.stringify({
+      type: 'message', id: 'oldest-call', timestamp: new Date(startTime - 2).toISOString(),
+      message: { role: 'assistant', content: [{ type: 'toolCall', toolName: 'read', toolInput: { path: 'a.ts' }, toolCallId: 'call-oldest' }] },
+    }));
+    lines.push(JSON.stringify({
+      type: 'message', id: 'oldest-result', timestamp: new Date(startTime - 1).toISOString(),
+      message: { role: 'toolResult', toolCallId: 'call-oldest', toolName: 'read', content: [{ type: 'text', text: 'oldest output' }], isError: false },
+    }));
     for (let index = 0; index < messageCount; index += 1) {
       lines.push(JSON.stringify({
         type: 'message',
@@ -466,22 +477,44 @@ test('gjc sessions provider keeps only the bounded normalized history tail', { c
         message: { role: 'user', content: [{ type: 'text', text: `message-${index}` }] },
       }));
     }
-    await writeFile(
-      path.join(sessionsDir, '2026-07-09T00-00-00_gjc-ring-history.jsonl'),
-      `${lines.join('\n')}\n`,
-      'utf8',
-    );
+    const transcriptPath = path.join(sessionsDir, '2026-07-09T00-00-00_gjc-ring-history.jsonl');
+    await writeFile(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
 
     await withIsolatedDatabase(async () => {
       await new GjcSessionSynchronizer().synchronize();
 
-      const history = await new GjcSessionsProvider().fetchHistory('gjc-ring-history');
-
-      assert.equal(history.total, 5_000);
+      const provider = new GjcSessionsProvider();
+      await assert.rejects(provider.fetchHistory('gjc-ring-history'), { code: 'HISTORY_PAGE_TOO_LARGE' });
+      // In-server consumers never issue the unbounded read; they page instead.
+      const complete = await fetchCompleteHistory('gjc-ring-history', { provider: 'gjc', providerSessionId: 'gjc-ring-history' });
+      assert.equal(complete.messages.length, 5_002);
+      assert.equal(complete.total, 5_002);
+      assert.equal(complete.hasMore, false);
+      assert.equal(complete.messages[0]?.toolId, 'call-oldest');
+      assert.equal(complete.messages[0]?.toolResult?.content, 'oldest output');
+      assert.equal(complete.messages.at(-1)?.content, 'message-5000');
+      assert.equal(new Set(complete.messages.map((message) => message.id)).size, 5_002, 'pages overlap only by identity');
+      const oldestResult = await sessionsService.fetchToolResult('gjc-ring-history', 'call-oldest');
+      assert.equal(oldestResult.toolResult.content, 'oldest output');
+      await assert.rejects(sessionsService.fetchToolResult('gjc-ring-history', 'call-missing'), { code: 'TOOL_RESULT_NOT_FOUND' });
+      const exported = await exportSessionTranscript('gjc-ring-history');
+      assert.ok(exported.body.includes('message-0\n'), 'export reaches the oldest prompt');
+      assert.ok(exported.body.includes('message-5000'));
+      await rm(transcriptPath);
+      const gone = await provider.fetchHistory('gjc-ring-history', { limit: 20 });
+      assert.deepEqual({ total: gone.total, hasMore: gone.hasMore, messages: gone.messages }, { total: 0, hasMore: false, messages: [] }, 'a removed transcript is an empty window, not a 500');
+      await writeFile(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
+      const history = await provider.fetchHistory('gjc-ring-history', { limit: 5_000 });
+      assert.equal(history.total, 5_002);
       assert.equal(history.messages.length, 5_000);
       assert.equal(history.messages[0]?.content, 'message-1');
       assert.equal(history.messages.at(-1)?.content, 'message-5000');
       assert.equal(history.hasMore, true);
+      const oldest = await provider.fetchHistory('gjc-ring-history', { limit: 20, offset: 5_000 });
+      assert.equal(oldest.messages[0]?.toolId, 'call-oldest');
+      assert.equal(oldest.messages[1]?.content, 'message-0');
+      assert.equal(oldest.total, 5_002);
+      assert.equal(oldest.hasMore, false);
     });
   } finally {
     restoreLiveSessionDir();
@@ -752,6 +785,95 @@ test('history transport truncates oversized gjc tool output and serves the full 
 
       const full = await sessionsService.fetchToolResult('gjc-transport', 'call-large');
       assert.equal(full.toolResult.content, output);
+    });
+  } finally {
+    restoreLiveSessionDir();
+    restoreHomeDir();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('GJC pages count visible rows, preserve results and reach history beyond the old buffer', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gjc-visible-pages-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  const restoreHomeDir = patchHomeDir(tempRoot);
+  const restoreLiveSessionDir = patchLiveSessionDir(path.join(tempRoot, 'live-sessions'));
+  try {
+    const sessionId = 'visible-pages';
+    const filePath = await writeGjcTranscript(tempRoot, sessionId, workspacePath, { firstUserMessage: 'oldest prompt' });
+    const records: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      const time = new Date(Date.UTC(2026, 6, 9, 0, 0, 10 + i)).toISOString();
+      records.push(JSON.stringify({ type: 'message', id: `call-${i}`, parentId: 'msg-1', timestamp: time,
+        message: { role: 'assistant', content: [{ type: 'toolCall', toolName: 'read', toolCallId: `tool-${i}`, toolInput: { path: `file-${i}` } }] } }));
+      records.push(JSON.stringify({ type: 'message', id: `result-${i}`, parentId: `call-${i}`, timestamp: time,
+        message: { role: 'toolResult', toolCallId: `tool-${i}`, content: [{ type: 'text', text: `output-${i}` }], details: { index: i } } }));
+    }
+    await appendFile(filePath, `${records.join('\n')}\n`, 'utf8');
+    await withIsolatedDatabase(async () => {
+      await new GjcSessionSynchronizer().synchronize();
+      const provider = new GjcSessionsProvider();
+      let offset = 0;
+      let more = true;
+      const ids = new Set<string>();
+      while (more) {
+        const page = await provider.fetchHistory(sessionId, { limit: 20, offset });
+        assert.equal(page.total, 301);
+        assert.ok(page.messages.length > 0, `page at ${offset} must make progress`);
+        for (const row of page.messages) {
+          assert.equal(ids.has(row.id), false);
+          ids.add(row.id);
+          if (row.kind === 'tool_use') {
+            const i = Number(row.toolId!.split('-')[1]);
+            assert.equal(row.toolResult?.content, `output-${i}`);
+            assert.deepEqual(row.toolResult?.toolUseResult, { index: i });
+          }
+        }
+        offset += page.messages.length;
+        more = page.hasMore;
+      }
+      assert.equal(ids.size, 301);
+      assert.ok(ids.has('msg-1:0:text'));
+      const exhausted = await provider.fetchHistory(sessionId, { limit: 20, offset: 400 });
+      assert.equal(exhausted.hasMore, false);
+      assert.equal(exhausted.messages.length, 0);
+      assert.equal(exhausted.total, 301);
+
+      // Deep offset must not be capped by the number of payloads retained.
+      const later = Array.from({ length: 5100 }, (_, i) => JSON.stringify({ type: 'message', id: `later-${i}`, parentId: 'msg-1',
+        timestamp: new Date(Date.UTC(2026, 6, 10, 0, 0, i)).toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: `later ${i}` }] } }));
+      await appendFile(filePath, `${later.join('\n')}\n`, 'utf8');
+      const oldest = await provider.fetchHistory(sessionId, { limit: 20, offset: 5400 });
+      assert.equal(oldest.total, 5401);
+      assert.equal(oldest.hasMore, false);
+      assert.equal(oldest.messages[0]?.content, 'oldest prompt');
+      await assert.rejects(provider.fetchHistory(sessionId), { code: 'HISTORY_PAGE_TOO_LARGE' });
+
+      // A live writer appending mid-read is absorbed by re-reading; only a
+      // transcript that keeps changing on every attempt surfaces as 409.
+      const originalStat = fs.promises.stat;
+      let stats = 0;
+      let appendsPerRead = 1;
+      (fs.promises as { stat: unknown }).stat = async (...args: Parameters<typeof fs.promises.stat>) => {
+        stats += 1;
+        // Even calls are the post-read revision check; grow the file just before it.
+        if (stats % 2 === 0 && appendsPerRead > 0) {
+          appendsPerRead -= 1;
+          await appendFile(filePath, `${JSON.stringify({ type: 'message', id: `live-${stats}`, parentId: 'msg-1',
+            timestamp: new Date(Date.UTC(2026, 6, 11, 0, 0, stats)).toISOString(), message: { role: 'user', content: [{ type: 'text', text: `live ${stats}` }] } })}\n`, 'utf8');
+        }
+        return originalStat(...args);
+      };
+      try {
+        const settled = await provider.fetchHistory(sessionId, { limit: 20 });
+        assert.equal(settled.total, 5402, 'the retry sees the row appended during the first attempt');
+        assert.equal(settled.messages.at(-1)?.content, 'live 2');
+        appendsPerRead = Number.POSITIVE_INFINITY;
+        await assert.rejects(provider.fetchHistory(sessionId, { limit: 20 }), { code: 'HISTORY_CHANGED', statusCode: 409 });
+      } finally {
+        (fs.promises as { stat: unknown }).stat = originalStat;
+      }
     });
   } finally {
     restoreLiveSessionDir();

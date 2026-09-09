@@ -53,6 +53,7 @@ function Harness() {
           if (!node) return;
           Object.defineProperties(node, {
             clientHeight: { configurable: true, get: () => 100 },
+            clientWidth: { configurable: true, get: () => 300 },
             scrollHeight: { configurable: true, get: () => height },
           });
         }}
@@ -127,6 +128,31 @@ test('a passive scroll away from the bottom does not stop following', () => {
   fireEvent.scroll(container);
   grow();
   assertAtBottom(container);
+});
+
+test('scrollbar interaction stops following growth', () => {
+  const { container, grow } = setup();
+  // The vertical scrollbar track lies past the client box.
+  fireEvent.pointerDown(container, { offsetX: 305 });
+  container.scrollTop = 30;
+  fireEvent.scroll(container);
+  grow();
+  assert.equal(container.scrollTop, 30);
+});
+
+test('a click on the pane gutter keeps following', () => {
+  const { container, grow } = setup();
+  fireEvent.pointerDown(container, { offsetX: 12 });
+  grow();
+  assertAtBottom(container);
+});
+
+test('PageUp from a transcript child stops following', () => {
+  const { container, content, grow } = setup();
+  container.scrollTop = 30;
+  fireEvent.keyDown(content, { key: 'PageUp' });
+  grow();
+  assert.equal(container.scrollTop, 30);
 });
 
 after(() => {

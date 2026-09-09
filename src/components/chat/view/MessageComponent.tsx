@@ -8,6 +8,7 @@ import type {
   Provider,
   ToolResult, CodeEditorDiffInfo 
 } from '../types/types';
+import { getIntrinsicMessageKey } from '../utils/messageKeys';
 import { formatUsageLimitText } from '../utils/chatFormatting';
 import { toolOutputDensityRules } from '../utils/toolOutputDensity';
 import type { ToolOutputDensity } from '../utils/toolOutputDensity';
@@ -160,6 +161,7 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, d
     <div
       ref={messageRef}
       data-message-timestamp={message.timestamp || undefined}
+      data-message-anchor={getIntrinsicMessageKey(message) ?? undefined}
       className={`chat-message group/turn ${message.type} ${isGrouped ? 'grouped' : ''} ${message.type === 'user' ? 'flex justify-end px-3 sm:px-0' : 'px-3 sm:px-0'} ${startsExchange ? 'mt-6 border-t border-border/40 pt-6' : ''}`}
     >
       {message.type === 'user' ? (

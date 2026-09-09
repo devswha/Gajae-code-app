@@ -128,13 +128,11 @@
   "session": {
     "loading": {
       "olderMessages": "Önceki mesajlar alınıyor…",
+      "olderMessagesFailed": "Önceki mesajlar alınamadı.",
+      "retry": "Yeniden dene",
       "sessionMessages": "Konuşma mesajları alınıyor…"
     },
     "messages": {
-      "showingOf": " iletiden  tanesi görüntüleniyor {{shown}} {{total}}",
-      "loadedCount": "Yüklenen iletiler: {{shown}}",
-      "scrollToLoad": "Daha fazlası için yukarı kaydırın",
-      "showingLast": " sayısının en son  mesajı görüntüleniyor {{count}} {{total}}",
       "loadEarlier": "Daha erken mesajlar alın",
       "loadAll": "Tüm mesajları al",
       "loadFullToolOutput": "Tam çıktı alın",

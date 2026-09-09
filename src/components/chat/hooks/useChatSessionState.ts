@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
 import { authenticatedFetch } from '../../../utils/api';
@@ -7,6 +7,7 @@ import type { LLMProvider, Project, ProjectSession } from '../../../types/app';
 import type { NormalizedMessage, SessionStore } from '../../../stores/useSessionStore';
 import type { ChatMessage } from '../types/types';
 import { createCachedDiffCalculator, type DiffCalculator } from '../utils/messageTransforms';
+import { getIntrinsicMessageKey } from '../utils/messageKeys';
 
 import { normalizedToChatMessages } from './useChatMessages';
 import { useChatFollowScroll } from './useChatFollowScroll';
@@ -29,7 +30,6 @@ type Props = {
   showImagePreviews?: boolean;
 };
 
-type ScrollSnapshot = { height: number; top: number };
 type SearchRequest = { timestamp?: string; uuid?: string; snippet?: string };
 
 export function shouldRefreshCachedImageWindow(
@@ -70,6 +70,28 @@ function normalizeLocalMessage(message: ChatMessage, sessionId: string): Normali
   };
 }
 
+function hasNewTailContent(previous: ChatMessage[], next: ChatMessage[]): boolean {
+  const before = previous.at(-1);
+  const after = next.at(-1);
+  if (!before || !after) return false;
+  const beforeKey = getIntrinsicMessageKey(before);
+  const afterKey = getIntrinsicMessageKey(after);
+  if (before === after || (beforeKey !== null && beforeKey === afterKey)) {
+    return (after.content?.length ?? 0) > (before.content?.length ?? 0);
+  }
+  // Rewind/removal exposes a message we already had, not a new arrival.
+  if (afterKey !== null && previous.some(message => getIntrinsicMessageKey(message) === afterKey)) return false;
+  // Prepending history leaves the old tail last; appending puts a row after it.
+  if (beforeKey !== null && next.some(message => getIntrinsicMessageKey(message) === beforeKey)) return true;
+  // A refreshed window can replace IDs (notably a stream's persisted final row).
+  // Equal final text is reconciliation, while a genuinely newer tail is an arrival.
+  if (before.isStreaming && after.type === before.type && after.content === before.content) return false;
+  return new Date(after.timestamp).getTime() > new Date(before.timestamp).getTime()
+    || (Boolean(before.isStreaming) && after.type === before.type
+      && Boolean(after.content?.startsWith(before.content ?? ''))
+      && (after.content?.length ?? 0) > (before.content?.length ?? 0));
+}
+
 function clearTimer(timer: MutableRefObject<ReturnType<typeof setTimeout> | null>) {
   if (timer.current) clearTimeout(timer.current);
   timer.current = null;
@@ -91,6 +113,7 @@ export function useChatSessionState({
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(selectedSession?.id || null);
   const [isLoadingSessionMessages, setIsLoadingSessionMessages] = useState(false);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
+  const [historyLoadError, setHistoryLoadError] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [totalMessages, setTotalMessages] = useState(0);
   const [hasNewMessagesBelow, setHasNewMessagesBelow] = useState(false);
@@ -119,38 +142,34 @@ export function useChatSessionState({
   const storeSessionRef = useRef<string | null>(null);
   const pendingEchoRef = useRef<ChatMessage | null>(null);
   const messageLengthRef = useRef(0);
-  const priorContentRef = useRef({ count: 0, size: 0 });
+  const priorContentRef = useRef<{ sessionId: string | null; messages: ChatMessage[] }>({ sessionId: null, messages: [] });
   const previousTriggerRef = useRef(newSessionTrigger ?? 0);
   const imageStateRef = useRef({ sessionKey: null as string | null, enabled: showImagePreviews });
   const loadedKeyRef = useRef<string | null>(null);
   const initialScrollRef = useRef(true);
   const searchInProgressRef = useRef(false);
   const loadingMoreRef = useRef(false);
+  const historyLoadErrorRef = useRef(false);
   const loadedAllRef = useRef(false);
-  const topRequestLockRef = useRef(false);
-  const nearTopRef = useRef(false);
-  const restoreScrollRef = useRef<ScrollSnapshot | null>(null);
   const ignoredOffsetRef = useRef(0);
-  const overlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const finishedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const createDiff = useMemo<DiffCalculator>(createCachedDiffCalculator, []);
 
   const resetPagination = useCallback((resetVisibility: boolean) => {
     ignoredOffsetRef.current = 0;
-    loadedAllRef.current = false;
     loadingMoreRef.current = false;
-    topRequestLockRef.current = false;
-    nearTopRef.current = false;
-    restoreScrollRef.current = null;
+    historyLoadErrorRef.current = false;
+    setHistoryLoadError(false);
+    setIsLoadingMoreMessages(false);
+    loadedAllRef.current = false;
+
     setHasMoreMessages(false);
     setTotalMessages(0);
     setAllMessagesLoaded(false);
-    setIsLoadingMoreMessages(false);
     setIsLoadingAllMessages(false);
     setLoadAllJustFinished(false);
     setShowLoadAllOverlay(false);
     if (resetVisibility) setVisibleMessageCount(FIRST_VISIBLE_COUNT);
-    clearTimer(overlayTimerRef);
     clearTimer(finishedTimerRef);
   }, []);
 
@@ -217,7 +236,7 @@ export function useChatSessionState({
     if (activeSessionRef.current) sessionStore.clearRealtime(activeSessionRef.current);
   }, [sessionStore]);
   const rewindMessages = useCallback((count: number) => setViewHiddenCount(count), []);
-  const followScrollEnabled = !isLoadingMoreMessages && !restoreScrollRef.current && !searchInProgressRef.current;
+  const followScrollEnabled = !isLoadingMoreMessages && !isLoadingAllMessages && !searchInProgressRef.current;
   const {
     isFollowing,
     setFollowing,
@@ -244,96 +263,78 @@ export function useChatSessionState({
     }
   }, [allMessagesLoaded, scrollToBottom]);
 
-  const loadOlderMessages = useCallback(async (node: HTMLDivElement) => {
-    if (loadingMoreRef.current || isLoadingMoreMessages || loadedAllRef.current || !hasMoreMessages || !selectedSession || !selectedProject) return false;
+  const loadOlderMessages = useCallback(async () => {
+    if (loadingMoreRef.current || historyLoadErrorRef.current || isLoadingMoreMessages || loadedAllRef.current || !hasMoreMessages || !selectedSession || !selectedProject) return false;
+    const requestId = selectedSession.id;
     loadingMoreRef.current = true;
     setIsLoadingMoreMessages(true);
     const requestView = requestViewRef.current;
-    const old = { height: node.scrollHeight, top: node.scrollTop };
+    setFollowing(false);
     try {
-      const page = await sessionStore.fetchMore(selectedSession.id, { limit: PAGE_SIZE, includeImages: showImagePreviews });
+      const page = await sessionStore.fetchMore(requestId, { limit: PAGE_SIZE, includeImages: showImagePreviews });
       if (requestViewRef.current !== requestView) return false;
+      // A superseded or no-op page is not a failure; a reconcile after a live
+      // turn may discard an in-flight page and the next scroll asks again.
       if (!page) return false;
-      if (!page.serverMessages.length) {
-        if (!page.hasMore) {
-          loadedAllRef.current = true;
-          setAllMessagesLoaded(true);
-          setHasMoreMessages(false);
-          clearTimer(overlayTimerRef);
-          setShowLoadAllOverlay(false);
-        }
+      if (page.failed || (page.addedCount === 0 && page.hasMore)) {
+        // Never spin at one offset or pretend unreachable history is complete.
+        historyLoadErrorRef.current = true;
+        setHistoryLoadError(true);
         return false;
       }
-      restoreScrollRef.current = old;
       setHasMoreMessages(page.hasMore);
       setTotalMessages(page.total);
-      setVisibleMessageCount(value => value + PAGE_SIZE);
+      if (page.addedCount > 0) setVisibleMessageCount(value => value + page.addedCount);
       if (!page.hasMore) {
         loadedAllRef.current = true;
         setAllMessagesLoaded(true);
-        clearTimer(overlayTimerRef);
         setShowLoadAllOverlay(false);
       }
-      return true;
+      return page.addedCount > 0;
     } finally {
       if (requestViewRef.current === requestView) {
         loadingMoreRef.current = false;
         setIsLoadingMoreMessages(false);
       }
     }
-  }, [hasMoreMessages, isLoadingMoreMessages, selectedProject, selectedSession, sessionStore, showImagePreviews]);
+  }, [hasMoreMessages, isLoadingMoreMessages, selectedProject, selectedSession, sessionStore, setFollowing, showImagePreviews]);
+
+  const retryOlderMessages = useCallback(() => {
+    historyLoadErrorRef.current = false;
+    setHistoryLoadError(false);
+    void loadOlderMessages();
+  }, [loadOlderMessages]);
 
   const handleScroll = useCallback(async () => {
     const node = scrollContainerRef.current;
     if (!node) return;
     const bottom = isNearBottom();
+    if (!bottom) initialScrollRef.current = false;
     if (bottom) setHasNewMessagesBelow(false);
-    const atTop = node.scrollTop < 100;
-    if (atTop && hasMoreMessages && !loadedAllRef.current) {
-      if (!nearTopRef.current) {
-        nearTopRef.current = true;
-        clearTimer(overlayTimerRef);
-        setShowLoadAllOverlay(true);
-        overlayTimerRef.current = setTimeout(() => {
-          setShowLoadAllOverlay(false);
-          overlayTimerRef.current = null;
-        }, 2500);
-      }
-    } else if (!atTop) {
-      nearTopRef.current = false;
-    }
-    if (loadedAllRef.current) return;
-    if (!atTop) {
-      topRequestLockRef.current = false;
+    // The in-flight request guard is enough. Requiring a trip away from the
+    // top after every page forces a second gesture before history can continue.
+    if (node.scrollTop >= 100) return;
+    if (chatMessages.length > visibleMessageCount) {
+      setFollowing(false);
+      setVisibleMessageCount(count => count + 100);
       return;
     }
-    if (topRequestLockRef.current) {
-      if (node.scrollTop > 20) topRequestLockRef.current = false;
-      return;
-    }
-    if (await loadOlderMessages(node)) topRequestLockRef.current = true;
-  }, [hasMoreMessages, isNearBottom, loadOlderMessages]);
-
-  useLayoutEffect(() => {
-    const saved = restoreScrollRef.current;
-    const node = scrollContainerRef.current;
-    if (!saved || !node) return;
-    node.scrollTop = saved.top + Math.max(node.scrollHeight - saved.height, 0);
-    restoreScrollRef.current = null;
-  }, [chatMessages.length]);
+    await loadOlderMessages();
+  }, [chatMessages.length, isNearBottom, loadOlderMessages, setFollowing, visibleMessageCount]);
 
   useEffect(() => {
     if (!searchInProgressRef.current) {
       initialScrollRef.current = true;
       setVisibleMessageCount(FIRST_VISIBLE_COUNT);
     }
-    topRequestLockRef.current = false;
-    restoreScrollRef.current = null;
-    nearTopRef.current = false;
     setIsUserScrolledUp(false);
   }, [selectedProject?.projectId, selectedSession?.id, setIsUserScrolledUp]);
 
   useEffect(() => {
+    if (!isFollowing) {
+      initialScrollRef.current = false;
+      return;
+    }
     if (!initialScrollRef.current || isLoadingSessionMessages || !scrollContainerRef.current) return;
     if (!chatMessages.length || searchInProgressRef.current) {
       initialScrollRef.current = false;
@@ -358,7 +359,7 @@ export function useChatSessionState({
     };
     frameId = requestAnimationFrame(settle);
     return () => cancelAnimationFrame(frameId);
-  }, [chatMessages.length, isLoadingSessionMessages]);
+  }, [chatMessages.length, isFollowing, isLoadingSessionMessages]);
 
   useEffect(() => {
     if (!selectedProject || !selectedSession) {
@@ -525,19 +526,18 @@ export function useChatSessionState({
 
   const visibleMessages = useMemo(() => chatMessages.length <= visibleMessageCount ? chatMessages : chatMessages.slice(-visibleMessageCount), [chatMessages, visibleMessageCount]);
 
-  const lastMessage = chatMessages[chatMessages.length - 1];
-  const finalMessageSize = typeof lastMessage?.content === 'string' ? lastMessage.content.length : 0;
   useEffect(() => {
     const before = priorContentRef.current;
-    const advanced = chatMessages.length > before.count || finalMessageSize > before.size;
-    priorContentRef.current = { count: chatMessages.length, size: finalMessageSize };
-    if (!chatMessages.length || !advanced || loadingMoreRef.current || isLoadingMoreMessages || restoreScrollRef.current || searchInProgressRef.current) return;
-    if (!isFollowing) setHasNewMessagesBelow(true);
-  }, [chatMessages.length, finalMessageSize, isFollowing, isLoadingMoreMessages]);
-  useEffect(() => {
-    setHasNewMessagesBelow(false);
-    priorContentRef.current = { count: 0, size: 0 };
-  }, [activeSession]);
+    priorContentRef.current = { sessionId: activeSession, messages: chatMessages };
+    if (before.sessionId !== activeSession) {
+      setHasNewMessagesBelow(false);
+      return;
+    }
+    if (isLoadingSessionMessages || searchInProgressRef.current || isFollowing) return;
+    // Loading flags cannot identify insertion direction: pagination and realtime
+    // updates may commit together, or a genuine arrival may happen mid-request.
+    if (hasNewTailContent(before.messages, chatMessages)) setHasNewMessagesBelow(true);
+  }, [activeSession, chatMessages, isFollowing, isLoadingSessionMessages]);
   useEffect(() => {
     const node = scrollContainerRef.current;
     if (!node) return;
@@ -553,18 +553,19 @@ export function useChatSessionState({
     loadingMoreRef.current = true;
     setIsLoadingAllMessages(true);
     setShowLoadAllOverlay(true);
-    clearTimer(overlayTimerRef);
-    const node = scrollContainerRef.current;
-    const previous = node ? { height: node.scrollHeight, top: node.scrollTop } : null;
+    setFollowing(false);
     try {
       const window = await sessionStore.fetchFromServer(requestId, { limit: null, offset: 0, includeImages: showImagePreviews });
       if (requestViewRef.current !== requestView) return;
       if (!window) {
+        // Too large to serve at once, or otherwise refused: say so and offer
+        // the paged path instead of quietly dropping the request.
         loadedAllRef.current = false;
         setShowLoadAllOverlay(false);
+        historyLoadErrorRef.current = true;
+        setHistoryLoadError(true);
         return;
       }
-      if (previous) restoreScrollRef.current = previous;
       setHasMoreMessages(false);
       setTotalMessages(window.total);
       ignoredOffsetRef.current = window.total;
@@ -582,14 +583,24 @@ export function useChatSessionState({
       console.error('Error loading all messages:', error);
       loadedAllRef.current = false;
       setShowLoadAllOverlay(false);
+      historyLoadErrorRef.current = true;
+      setHistoryLoadError(true);
     } finally {
       if (requestViewRef.current === requestView) {
         loadingMoreRef.current = false;
         setIsLoadingAllMessages(false);
       }
     }
-  }, [isLoadingAllMessages, selectedProject, selectedSession, sessionStore, showImagePreviews]);
-  const loadEarlierMessages = useCallback(() => setVisibleMessageCount(count => count + 100), []);
+  }, [isLoadingAllMessages, selectedProject, selectedSession, sessionStore, setFollowing, showImagePreviews]);
+  // Reveals rows already loaded first; once the loaded window is fully shown,
+  // the same control pages further back so every history state has a click path.
+  const loadEarlierMessages = useCallback(() => {
+    if (visibleMessageCount < chatMessages.length) {
+      setVisibleMessageCount(count => count + 100);
+      return;
+    }
+    void loadOlderMessages();
+  }, [chatMessages.length, loadOlderMessages, visibleMessageCount]);
 
   return {
     chatMessages,
@@ -603,6 +614,8 @@ export function useChatSessionState({
     setCurrentSessionId,
     isLoadingSessionMessages,
     isLoadingMoreMessages,
+    historyLoadError,
+    retryOlderMessages,
     hasMoreMessages,
     totalMessages,
     isUserScrolledUp,

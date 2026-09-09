@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 
-import { act, cleanup, renderHook } from '@testing-library/react';
+import { act, cleanup, render, renderHook } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createElement } from 'react';
 
-import { useSessionStore, type NormalizedMessage, type SessionSlot, type SessionStore } from '../../../stores/useSessionStore';
+import { useSessionStore, type FetchMoreResult, type NormalizedMessage, type SessionSlot, type SessionStore } from '../../../stores/useSessionStore';
 import type { Project, ProjectSession } from '../../../types/app';
 
 import { useChatSessionState } from './useChatSessionState';
@@ -157,4 +157,284 @@ test('subscription cursors survive A → B → A, reconnect, and remount with th
   await act(async () => {});
   expectCursor('a', 'a-next', 1);
   assert.deepEqual(store.getReplayCursor('b'), { replayGeneration: 'b-first', lastSeq: 3 });
+});
+
+const message = (id: string, seconds: number, content = id): NormalizedMessage => ({
+  id, sessionId: 'session', timestamp: new Date(Date.UTC(2026, 8, 6, 0, 0, seconds)).toISOString(),
+  provider: 'gjc', kind: 'text', role: 'assistant', content,
+});
+
+async function setup() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{}', { status: 200 })) as typeof fetch;
+  let rows = [message('first', 20), message('latest', 30)];
+  let pageRequests = 0;
+  let pageResolve: ((value: FetchMoreResult) => void) | undefined;
+  let allResolve: ((value: unknown) => void) | undefined;
+  let state: ReturnType<typeof useChatSessionState> | undefined;
+  const store = {
+    setActiveSession() {},
+    getMessages: () => rows,
+    has: () => true,
+    isStale: () => false,
+    fetchFromServer: (_id: string, options: { limit: number | null }) => options.limit === null
+      ? new Promise(resolve => { allResolve = resolve; })
+      : Promise.resolve({ serverMessages: rows, hasMore: true, total: 40 }),
+    fetchMore: () => { pageRequests += 1; return new Promise(resolve => { pageResolve = resolve; }); },
+  } as unknown as SessionStore;
+  const props = {
+    selectedProject: { projectId: 'project', displayName: 'Project', fullPath: '/project' },
+    selectedSession: { id: 'session' }, ws: null, sendMessage() {}, resetStreamingState() {},
+    statusCheckSentAtRef: { current: new Map<string, number>() },
+    sessionStore: store,
+  };
+  function Harness() {
+    state = useChatSessionState(props);
+    return <div ref={state.scrollContainerRef}><div /></div>;
+  }
+  const view = render(<Harness />);
+  await act(async () => {});
+  act(() => state!.setIsUserScrolledUp(true));
+  const update = (next: NormalizedMessage[]) => {
+    rows = next;
+    view.rerender(<Harness />);
+  };
+  return {
+    state: () => state!,
+    rows: () => rows,
+    update,
+    pageRequests: () => pageRequests,
+    async page(next: NormalizedMessage[], beforeResolve?: () => void, hasMore = false) {
+      let request: Promise<void>;
+      act(() => { request = state!.handleScroll(); });
+      assert.ok(pageResolve);
+      beforeResolve?.();
+      await act(async () => {
+        const addedCount = next.length - rows.length;
+        rows = next;
+        pageResolve!({ failed: false, addedCount, hasMore, total: next.length });
+        await request!;
+      });
+    },
+    async pageOutcome(outcome: { failed: true } | null) {
+      let request: Promise<void>;
+      act(() => { request = state!.handleScroll(); });
+      assert.ok(pageResolve);
+      await act(async () => { pageResolve!(outcome); await request!; });
+    },
+    async retry(next: NormalizedMessage[]) {
+      act(() => state!.retryOlderMessages());
+      const addedCount = next.length - rows.length;
+      rows = next;
+      await act(async () => { pageResolve!({ failed: false, addedCount, hasMore: false, total: next.length }); });
+    },
+    async all(next: NormalizedMessage[] | null) {
+      let request: Promise<void>;
+      act(() => { request = state!.loadAllMessages(); });
+      assert.ok(allResolve);
+      await act(async () => {
+        if (next) rows = next;
+        allResolve!(next ? { serverMessages: rows, hasMore: false, total: rows.length } : null);
+        await request!;
+      });
+    },
+    async switchSession() {
+      props.selectedSession = { id: 'another-session' };
+      await act(async () => view.rerender(<Harness />));
+    },
+    close() { view.unmount(); globalThis.fetch = originalFetch; },
+  };
+}
+
+test('an empty page claiming more history stops automatic retries without hiding history', async () => {
+  const harness = await setup();
+  try {
+    await harness.page(harness.rows(), undefined, true);
+    assert.equal(harness.state().historyLoadError, true);
+    assert.equal(harness.state().hasMoreMessages, true);
+    assert.equal(harness.state().allMessagesLoaded, false);
+    for (let index = 0; index < 8; index++) {
+      await act(async () => { await harness.state().handleScroll(); });
+    }
+    assert.equal(harness.pageRequests(), 1);
+    assert.equal(harness.state().isLoadingMoreMessages, false);
+    await harness.retry([message('recovered', 0), ...harness.rows()]);
+    assert.equal(harness.pageRequests(), 2);
+    assert.equal(harness.state().historyLoadError, false);
+    assert.equal(harness.state().allMessagesLoaded, true);
+  } finally { harness.close(); }
+});
+
+test('a superseded page stays quiet while a failed request raises the retry banner', async () => {
+  const harness = await setup();
+  try {
+    // A reconcile after a live turn discards the in-flight page: not an error.
+    await harness.pageOutcome(null);
+    assert.equal(harness.state().historyLoadError, false);
+    assert.equal(harness.state().hasMoreMessages, true);
+    await harness.pageOutcome({ failed: true });
+    assert.equal(harness.state().historyLoadError, true);
+    assert.equal(harness.pageRequests(), 2);
+    await act(async () => { await harness.state().handleScroll(); });
+    assert.equal(harness.pageRequests(), 2, 'a failed page is not retried automatically');
+    await harness.retry([message('recovered', 0), ...harness.rows()]);
+    assert.equal(harness.state().historyLoadError, false);
+  } finally { harness.close(); }
+});
+
+test('a refused load-all surfaces the retry banner and the paged path still works', async () => {
+  const harness = await setup();
+  try {
+    await harness.all(null);
+    assert.equal(harness.state().historyLoadError, true);
+    assert.equal(harness.state().allMessagesLoaded, false);
+    assert.equal(harness.state().isLoadingAllMessages, false);
+    await act(async () => { await harness.state().handleScroll(); });
+    assert.equal(harness.pageRequests(), 0, 'no automatic paging behind an unresolved error');
+    await harness.retry([message('recovered', 0), ...harness.rows()]);
+    assert.equal(harness.state().historyLoadError, false);
+    assert.equal(harness.pageRequests(), 1);
+  } finally { harness.close(); }
+});
+
+test('load earlier pages further back once the loaded window is fully visible', async () => {
+  const harness = await setup();
+  try {
+    assert.equal(harness.state().hasMoreMessages, true);
+    act(() => harness.state().loadEarlierMessages());
+    assert.equal(harness.pageRequests(), 1, 'nothing hidden locally, so the control fetches a page');
+  } finally { harness.close(); }
+});
+
+test('reaching the top loads immediately without another leave-and-return gesture', async () => {
+  const harness = await setup();
+  try {
+    await harness.page([message('older', 10), ...harness.rows()], () => {
+      assert.equal(harness.state().isLoadingMoreMessages, true);
+      assert.equal(harness.state().showLoadAllOverlay, false);
+      act(() => { void harness.state().handleScroll(); });
+      assert.equal(harness.pageRequests(), 1, 'repeated input cannot duplicate an in-flight request');
+    }, true);
+    assert.equal(harness.state().isLoadingMoreMessages, false);
+    // Stay at scrollTop=0, as when a folded page adds no height or the user
+    // keeps pulling upward. No detour below the old 100px lock boundary.
+    await harness.page([message('oldest', 0), ...harness.rows()]);
+    assert.equal(harness.pageRequests(), 2);
+    await act(async () => { await harness.state().handleScroll(); });
+    assert.equal(harness.pageRequests(), 2, 'end of history never sends another request');
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('reaching the top reveals already cached older rows without clicking a count notice', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.update(Array.from({ length: 130 }, (_, index) => message(`row-${index}`, index))));
+    assert.equal(harness.state().visibleMessages.length, 100);
+    await act(async () => { await harness.state().handleScroll(); });
+    assert.equal(harness.state().visibleMessages.length, 130);
+    assert.equal(harness.pageRequests(), 0);
+  } finally { harness.close(); }
+});
+
+test('loading an older page does not announce existing messages below as new', async () => {
+  const harness = await setup();
+  try {
+    await harness.page([message('older', 10), ...harness.rows()]);
+    assert.equal(harness.state().isUserScrolledUp, true);
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('load-all does not announce historical messages as new', async () => {
+  const harness = await setup();
+  try {
+    await harness.all([message('oldest', 0), message('older', 10), ...harness.rows()]);
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('new tail arrival still announces while an older page is in flight', async () => {
+  const harness = await setup();
+  try {
+    const arrived = message('arrived', 40);
+    await harness.page([message('older', 10), ...harness.rows(), arrived], () => {
+      act(() => harness.update([...harness.rows(), arrived]));
+      assert.equal(harness.state().isLoadingMoreMessages, true);
+      assert.equal(harness.state().hasNewMessagesBelow, true);
+    });
+    assert.equal(harness.state().hasNewMessagesBelow, true);
+  } finally { harness.close(); }
+});
+
+test('a genuine append in the same commit as prepend is announced', async () => {
+  const harness = await setup();
+  try {
+    await harness.page([message('older', 10), ...harness.rows(), message('arrived', 40)]);
+    assert.equal(harness.state().hasNewMessagesBelow, true);
+    act(() => harness.state().scrollToBottomAndReset());
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('tail growth is announced without increasing the message count', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.update([harness.rows()[0], message('latest', 30, 'latest streaming addition')]));
+    assert.equal(harness.state().hasNewMessagesBelow, true);
+  } finally { harness.close(); }
+});
+
+test('refreshing identical rows during history loading does not raise a badge', async () => {
+  const harness = await setup();
+  try {
+    await harness.page([message('older', 10), ...harness.rows().map(row => ({ ...row }))]);
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('returning to previously viewed content after rewind is not a new arrival', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.state().rewindMessages(1));
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('a finalized stream with only a persisted ID change is not a new message', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.state().setIsUserScrolledUp(false));
+    act(() => harness.update([harness.rows()[0], { ...message('stream', 30, 'answer'), kind: 'stream_delta' }]));
+    act(() => harness.state().setIsUserScrolledUp(true));
+    act(() => harness.update([harness.rows()[0], message('persisted', 35, 'answer')]));
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('switching sessions clears an existing unread badge', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.update([...harness.rows(), message('new', 40)]));
+    assert.equal(harness.state().hasNewMessagesBelow, true);
+    await harness.switchSession();
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('while following, new content does not create an unread badge', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.state().setIsUserScrolledUp(false));
+    act(() => harness.update([...harness.rows(), message('new', 40)]));
+    assert.equal(harness.state().hasNewMessagesBelow, false);
+  } finally { harness.close(); }
+});
+
+test('tail-window replacement notices a new message even with an unchanged count', async () => {
+  const harness = await setup();
+  try {
+    act(() => harness.update([harness.rows()[1], message('new', 40, 'x')]));
+    assert.equal(harness.state().hasNewMessagesBelow, true);
+  } finally { harness.close(); }
 });

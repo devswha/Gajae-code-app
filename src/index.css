@@ -561,11 +561,10 @@
 
   .chat-message {
     hyphens: auto; overflow-wrap: break-word; word-wrap: break-word;
-    contain-intrinsic-size: auto 180px; content-visibility: auto; contain: layout style paint;
+    /* Pagination anchors use actual geometry. Estimated offscreen heights
+       changed the scroll range a second time after every prepend. */
+    contain: layout style paint;
   }
-
-  .chat-message.assistant { contain-intrinsic-size: auto 240px; }
-  .chat-message.user, .chat-message.tool, .chat-message.error { contain-intrinsic-size: auto 96px; }
 
   .chat-message pre,
   .chat-message code {

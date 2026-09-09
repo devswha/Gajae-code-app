@@ -64,7 +64,6 @@
     "stopSpeaking": "Останавливаться",
     "loading": "Загрузка…"
   },
-
   "input": {
     "placeholder": "Спросите {{provider}}, используйте / для команд или @ для добавления файлов…",
     "modelReasoning": {
@@ -131,13 +130,11 @@
   "session": {
     "loading": {
       "olderMessages": "Получение предыдущих сообщений…",
+      "olderMessagesFailed": "Не удалось получить предыдущие сообщения.",
+      "retry": "Повторить",
       "sessionMessages": "Получение сообщений беседы…"
     },
     "messages": {
-      "showingOf": "Отображение {{shown}} из {{total}} сообщений",
-      "loadedCount": "Загружено сообщений: {{shown}}",
-      "scrollToLoad": "Прокрутите вверх, чтобы увидеть больше",
-      "showingLast": "Отображение последних сообщений {{count}} из {{total}}",
       "loadEarlier": "Получить более ранние сообщения",
       "loadAll": "Получить все сообщения",
       "loadFullToolOutput": "Получить полный вывод",
