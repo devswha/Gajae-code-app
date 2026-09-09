@@ -43,6 +43,7 @@ import {
   serializeBrowserFrame,
   type BrowserCommand,
   type BrowserChildActivity,
+  isBrowserClipboardInput,
   type BrowserEventFrame,
   type BrowserInput,
   type BrowserRequestFrame,
@@ -81,6 +82,7 @@ type Tab = {
   screencasting: boolean;
   screencastListenerAttached: boolean;
   viewport: BrowserViewportSize;
+  deviceScaleFactor: number;
 };
 
 type Session = {
@@ -112,10 +114,27 @@ type AxNode = {
   value?: { value?: string | number | boolean };
 };
 
+type ClipboardSelection = {
+  text: string;
+  editable: boolean;
+  selectionId: string;
+};
+
 const CACHE_ROOT = process.env.GAJAE_BROWSER_CACHE_DIR ?? join(homedir(), '.gajae-app', 'browser', 'chromium');
 const PROFILE_ROOT = process.env.GAJAE_BROWSER_PROFILE_DIR ?? join(homedir(), '.gajae-app', 'browser', 'profile');
 const MAX_RUN_CODE_BYTES = 64 * 1024;
 const MAX_RESULT_TEXT = 256 * 1024;
+const DEFAULT_BROWSER_DEVICE_SCALE_FACTOR = 1;
+export const MAX_BROWSER_DEVICE_SCALE_FACTOR = 2;
+const MAX_CLIPBOARD_TEXT = 1024 * 1024;
+const MAX_BROWSER_FRAME_WIDTH = 5_120;
+const MAX_BROWSER_FRAME_HEIGHT = 3_200;
+
+export function normalizeBrowserDeviceScaleFactor(value: unknown): number | null {
+  if (value === undefined) return DEFAULT_BROWSER_DEVICE_SCALE_FACTOR;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  return Math.min(Math.max(Math.round(value * 100) / 100, DEFAULT_BROWSER_DEVICE_SCALE_FACTOR), MAX_BROWSER_DEVICE_SCALE_FACTOR);
+}
 
 /** Console-style page evaluation: preserve completion values and support top-level await. */
 export async function evaluateBrowserScript(cdp: Pick<CDPSession, 'send'>, code: string): Promise<unknown> {
@@ -469,9 +488,18 @@ export class BrowserRuntime {
           break;
         case 'fill':
           await this.focus(tab, command);
-          await page.keyboard.down(process.platform === 'darwin' ? 'Meta' : 'Control');
-          await page.keyboard.press('A');
-          await page.keyboard.up(process.platform === 'darwin' ? 'Meta' : 'Control');
+          await page.evaluate(() => {
+            const active = document.activeElement;
+            if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+              active.select();
+            } else if (active instanceof HTMLElement && active.isContentEditable) {
+              const selection = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(active);
+              selection?.removeAllRanges();
+              selection?.addRange(range);
+            }
+          });
           await page.keyboard.type(command.text);
           break;
         case 'select':
@@ -537,22 +565,52 @@ export class BrowserRuntime {
     }).promise;
   }
 
-  async input(sessionId: string, input: BrowserInput): Promise<{ accepted: true }> {
+  async input(sessionId: string, input: BrowserInput): Promise<Record<string, unknown>> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error('session_not_found: Open the browser session first.');
     this.requireOpen(session);
     return this.track(session, async () => {
       this.requireOpen(session);
       const tab = this.activeTab(session);
+      if (input.kind === 'clipboard') {
+        if (!isBrowserClipboardInput(input)) {
+          throw new Error('invalid_clipboard: Clipboard input must bind to a valid browser tab.');
+        }
+        if (input.tabId !== tab.id) {
+          throw new Error('clipboard_target_changed: The browser tab changed before the clipboard operation completed.');
+        }
+        if (input.event === 'read') {
+          const selection = await this.readClipboardSelection(tab);
+          if (Buffer.byteLength(selection.text, 'utf8') > MAX_CLIPBOARD_TEXT) {
+            throw new Error('clipboard_too_large: The selected text is too large to copy.');
+          }
+          return { accepted: true, ...selection };
+        }
+        if (Buffer.byteLength(input.text, 'utf8') > MAX_CLIPBOARD_TEXT) {
+          throw new Error('clipboard_too_large: Clipboard text is too large.');
+        }
+        if (input.event === 'delete') {
+          const deleted = await this.deleteClipboardSelection(tab, input.text, input.selectionId);
+          return { accepted: true, deleted };
+        }
+        const cdp = await this.cdp(tab);
+        await cdp.send('Input.insertText', { text: input.text });
+        return { accepted: true };
+      }
       const cdp = await this.cdp(tab);
       if (input.kind === 'viewport') {
         const viewport = normalizeBrowserViewport(input.width, input.height);
         if (!viewport) throw new Error('invalid_viewport: Browser viewport dimensions must be positive finite numbers.');
-        if (viewport.width !== tab.viewport.width || viewport.height !== tab.viewport.height) {
+        const deviceScaleFactor = normalizeBrowserDeviceScaleFactor(input.deviceScaleFactor);
+        if (deviceScaleFactor === null) throw new Error('invalid_viewport: Device scale factor must be a positive finite number.');
+        if (viewport.width !== tab.viewport.width
+          || viewport.height !== tab.viewport.height
+          || deviceScaleFactor !== tab.deviceScaleFactor) {
           const resumeScreencast = tab.screencasting && session.subscribed && session.activeTabId === tab.id;
           if (resumeScreencast) await this.stopScreencast(tab);
+          await this.applyViewport(tab, viewport, deviceScaleFactor, cdp);
           tab.viewport = viewport;
-          await tab.page.setViewport({ ...viewport, deviceScaleFactor: 1 });
+          tab.deviceScaleFactor = deviceScaleFactor;
           if (resumeScreencast) await this.startScreencast(session, tab);
         }
       } else if (input.kind === 'mouse') {
@@ -664,7 +722,10 @@ export class BrowserRuntime {
         browser = await launchBrowserWithLinuxFallback(installed.executablePath, {
           userDataDir: profilePath,
           headless: true,
-          defaultViewport: { ...DEFAULT_BROWSER_VIEWPORT, deviceScaleFactor: 1 },
+          defaultViewport: {
+            ...DEFAULT_BROWSER_VIEWPORT,
+            deviceScaleFactor: DEFAULT_BROWSER_DEVICE_SCALE_FACTOR,
+          },
           downloadBehavior: { policy: 'deny' },
           args: ['--disable-background-networking', '--disable-component-update', '--no-first-run'],
         }, {
@@ -805,13 +866,14 @@ export class BrowserRuntime {
       screencasting: false,
       screencastListenerAttached: false,
       viewport: DEFAULT_BROWSER_VIEWPORT,
+      deviceScaleFactor: DEFAULT_BROWSER_DEVICE_SCALE_FACTOR,
     };
     session.tabs.set(tab.id, tab);
     session.activeTabId = tab.id;
     this.ownerByTarget.set(page.target(), session);
     this.changed();
-    await page.setViewport({ ...DEFAULT_BROWSER_VIEWPORT, deviceScaleFactor: 1 });
     const cdp = await this.cdp(tab);
+    await this.applyViewport(tab, DEFAULT_BROWSER_VIEWPORT, DEFAULT_BROWSER_DEVICE_SCALE_FACTOR, cdp);
     const rememberMainFrame = (frameId: string) => {
       this.ownerByFrameId.set(frameId, { sessionId: session.id, tabId: tab.id });
     };
@@ -898,6 +960,137 @@ export class BrowserRuntime {
     }));
   }
 
+  private async applyViewport(
+    tab: Tab,
+    viewport: BrowserViewportSize,
+    deviceScaleFactor: number,
+    cdp: CDPSession,
+  ): Promise<void> {
+    await tab.page.setViewport({ ...viewport, deviceScaleFactor });
+    // Puppeteer's viewport emulation updates CSS metrics and DPR, but
+    // Page.startScreencast still emits CSS-sized frames. A viewport scale
+    // requests the physical backing surface while preserving CSS input space.
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: viewport.width,
+      height: viewport.height,
+      deviceScaleFactor,
+      mobile: false,
+      viewport: {
+        x: 0,
+        y: 0,
+        width: viewport.width,
+        height: viewport.height,
+        scale: deviceScaleFactor,
+      },
+    });
+  }
+
+  private async readClipboardSelection(tab: Tab): Promise<ClipboardSelection> {
+    return tab.page.evaluate(() => {
+      const nodePath = (node: Node | null): string => {
+        const parts: number[] = [];
+        let current = node;
+        while (current && current !== document) {
+          const parent = current.parentNode;
+          if (!parent) break;
+          parts.push(Array.prototype.indexOf.call(parent.childNodes, current));
+          current = parent;
+        }
+        return parts.reverse().join('.');
+      };
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement && active.type === 'password') {
+        return { text: '', editable: false, selectionId: 'none' };
+      }
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        const start = active.selectionStart;
+        const end = active.selectionEnd;
+        if (start !== null && end !== null && start !== end) {
+          return {
+            text: active.value.slice(start, end),
+            editable: !active.readOnly && !active.disabled,
+            selectionId: `control:${nodePath(active)}:${start}:${end}`,
+          };
+        }
+        return { text: '', editable: false, selectionId: 'none' };
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0) {
+        return { text: '', editable: false, selectionId: 'none' };
+      }
+      const anchor = selection.anchorNode;
+      const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE
+        ? anchor as Element
+        : anchor?.parentElement;
+      const editable = Boolean(
+        (active instanceof HTMLElement && active.isContentEditable)
+        || anchorElement?.closest('[contenteditable="true"],[contenteditable="plaintext-only"]'),
+      );
+      return {
+        text: selection.toString(),
+        editable,
+        selectionId: `range:${nodePath(selection.anchorNode)}:${selection.anchorOffset}:${nodePath(selection.focusNode)}:${selection.focusOffset}`,
+      };
+    });
+  }
+
+  private async deleteClipboardSelection(tab: Tab, expectedText: string, expectedSelectionId: string): Promise<boolean> {
+    return tab.page.evaluate(({ expectedText: text, expectedSelectionId: selectionId }) => {
+      const nodePath = (node: Node | null): string => {
+        const parts: number[] = [];
+        let current = node;
+        while (current && current !== document) {
+          const parent = current.parentNode;
+          if (!parent) break;
+          parts.push(Array.prototype.indexOf.call(parent.childNodes, current));
+          current = parent;
+        }
+        return parts.reverse().join('.');
+      };
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement && active.type === 'password') return false;
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+        const start = active.selectionStart;
+        const end = active.selectionEnd;
+        if (
+          start !== null
+          && end !== null
+          && start !== end
+          && !active.readOnly
+          && !active.disabled
+          && active.value.slice(start, end) === text
+          && `control:${nodePath(active)}:${start}:${end}` === selectionId
+        ) {
+          active.setRangeText('', start, end, 'start');
+          active.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            inputType: 'deleteByCut',
+            data: null,
+          }));
+          return true;
+        }
+        return false;
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || selection.toString() !== text) return false;
+      const anchor = selection.anchorNode;
+      const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE
+        ? anchor as Element
+        : anchor?.parentElement;
+      if (!(
+        (active instanceof HTMLElement && active.isContentEditable)
+        || anchorElement?.closest('[contenteditable="true"],[contenteditable="plaintext-only"]')
+      )) return false;
+      const currentSelectionId = `range:${nodePath(selection.anchorNode)}:${selection.anchorOffset}:${nodePath(selection.focusNode)}:${selection.focusOffset}`;
+      if (currentSelectionId !== selectionId) return false;
+      selection.deleteFromDocument();
+      const editableElement = anchorElement?.closest('[contenteditable="true"],[contenteditable="plaintext-only"]')
+        ?? (active instanceof HTMLElement && active.isContentEditable ? active : null);
+      editableElement?.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteByCut' }));
+      return true;
+    }, { expectedText, expectedSelectionId });
+  }
+
   private async cdp(tab: Tab): Promise<CDPSession> {
     if (!tab.cdp) tab.cdp = await tab.page.createCDPSession();
     return tab.cdp;
@@ -927,12 +1120,30 @@ export class BrowserRuntime {
           tabId: tab.id,
           mimeType: 'image/jpeg',
           data: event.data,
-          metadata: event.metadata as unknown as Record<string, unknown>,
+          // CDP's deviceWidth/deviceHeight can describe physical pixels after
+          // device emulation. Keep the public frame contract in CSS pixels so
+          // input coordinates remain in the same space as window.innerWidth.
+          metadata: {
+            ...object(event.metadata),
+            deviceWidth: tab.viewport.width,
+            deviceHeight: tab.viewport.height,
+            cssWidth: tab.viewport.width,
+            cssHeight: tab.viewport.height,
+            deviceScaleFactor: tab.deviceScaleFactor,
+          },
         }, session.id);
       });
     }
+    const maxWidth = Math.min(
+      MAX_BROWSER_FRAME_WIDTH,
+      Math.max(1, Math.round(tab.viewport.width * tab.deviceScaleFactor)),
+    );
+    const maxHeight = Math.min(
+      MAX_BROWSER_FRAME_HEIGHT,
+      Math.max(1, Math.round(tab.viewport.height * tab.deviceScaleFactor)),
+    );
     await cdp.send('Page.startScreencast', {
-      format: 'jpeg', quality: 70, maxWidth: 1440, maxHeight: 900, everyNthFrame: 1,
+      format: 'jpeg', quality: 80, maxWidth, maxHeight, everyNthFrame: 1,
     });
   }
 

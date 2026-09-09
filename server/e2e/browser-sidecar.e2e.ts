@@ -230,7 +230,7 @@ test('real Chromium sidecar shares structured actions, tabs, and screencast stat
   const status = await sidecar.request('status') as { installed: boolean };
   assert.equal(status.installed, true, 'activate the Browser panel once before running this E2E');
 
-  const opened = await sidecar.request('session.open', 'browser-e2e', { url, allowDownload: false }) as { tabs: unknown[] };
+  const opened = await sidecar.request('session.open', 'browser-e2e', { url, allowDownload: false }) as { activeTabId: string; tabs: unknown[] };
   assert.equal(opened.tabs.length, 1);
   await sidecar.request('screencast.subscribe', 'browser-e2e');
   await sidecar.waitForEvent('frame');
@@ -267,6 +267,83 @@ test('real Chromium sidecar shares structured actions, tabs, and screencast stat
   assert.equal(resizedFrame.kind === 'event' && resizedFrame.payload.metadata && typeof resizedFrame.payload.metadata === 'object'
     ? (resizedFrame.payload.metadata as { deviceHeight?: number }).deviceHeight
     : undefined, 742);
+
+  const retinaFrameStart = sidecar.events.length;
+  await sidecar.request('browser.input', 'browser-e2e', {
+    input: { kind: 'viewport', width: 1000, height: 700, deviceScaleFactor: 2 },
+  });
+  assert.deepEqual(await runScript('({ width: innerWidth, height: innerHeight, scale: devicePixelRatio })'), {
+    value: { width: 1000, height: 700, scale: 2 },
+  });
+  const retinaFrame = await sidecar.waitForEvent('frame', 5_000, retinaFrameStart);
+  assert.equal(retinaFrame.kind, 'event');
+  if (retinaFrame.kind !== 'event') throw new Error('Expected a browser frame.');
+  const retinaSize = await runScript(`const image = new Image();
+    image.src = ${JSON.stringify(`data:image/jpeg;base64,${retinaFrame.payload.data}`)};
+    await image.decode();
+    ({ width: image.naturalWidth, height: image.naturalHeight });`);
+  assert.deepEqual(retinaSize, { value: { width: 2000, height: 1400 } },
+    'the streamed image must retain physical pixels beyond the old 1440×900 cap');
+  assert.equal((retinaFrame.payload.metadata as { deviceWidth: number }).deviceWidth, 1000);
+  assert.equal((retinaFrame.payload.metadata as { deviceHeight: number }).deviceHeight, 700);
+  await runScript(`const corner = document.createElement('button'); corner.id = 'retina-corner';
+    corner.style = 'position:fixed;right:0;bottom:0;width:40px;height:40px';
+    corner.onclick = () => { window.retinaClicked = true; }; document.body.append(corner);`);
+  for (const event of ['down', 'up']) {
+    await sidecar.request('browser.input', 'browser-e2e', {
+      input: { kind: 'mouse', event, x: 980, y: 680, button: 'left' },
+    });
+  }
+  assert.deepEqual(await runScript('window.retinaClicked'), { value: true },
+    'high-DPI preview input must reach the bottom-right CSS coordinates');
+
+  const clipboard = (input: Record<string, unknown>) => sidecar.request('browser.input', 'browser-e2e', {
+    input: { kind: 'clipboard', tabId: opened.activeTabId, ...input },
+  });
+  await runScript(`const input = document.querySelector('#name');
+    window.cutInputEvents = 0;
+    input.addEventListener('input', () => { window.cutInputEvents++; });
+    input.value = '복사할 텍스트'; input.focus(); input.select();`);
+  const copied = await clipboard({ event: 'read' }) as { text: string; selectionId: string };
+  assert.equal(copied.text, '복사할 텍스트');
+  assert.deepEqual(await runScript('document.querySelector("#name").value'), { value: '복사할 텍스트' },
+    'copy must not mutate the selected input');
+  await clipboard({ event: 'delete', text: copied.text, selectionId: copied.selectionId });
+  assert.deepEqual(await runScript('document.querySelector("#name").value'), { value: '' });
+  assert.deepEqual(await runScript('window.cutInputEvents'), { value: 1 },
+    'cut must notify reactive input handlers');
+  await clipboard({ event: 'paste', text: '붙여넣기 ✓' });
+  assert.deepEqual(await runScript('document.querySelector("#name").value'), { value: '붙여넣기 ✓' });
+  await runScript('document.querySelector("#name").select()');
+  const staleCopy = await clipboard({ event: 'read' }) as { text: string; selectionId: string };
+  await runScript('document.querySelector("#name").setSelectionRange(0, 1)');
+  assert.deepEqual(await clipboard({ event: 'delete', text: staleCopy.text, selectionId: staleCopy.selectionId }),
+    { accepted: true, deleted: false }, 'cut must not delete a changed selection');
+  await runScript('document.querySelector("#name").readOnly = true; document.querySelector("#name").select()');
+  const readonlyCopy = await clipboard({ event: 'read' }) as { text: string; editable: boolean; selectionId: string };
+  assert.equal(readonlyCopy.editable, false);
+  assert.deepEqual(await clipboard({ event: 'delete', text: readonlyCopy.text, selectionId: readonlyCopy.selectionId }),
+    { accepted: true, deleted: false });
+  await runScript('document.querySelector("#name").readOnly = false');
+  await runScript(`const password = document.createElement('input');
+    password.type = 'password'; password.value = 'private password'; password.id = 'password';
+    document.body.append(password); password.focus(); password.select();`);
+  const passwordCopy = await clipboard({ event: 'read' }) as { text: string; editable: boolean };
+  assert.equal(passwordCopy.text, '', 'password selections must never cross the clipboard bridge');
+  assert.equal(passwordCopy.editable, false);
+  await runScript('document.querySelector("#password").remove()');
+  await runScript(`const editable = document.createElement('div');
+    editable.id = 'editable'; editable.contentEditable = 'true';
+    editable.textContent = 'editable selection'; document.body.append(editable);
+    editable.focus(); const range = document.createRange(); range.selectNodeContents(editable);
+    getSelection().removeAllRanges(); getSelection().addRange(range);`);
+  const editableCopy = await clipboard({ event: 'read' }) as { text: string; selectionId: string };
+  assert.equal(editableCopy.text, 'editable selection');
+  await clipboard({ event: 'delete', text: editableCopy.text, selectionId: editableCopy.selectionId });
+  await clipboard({ event: 'paste', text: 'editable paste' });
+  assert.deepEqual(await runScript('document.querySelector("#editable").textContent'), { value: 'editable paste' });
+  await assert.rejects(clipboard({ event: 'paste', tabId: 'wrong-tab', text: 'must not insert' }), /browser tab changed/i);
+  assert.deepEqual(await runScript('document.querySelector("#editable").textContent'), { value: 'editable paste' });
 
   const observed = await sidecar.request('browser.command', 'browser-e2e', {
     command: { action: 'observe' },

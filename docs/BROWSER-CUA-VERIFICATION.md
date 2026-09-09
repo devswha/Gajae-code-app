@@ -28,6 +28,24 @@ and published beta.10 app is unchanged until a new versioned build is released.
 
 ## Implemented surface
 
+### Unreleased panel fixes — 2026-09-09
+
+- Preview sizing includes the viewer's device pixel ratio (bounded at 2×).
+  Screencast frames are no longer capped at 1440×900; pointer coordinates remain
+  in CSS pixels rather than physical image pixels.
+- With the preview focused, Ctrl/Cmd+C, X and V transfer plain text between the
+  viewer's clipboard and the remote page selection. Cut deletes only after a
+  successful local clipboard write and a matching remote selection check.
+  Delayed operations are bound to the originating tab.
+- Clipboard access requires the viewer's browser permission and a secure
+  context. This is user-triggered text transfer, not ambient system clipboard
+  synchronization; images, files and rich HTML are not transferred.
+- Real Chromium regression coverage decodes a 2000×1400 streamed frame for a
+  1000×700 CSS viewport at 2×, checks a bottom-right pointer target, and exercises
+  input/contenteditable copy, cut and paste, changed-selection refusal,
+  readonly controls and reactive input events.
+- These are source changes, not acceptance of a newly packaged or installed app.
+
 ### Unreleased panel fixes — 2026-09-07
 
 - The selected conversation watches `/ws/browser?sessionId=…&mode=state`
@@ -89,7 +107,8 @@ These fixes are unreleased. Published/installed beta.10 remains unchanged.
 
 The PoC intentionally excludes file upload, automatic download saving, browser
 extensions, existing Chrome profiles, force-quitting native apps, clipboard
-reading, file transfer, screen recording, and lock-screen control.
+reading through the CUA driver, file transfer, screen recording, and lock-screen
+control. The panel's explicit plain-text clipboard shortcuts are described above.
 
 ## Automated evidence
 

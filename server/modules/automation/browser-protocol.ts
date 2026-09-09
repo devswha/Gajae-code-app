@@ -52,12 +52,39 @@ export type BrowserCommand =
 
 export type BrowserWaitUntil = 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2';
 
+/**
+ * Clipboard operations are deliberately two-phase for copy/cut. A read only
+ * observes the remote selection; the client writes that text to its own
+ * clipboard before asking the sidecar to delete the still-matching selection.
+ * The tab binding prevents a delayed local clipboard permission result from
+ * mutating a different active tab.
+ */
+export type BrowserClipboardInput =
+  | { kind: 'clipboard'; event: 'read'; tabId: string }
+  | { kind: 'clipboard'; event: 'delete'; tabId: string; text: string; selectionId: string }
+  | { kind: 'clipboard'; event: 'paste'; tabId: string; text: string };
+
 export type BrowserInput =
   | { kind: 'mouse'; event: 'move' | 'down' | 'up'; x: number; y: number; button?: 'left' | 'right' | 'middle'; clickCount?: number }
   | { kind: 'wheel'; x: number; y: number; deltaX: number; deltaY: number }
   | { kind: 'key'; event: 'down' | 'up'; key: string; code?: string; modifiers?: number }
   | { kind: 'text'; text: string }
-  | { kind: 'viewport'; width: number; height: number };
+  | { kind: 'viewport'; width: number; height: number; deviceScaleFactor?: number }
+  | BrowserClipboardInput;
+
+export function isBrowserClipboardInput(value: unknown): value is BrowserClipboardInput {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const input = value as Record<string, unknown>;
+  if (input.kind !== 'clipboard' || !safeSessionId(input.tabId)) return false;
+  if (input.event === 'read') return Object.keys(input).length === 3;
+  if (input.event === 'paste') return Object.keys(input).length === 4 && typeof input.text === 'string';
+  return input.event === 'delete'
+    && Object.keys(input).length === 5
+    && typeof input.text === 'string'
+    && typeof input.selectionId === 'string'
+    && input.selectionId.length > 0
+    && input.selectionId.length <= 2_048;
+}
 
 export type BrowserRequestMethod =
   | 'initialize'
