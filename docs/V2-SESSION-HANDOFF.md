@@ -1,5 +1,12 @@
 # gajae-app v2 — Session Handoff (resume state)
 
+Latest user-test installer: **beta.11 / desktop 0.2.5**, built from `e28fa6d`,
+signed/notarized/stapled and delivered to Downloads. Final copied-app server,
+data-survival and actual isolated GUI quit/reopen/draft/image/settings checks
+passed. This is a **manual-install, updater-disabled private test DMG**, not a
+public updater release; the existing production installation was not changed.
+Artifact hash, exact source and limits: [RELEASE-BETA11-TEST.md](RELEASE-BETA11-TEST.md).
+
 Production updater key: local encrypted-file + login-Keychain provisioning and
 sign/verify/negative checks passed on September 9. Do not regenerate it.
 Independent external backup and release gates remain open. Exact local metadata
