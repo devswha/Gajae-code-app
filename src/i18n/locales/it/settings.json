@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "Aggiorna",
     "updating": "Aggiornamento in corso…",
+    "restartToInstall": "Riavvia per installare",
+    "restarting": "Riavvio in corso…",
+    "readyHelp": "L’aggiornamento è scaricato e verificato. Il riavvio chiude brevemente l’app e la riapre come {{version}}. Salva prima il tuo lavoro.",
     "manualHelp": "Aggiorna avvia il download e richiede un riavvio sicuro. I controlli non scaricano né installano aggiornamenti.",
     "awaitingOperation": "In attesa del termine dell’operazione nativa precedente. Non riprovare ancora.",
     "targetVersion": "Versione {{version}}",

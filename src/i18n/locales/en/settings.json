@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "Update",
     "updating": "Updating…",
+    "restartToInstall": "Restart to install",
+    "restarting": "Restarting…",
+    "readyHelp": "The update is downloaded and verified. Restarting closes the app briefly and reopens it as {{version}}. Save your work first.",
     "manualHelp": "Click Update to download and request a safe restart. Checks never download or install updates.",
     "awaitingOperation": "Waiting for the previous native operation to finish. Do not retry yet.",
     "targetVersion": "Version {{version}}",

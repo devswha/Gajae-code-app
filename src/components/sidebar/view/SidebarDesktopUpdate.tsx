@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 
 import { useDesktopUpdate } from '../../../hooks/useDesktopUpdate';
 import { Button } from '../../../shared/view/ui/Button';
-import { DesktopUpdateProgress, DesktopUpdateStatus, desktopUpdateControls } from '../../settings/view/tabs/DesktopUpdatePanel';
+import { DesktopUpdateProgress, DesktopUpdateStatus, desktopUpdateAction, desktopUpdateControls } from '../../settings/view/tabs/DesktopUpdatePanel';
 
 // A notice dismissal lasts only for this page and this exact native target.
 // It survives sidebar mode swaps, but never disables checks or hides a new target.
@@ -42,6 +42,7 @@ function SidebarDesktopUpdateNotice({ update, targetId, collapsed, onExpand }: P
   const id = useId();
   const { snapshot, error, updating } = update;
   const { locked, busy, statusOnly, canUpdate } = desktopUpdateControls(update);
+  const action = desktopUpdateAction(update);
   if (!snapshot) return null;
 
   const version = snapshot.targetProductVersion || snapshot.targetDesktopVersion;
@@ -74,10 +75,10 @@ function SidebarDesktopUpdateNotice({ update, targetId, collapsed, onExpand }: P
     <DesktopUpdateProgress update={update} />
     {!snapshot.installationAvailable && <p className="text-muted-foreground">{t('desktopUpdate.preparationOnly')}</p>}
     {canUpdate && <>
-      <p id={`${id}-manual`} className="text-muted-foreground">{t('desktopUpdate.manualHelp')}</p>
+      <p id={`${id}-manual`} className="text-muted-foreground">{t(action.helpKey, { version: action.version })}</p>
       <Button type="button" size="sm" className="h-auto min-h-9 w-full whitespace-normal" disabled={locked}
         aria-describedby={`${id}-manual`} onClick={() => { void update.update(); }}>
-        {t(updating ? 'desktopUpdate.updating' : 'desktopUpdate.update')}
+        {t(action.labelKey)}
       </Button>
     </>}
     {(error || statusOnly || showRetry) && <Button type="button" size="sm" variant="outline"

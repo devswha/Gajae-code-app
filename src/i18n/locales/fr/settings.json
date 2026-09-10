@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "Mettre à jour",
     "updating": "Mise à jour en cours…",
+    "restartToInstall": "Redémarrer pour installer",
+    "restarting": "Redémarrage…",
+    "readyHelp": "La mise à jour est téléchargée et vérifiée. Le redémarrage ferme brièvement l’application et la rouvre en {{version}}. Enregistrez d’abord votre travail.",
     "manualHelp": "Mettre à jour lance le téléchargement et demande un redémarrage sûr. Les vérifications ne téléchargent ni n’installent rien.",
     "awaitingOperation": "L’opération native précédente n’est pas terminée. Ne réessayez pas encore.",
     "targetVersion": "Version {{version}}",

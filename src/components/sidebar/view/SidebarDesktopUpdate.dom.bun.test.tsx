@@ -157,13 +157,15 @@ test('Update explicitly downloads then requests one target-bound restart; duplic
   assert.equal(screen.queryByRole('button', { name: english.desktopUpdate.update }), null);
 });
 
-test('ready target uses Update to request restart only after a click', async () => {
+test('ready target offers Restart to install and requests restart only after a click', async () => {
   const snapshot = native({ phase: 'ready' });
   const commands: DesktopUpdateCommand[] = [];
   inject(async (command) => { commands.push(command); return command.action === 'restart' ? { ...snapshot, phase: 'restarting' } : snapshot; });
   await mount();
   assert.deepEqual(writes(commands), []);
-  const button = screen.getByRole('button', { name: english.desktopUpdate.update });
+  assert.equal(screen.queryByRole('button', { name: english.desktopUpdate.update }), null);
+  assert.ok(screen.getByText(english.desktopUpdate.readyHelp.replace('{{version}}', '2.0.0-beta.11')));
+  const button = screen.getByRole('button', { name: english.desktopUpdate.restartToInstall });
   act(() => button.focus());
   assert.equal(document.activeElement, button);
   await act(async () => { fireEvent.click(button); });
@@ -313,10 +315,10 @@ test('busy, changed, and failed updates show translated actionable hints and nev
       const commands: DesktopUpdateCommand[] = [];
       inject(async (command) => { commands.push(command); return command.action === 'restart' ? { ...snapshot, reason } : snapshot; });
       const view = await mount('notice', language);
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: translations.desktopUpdate.update })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: translations.desktopUpdate.restartToInstall })); });
       const hint = screen.getByText(translations.desktopUpdate.updateErrors[error]);
       assert.ok(screen.getByRole('status').contains(hint));
-      assert.equal((screen.getByRole('button', { name: translations.desktopUpdate.update }) as HTMLButtonElement).disabled, false);
+      assert.equal((screen.getByRole('button', { name: translations.desktopUpdate.restartToInstall }) as HTMLButtonElement).disabled, false);
       await flush();
       assert.deepEqual(writes(commands), [{ action: 'restart', targetId: snapshot.targetId }]);
       view.unmount();

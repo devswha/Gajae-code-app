@@ -206,9 +206,13 @@ test('Update requires native installation support and a ready or available targe
   assert.equal(screen.queryByRole('button', { name: english.desktopUpdate.update }), null);
   snapshot = native({ phase: 'ready', installationAvailable: true });
   await act(async () => { window.dispatchEvent(new Event(DESKTOP_UPDATE_BRIDGE_EVENT)); });
-  const restart = screen.getByRole('button', { name: english.desktopUpdate.update });
+  // A downloaded update is a different action from downloading one: the
+  // button says restart and the help names the version the app reopens as.
+  assert.equal(screen.queryByRole('button', { name: english.desktopUpdate.update }), null);
+  const restart = screen.getByRole('button', { name: english.desktopUpdate.restartToInstall });
   const descriptions = restart.getAttribute('aria-describedby')?.split(' ').map((id) => document.getElementById(id)?.textContent);
-  assert.deepEqual(descriptions, [english.desktopUpdate.manualHelp, english.desktopUpdate.osPrompt]);
+  assert.deepEqual(descriptions, [english.desktopUpdate.readyHelp.replace('{{version}}', '2.0.0-beta.11'), english.desktopUpdate.osPrompt]);
+  assert.equal(screen.queryByText(english.desktopUpdate.manualHelp), null);
   assert.equal(document.querySelector('input:not([type="checkbox"])'), null);
   act(() => restart.focus());
   assert.equal(document.activeElement === restart, true);
@@ -241,6 +245,7 @@ test('About checks discover only, with explicit Update required to download and 
   assert.deepEqual(commands.filter((command) => ['download', 'restart'].includes(command.action)), [
     { action: 'download', targetId: snapshot.targetId }, { action: 'restart', targetId: snapshot.targetId },
   ]);
+  assert.ok(screen.getByText(english.desktopUpdate.phases.restarting));
 });
 
 test('About retains a disconnected target read-only and Refresh status reconnects without any mutation', async () => {
@@ -289,10 +294,11 @@ test('English and Korean expose translated controls, progress, reasons and OS pr
   assert.ok(screen.getByText('50바이트 다운로드됨 · 전체 크기 알 수 없음'));
   assert.ok(screen.getByText('작업 완료 대기 중'));
   await replace(native({ phase: 'ready', installationAvailable: true }));
-  assert.ok(screen.getByRole('button', { name: korean.desktopUpdate.update }));
+  assert.ok(screen.getByRole('button', { name: korean.desktopUpdate.restartToInstall }));
+  assert.ok(screen.getByText(korean.desktopUpdate.readyHelp.replace('{{version}}', '2.0.0-beta.11')));
   assert.ok(screen.getByText(korean.desktopUpdate.osPrompt));
   await act(async () => { await view.i18n.changeLanguage('en'); });
-  assert.ok(screen.getByRole('button', { name: english.desktopUpdate.update }));
+  assert.ok(screen.getByRole('button', { name: english.desktopUpdate.restartToInstall }));
   assert.ok(screen.getByText(english.desktopUpdate.osPrompt));
 });
 

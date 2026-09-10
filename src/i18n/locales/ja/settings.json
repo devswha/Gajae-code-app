@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "更新",
     "updating": "更新中…",
+    "restartToInstall": "再起動してインストール",
+    "restarting": "再起動中…",
+    "readyHelp": "更新のダウンロードと検証が完了しました。再起動するとアプリが一時的に終了し、{{version}} として再び開きます。先に作業を保存してください。",
     "manualHelp": "「更新」をクリックするとダウンロードし、安全な再起動を要求します。確認だけではダウンロードもインストールも行いません。",
     "awaitingOperation": "前のネイティブ処理の完了を待っています。まだ再試行しないでください。",
     "targetVersion": "バージョン {{version}}",

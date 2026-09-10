@@ -23,6 +23,21 @@ export function desktopUpdateControls(update: Props['update']) {
   return { locked, busy, statusOnly, canUpdate };
 }
 
+/** One button, two meanings: download while `available`, restart while `ready`. */
+export function desktopUpdateAction(update: Props['update']) {
+  const { snapshot, updating } = update;
+  const ready = snapshot?.phase === 'ready';
+  const version = snapshot?.targetProductVersion || snapshot?.targetDesktopVersion || '';
+  return {
+    ready,
+    version,
+    labelKey: ready
+      ? (updating ? 'desktopUpdate.restarting' : 'desktopUpdate.restartToInstall')
+      : (updating ? 'desktopUpdate.updating' : 'desktopUpdate.update'),
+    helpKey: ready ? 'desktopUpdate.readyHelp' : 'desktopUpdate.manualHelp',
+  };
+}
+
 export function DesktopUpdateStatus({ update }: Props) {
   const { t } = useTranslation('settings');
   const { snapshot, connected, pending, error, awaitingOperation, updating, updateError } = update;
@@ -79,8 +94,9 @@ export function DesktopUpdateProgress({ update }: Props) {
 export default function DesktopUpdatePanel({ update }: Props) {
   const { t } = useTranslation('settings');
   const id = useId();
-  const { snapshot, error, updating } = update;
+  const { snapshot, error } = update;
   const { locked, busy, statusOnly, canUpdate } = desktopUpdateControls(update);
+  const action = desktopUpdateAction(update);
 
   return (
     <section aria-labelledby={`${id}-title`} className="min-w-0 space-y-4 rounded-lg border border-border bg-card p-4">
@@ -132,9 +148,9 @@ export default function DesktopUpdatePanel({ update }: Props) {
         {canUpdate && <Button
           type="button" className="h-auto min-h-11 whitespace-normal" disabled={locked}
           aria-describedby={`${id}-manual ${id}-restart`} onClick={() => { void update.update(); }}
-        >{t(updating ? 'desktopUpdate.updating' : 'desktopUpdate.update')}</Button>}
+        >{t(action.labelKey)}</Button>}
       </div>
-      <p id={`${id}-manual`} className="text-sm text-muted-foreground">{t('desktopUpdate.manualHelp')}</p>
+      <p id={`${id}-manual`} className="text-sm text-muted-foreground">{t(action.helpKey, { version: action.version })}</p>
       {canUpdate && <p id={`${id}-restart`} className="text-sm text-muted-foreground">{t('desktopUpdate.osPrompt')}</p>}
       {snapshot?.notes && <div className="space-y-2">
         <h4 className="text-sm font-medium text-foreground">{t('desktopUpdate.notes')}</h4>

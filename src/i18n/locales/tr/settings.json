@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "Güncelle",
     "updating": "Güncelleniyor…",
+    "restartToInstall": "Yüklemek için yeniden başlat",
+    "restarting": "Yeniden başlatılıyor…",
+    "readyHelp": "Güncelleme indirildi ve doğrulandı. Yeniden başlatma uygulamayı kısa süre kapatıp {{version}} olarak yeniden açar. Önce çalışmanızı kaydedin.",
     "manualHelp": "Güncelle düğmesi indirmeyi başlatır ve güvenli yeniden başlatma ister. Denetimler güncelleme indirmez veya kurmaz.",
     "awaitingOperation": "Önceki yerel işlemin bitmesi bekleniyor. Henüz yeniden denemeyin.",
     "targetVersion": "Sürüm {{version}}",

@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "更新",
     "updating": "正在更新…",
+    "restartToInstall": "重新启动以安装",
+    "restarting": "正在重新启动…",
+    "readyHelp": "更新已下载并验证。重新启动会短暂关闭应用并以 {{version}} 重新打开。请先保存工作。",
     "manualHelp": "点击“更新”以下载并请求安全重启。检查更新不会下载或安装更新。",
     "awaitingOperation": "正在等待上一个原生操作完成。请勿立即重试。",
     "targetVersion": "版本 {{version}}",

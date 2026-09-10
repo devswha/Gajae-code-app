@@ -5,6 +5,9 @@
   "desktopUpdate": {
     "update": "업데이트",
     "updating": "업데이트 중…",
+    "restartToInstall": "재시작하여 설치",
+    "restarting": "재시작 중…",
+    "readyHelp": "업데이트 다운로드와 검증이 끝났습니다. 재시작하면 앱이 잠시 종료된 뒤 {{version}}(으)로 다시 열립니다. 작업을 먼저 저장하세요.",
     "manualHelp": "업데이트를 누르면 다운로드 후 안전한 재시작을 요청합니다. 버전 확인만으로 다운로드하거나 설치하지 않습니다.",
     "awaitingOperation": "이전 네이티브 작업이 끝나기를 기다리는 중입니다. 아직 다시 시도하지 마세요.",
     "targetVersion": "버전 {{version}}",
