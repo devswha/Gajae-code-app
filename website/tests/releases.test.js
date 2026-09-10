@@ -16,12 +16,12 @@ import {
 } from '../src/releases.js';
 
 /**
- * Reviewed public-release fixture: promote this with the verified beta.13 assets.
+ * Reviewed public-release fixture: promote this with the verified beta.14 assets.
  * A local/test candidate can advance package.json before publication; coupling
  * the page to that version would advertise download URLs that do not exist.
  * Update this fixture with RELEASE only after verifying the new public assets.
  */
-const publishedVersion = '2.0.0-beta.13';
+const publishedVersion = '2.0.0-beta.14';
 /** Last release that published Linux desktop packages (built on owner request only). */
 const linuxDesktopVersion = '2.0.0-beta.12';
 

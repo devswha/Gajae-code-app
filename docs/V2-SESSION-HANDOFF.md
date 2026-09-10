@@ -1,13 +1,13 @@
 # gajae-app v2 — Session Handoff (resume state)
 
-**Published but defective: v2.0.0-beta.13 / desktop 0.2.7**, source `58c700f`,
-release `386022482`. The macOS binary was built without the production updater
-binding (`updateMode: disabled`); updating from beta.12 installs it and then
-blocks startup. The owner's Mac was recovered by setting the journal/cache
-aside; the release notes warn; `2095beb` closes the verifier gap. **Next:
-publish a corrected desktop 0.2.8** (beta.12 users get it directly; beta.13
-users need one manual DMG). PR #53 is merged; PR #44 (Windows) stays open with
-conflicts. See [RELEASE-BETA13-ACCEPTANCE.md](RELEASE-BETA13-ACCEPTANCE.md).
+**Published and installed: v2.0.0-beta.14 / desktop 0.2.8**, source `60c98e3`,
+release `386182917`, `updateMode: production`. It supersedes beta.13, whose
+binary shipped with the updater compiled out (`RELEASE-BETA13-ACCEPTANCE.md`);
+the release build now fails without an explicit mode, the verifier refuses a
+non-production updater binary, and a disabled successor no longer blocks
+startup. beta.12 clients are offered 0.2.8 directly; beta.13 users need one
+manual DMG. PR #53 is merged; PR #44 (Windows) stays open with conflicts. See
+[RELEASE-BETA14-ACCEPTANCE.md](RELEASE-BETA14-ACCEPTANCE.md).
 
 **Installed: v2.0.0-beta.12 / desktop 0.2.6**, source `48fffce`.
 Release `385189777` contains the signed/notarized macOS DMG and click-update
