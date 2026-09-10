@@ -8,6 +8,7 @@ import { test } from 'node:test';
 import {
   assertDeveloperSignature,
   assertNotarizedAssessment,
+  assertBuildInfo,
   assertManualBuildInfo,
   parseVtoolBuildMinimums,
   verifyMacosApp,
@@ -100,8 +101,9 @@ async function fixture(t) {
       assert.equal(options.maxOutputBytes, 4096);
       await writeFile(options.output, state.buildInfoText ?? JSON.stringify({
         schemaVersion: 1, packageName: 'gajae-app', productVersion: input.version,
-        desktopVersion: input.desktopVersion, debug: false, updateMode: 'disabled',
-        runtimeManifestSha256: input.runtimeManifestSha256,
+        desktopVersion: input.desktopVersion, debug: false,
+        updateMode: input.manualDisabled ? 'disabled' : 'production',
+        runtimeManifestSha256: input.runtimeManifestSha256 ?? 'a'.repeat(64),
         payloadRuntimeManifestSha256: createHash('sha256').update('{"signed":"fixture"}\n').digest('hex'),
         ...state.buildInfoOverrides,
       }), { flag: 'wx', mode: 0o600 });
@@ -391,6 +393,45 @@ test('DMG, mounted app, quarantined copy and extracted updater app all undergo v
   assert.ok(!state.calls.some(call => call.args.includes('--sign') || call.args.includes('staple') || call.args.includes('submit')));
 });
 
+test('an updater release must attest a production updater after every Apple check', async t => {
+  const state = await fixture(t);
+  const result = await state.execute();
+  assert.equal(result.updateMode, 'production');
+  assert.equal(result.buildInfo.updateMode, 'production');
+  assert.match(result.buildInfo.runtimeManifestSha256, /^[a-f0-9]{64}$/);
+  assert.equal(result.payloadRuntimeManifestSha256, createHash('sha256').update('{"signed":"fixture"}\n').digest('hex'));
+  const diagnostics = state.calls.filter(call => call.args[0] === '--desktop-build-info');
+  assert.equal(diagnostics.length, 1);
+  assert.ok(diagnostics[0].program.includes('/copy/'));
+  const diagnosticIndex = state.calls.findIndex(call => call.args[0] === '--desktop-build-info');
+  for (const target of [state.input.dmg, join(state.input.root, 'mount/Gajae Code App.app'), result.copiedApp, result.extractedApp]) {
+    for (const program of ['codesign', 'spctl', 'xcrun']) {
+      assert.ok(state.calls.slice(0, diagnosticIndex).some(call => call.program === program && call.args.at(-1) === target));
+    }
+  }
+  assert.equal(state.calls.at(-1).args[0], 'detach');
+});
+
+test('an updater-disabled, QA or debug binary is rejected from the updater lane', async t => {
+  // beta.13 regression: a signed archive/manifest around a disabled binary.
+  for (const change of [
+    state => { state.buildInfoOverrides = { updateMode: 'disabled' }; },
+    state => { state.buildInfoOverrides = { updateMode: 'qa' }; },
+    state => { state.buildInfoOverrides = { debug: true }; },
+    state => { state.buildInfoOverrides = { desktopVersion: '0.2.3' }; },
+    state => { state.buildInfoOverrides = { runtimeManifestSha256: 'not-hex' }; },
+    state => { state.buildInfoOverrides = { payloadRuntimeManifestSha256: 'f'.repeat(64) }; },
+    state => { state.buildInfoText = '{}'; },
+    state => { state.buildInfoStderr = 'unexpected diagnostics'; },
+    state => { state.fail = (_, args) => args[0] === '--desktop-build-info'; },
+  ]) {
+    const state = await fixture(t);
+    change(state);
+    await assert.rejects(state.execute());
+    assert.equal(state.calls.at(-1).args[0], 'detach');
+  }
+});
+
 test('a bad DMG signature blocks before mounting', async t => {
   const state = await fixture(t);
   state.signature = 'Signature=adhoc\nTeamIdentifier=not set\n';
@@ -510,6 +551,23 @@ test('manual flag is explicit, mutually exclusive with updater archives, and req
   await chmod(state.input.root, 0o755);
   await assert.rejects(state.execute(), /owner-only/);
   assert.equal(state.calls.length, 0);
+});
+
+test('production build info accepts any pinned-format source digest but never another mode', () => {
+  const expected = { version: '2.0.0-beta.13', desktopVersion: '0.2.7', updateMode: 'production', payloadRuntimeManifestSha256: 'e'.repeat(64) };
+  const good = { schemaVersion: 1, packageName: 'gajae-app', productVersion: expected.version,
+    desktopVersion: expected.desktopVersion, debug: false, updateMode: 'production', runtimeManifestSha256: 'c'.repeat(64),
+    payloadRuntimeManifestSha256: expected.payloadRuntimeManifestSha256 };
+  assert.deepEqual(assertBuildInfo(JSON.stringify(good), expected), good);
+  assert.deepEqual(assertBuildInfo(JSON.stringify(good), { ...expected, runtimeManifestSha256: 'c'.repeat(64) }), good);
+  assert.throws(() => assertBuildInfo(JSON.stringify(good), { ...expected, runtimeManifestSha256: 'd'.repeat(64) }));
+  for (const [key, value] of [
+    ['updateMode', 'disabled'], ['updateMode', 'qa'], ['updateMode', 'enabled'], ['debug', true],
+    ['runtimeManifestSha256', 'C'.repeat(64)], ['runtimeManifestSha256', 'c'.repeat(63)], ['runtimeManifestSha256', 7],
+    ['payloadRuntimeManifestSha256', 'd'.repeat(64)], ['productVersion', '2.0.0-beta.12'], ['extra', 1],
+  ]) assert.throws(() => assertBuildInfo(JSON.stringify({ ...good, [key]: value }), expected));
+  assert.throws(() => assertBuildInfo(JSON.stringify(good), { ...expected, updateMode: 'enabled' }));
+  assert.throws(() => assertBuildInfo(JSON.stringify(good), { ...expected, runtimeManifestSha256: 'bad' }));
 });
 
 test('build info requires exact typed schema, disabled mode and every pinned compile-time identity', () => {

@@ -256,6 +256,21 @@ export function assertNotarizedAssessment(output) {
 export function assertManualBuildInfo(text, { version, desktopVersion, runtimeManifestSha256, payloadRuntimeManifestSha256 }) {
   requireValue(typeof runtimeManifestSha256 === 'string' && /^[a-f0-9]{64}$/.test(runtimeManifestSha256),
     'The pinned source runtimeManifestSha256 is required for manual verification.');
+  return assertBuildInfo(text, { version, desktopVersion, updateMode: 'disabled', runtimeManifestSha256, payloadRuntimeManifestSha256 });
+}
+
+/**
+ * The signed executable must positively attest the compile-time updater mode
+ * the release lane is publishing it as. beta.13 shipped an `updateMode:
+ * disabled` binary inside a valid signed updater archive because only the
+ * manual lane read this diagnostic; a disabled successor cannot verify its own
+ * installation and strands every updated user on the recovery screen.
+ */
+export function assertBuildInfo(text, { version, desktopVersion, updateMode, runtimeManifestSha256, payloadRuntimeManifestSha256 }) {
+  requireValue(updateMode === 'disabled' || updateMode === 'production', 'Expected updateMode must be disabled or production.');
+  requireValue(runtimeManifestSha256 === undefined
+    || (typeof runtimeManifestSha256 === 'string' && /^[a-f0-9]{64}$/.test(runtimeManifestSha256)),
+  'The pinned source runtimeManifestSha256 must be a SHA-256 hex digest when supplied.');
   requireValue(typeof payloadRuntimeManifestSha256 === 'string' && /^[a-f0-9]{64}$/.test(payloadRuntimeManifestSha256),
     'The verified signed payload runtime manifest SHA-256 is required.');
   requireValue(typeof text === 'string' && Buffer.byteLength(text) <= MAX_BUILD_INFO_BYTES,
@@ -263,7 +278,7 @@ export function assertManualBuildInfo(text, { version, desktopVersion, runtimeMa
   let info;
   try { info = JSON.parse(text); } catch { throw new Error('Desktop build info must be exactly one JSON object.'); }
   const expected = { schemaVersion: 1, packageName: PACKAGE_NAME, productVersion: version,
-    desktopVersion, debug: false, updateMode: 'disabled', runtimeManifestSha256, payloadRuntimeManifestSha256 };
+    desktopVersion, debug: false, updateMode, runtimeManifestSha256, payloadRuntimeManifestSha256 };
   requireValue(info !== null && typeof info === 'object' && !Array.isArray(info)
     && JSON.stringify(Object.keys(info).sort()) === JSON.stringify(Object.keys(expected).sort()),
   'Desktop build info must contain exactly the eight schema fields.');
@@ -272,9 +287,14 @@ export function assertManualBuildInfo(text, { version, desktopVersion, runtimeMa
   const keys = [...text.matchAll(/"(?:\\.|[^"\\])*"\s*:/g)];
   requireValue(keys.length === Object.keys(expected).length, 'Desktop build info contains duplicate fields.');
   for (const [key, value] of Object.entries(expected)) {
-    requireValue(info[key] === value, `Desktop build info ${key} does not match the pinned manual-disabled build.`);
+    if (key === 'runtimeManifestSha256' && value === undefined) {
+      requireValue(typeof info[key] === 'string' && /^[a-f0-9]{64}$/.test(info[key]),
+        'Desktop build info runtimeManifestSha256 must be a SHA-256 hex digest.');
+      continue;
+    }
+    requireValue(info[key] === value, `Desktop build info ${key} does not match the pinned ${updateMode} build.`);
   }
-  return Object.freeze(info);
+  return info;
 }
 
 /**
@@ -394,24 +414,27 @@ export async function verifyMacosRelease({
       }, { run });
       if (app === copiedApp) copiedDeployment = verifiedApp.deployment;
     }
+    // No UI, browser IPC, QA mode or lifecycle initialization. This early
+    // diagnostic is run only after *all* copied-app and Apple checks pass. An
+    // updater release must attest `production`: a `disabled` successor cannot
+    // verify the installation that produced it and blocks every updated user.
+    const updateMode = manualDisabled ? 'disabled' : 'production';
+    const output = join(root, 'desktop-build-info.json');
+    const result = await run(join(copiedApp, 'Contents/MacOS', `${PRODUCT_TOKEN}-desktop`),
+      ['--desktop-build-info'], { output, timeout: 10_000, maxOutputBytes: MAX_BUILD_INFO_BYTES });
+    requireValue(result?.stderr === '', 'Desktop build info wrote unexpected diagnostics.');
+    const payloadManifest = await readUpdaterSidecar(join(copiedApp,
+      'Contents/Resources/resources/server-payload/server/gjc-runtime-manifest.json'), MAX_PACKAGE_BYTES);
+    const payloadRuntimeManifestSha256 = createHash('sha256').update(payloadManifest, 'utf8').digest('hex');
+    const buildInfo = assertBuildInfo(await readUpdaterSidecar(output, MAX_BUILD_INFO_BYTES),
+      { version, desktopVersion, updateMode, runtimeManifestSha256, payloadRuntimeManifestSha256 });
+    compareAppInventories(copiedInventory, await inventoryApp(copiedApp));
     if (manualDisabled) {
-      // No UI, browser IPC, QA mode or lifecycle initialization. This early
-      // diagnostic is run only after *all* copied-app and Apple checks pass.
-      const output = join(root, 'desktop-build-info.json');
-      const result = await run(join(copiedApp, 'Contents/MacOS', `${PRODUCT_TOKEN}-desktop`),
-        ['--desktop-build-info'], { output, timeout: 10_000, maxOutputBytes: MAX_BUILD_INFO_BYTES });
-      requireValue(result?.stderr === '', 'Desktop build info wrote unexpected diagnostics.');
-      const payloadManifest = await readUpdaterSidecar(join(copiedApp,
-        'Contents/Resources/resources/server-payload/server/gjc-runtime-manifest.json'), MAX_PACKAGE_BYTES);
-      const payloadRuntimeManifestSha256 = createHash('sha256').update(payloadManifest, 'utf8').digest('hex');
-      const buildInfo = assertManualBuildInfo(await readUpdaterSidecar(output, MAX_BUILD_INFO_BYTES),
-        { version, desktopVersion, runtimeManifestSha256, payloadRuntimeManifestSha256 });
-      compareAppInventories(copiedInventory, await inventoryApp(copiedApp));
       verificationResult = { copiedApp, inventory: copiedInventory, deployment: copiedDeployment,
-        buildInfo, payloadRuntimeManifestSha256, updateMode: 'disabled' };
+        buildInfo, payloadRuntimeManifestSha256, updateMode };
     } else {
       verificationResult = { copiedApp, extractedApp: extracted.appPath, inventory: copiedInventory,
-        deployment: copiedDeployment, archive: extracted.archive };
+        deployment: copiedDeployment, archive: extracted.archive, buildInfo, payloadRuntimeManifestSha256, updateMode };
     }
   } catch (error) {
     verificationError = error;

@@ -81,12 +81,33 @@ scripts' defaults still use `src-tauri/target`, while this build deliberately
 uses a fresh `CARGO_TARGET_DIR`. Preserve the signing identity through both app
 and DMG creation. No signing runs after app stapling.
 
+The updater is **compiled in or out** by `src-tauri/build.rs` from three
+environment variables (`src-tauri/update_build_binding.rs`). Without them the
+build silently produces `updateMode: disabled`: a binary that a beta.12-style
+updater will happily install and that then refuses to verify its own
+installation ("Unfinished update requires the matching updater-enabled app"),
+stranding every updated user on the recovery screen. This is exactly what
+shipped as beta.13. Export the production binding for a public updater release;
+omit all three only for a deliberate manual-install, updater-disabled build.
+`verifyMacosRelease` now runs `--desktop-build-info` on every lane and refuses
+a `disabled` binary in the updater lane.
+
+```bash
+export GJC_UPDATE_MODE=production
+export GJC_UPDATE_FEED_ORIGIN=https://api.github.com
+export GJC_UPDATE_PUBKEY="$(cat "$HOME/.config/gajae-release/updater.key.pub")"
+# Production key packet fingerprint from UPDATER-KEY-CUSTODY.md.
+test "$(node -e 'const t=Buffer.from(process.env.GJC_UPDATE_PUBKEY,"base64").toString().trim().split(/\r?\n/)[1]; console.log(require("crypto").createHash("sha256").update(Buffer.from(t,"base64")).digest("hex"))')" \
+  = 6f0054b3ce55917aeb1bc07e18b6c7d266298fe356a361ab94972fc821f1a4c5
+```
+
 ```bash
 export CARGO_TARGET_DIR="$RELEASE_ROOT/cargo-target"
 npm run server:payload:macos 2>&1 | tee "$RELEASE_ROOT/payload-build.log"
 env -u CI npm run tauri -- build --bundles app 2>&1 | tee "$RELEASE_ROOT/tauri-build.log"
 APP="$CARGO_TARGET_DIR/aarch64-apple-darwin/release/bundle/macos/Gajae Code App.app"
 test -d "$APP"
+test "$("$APP/Contents/MacOS/gajae-app-desktop" --desktop-build-info | node -pe 'JSON.parse(require("fs").readFileSync(0)).updateMode')" = production
 npm run desktop:sign:macos -- --app "$APP" 2>&1 | tee "$RELEASE_ROOT/sign-app.log"
 codesign --verify --deep --strict "$APP"
 
@@ -132,14 +153,23 @@ team, hardened app runtime, both staples, Gatekeeper, package/desktop versions,
 and arm64 desktop/sidecar binaries. It detaches its image and leaves the
 quarantined writable copy for the remaining acceptance.
 
+The updater-lane verifier needs the signed updater archive from
+`make-macos-updater.mjs` (LOCAL-RELEASE.md) and the pinned OS floor, and it
+requires the acceptance root to be owner-only (`chmod 700`). It runs the
+copied binary's `--desktop-build-info` after every Apple check and fails on
+anything but `updateMode: production`.
+
 ```bash
-node --input-type=module - "$DMG" "$RELEASE_ROOT/acceptance" "$VERSION" "$DESKTOP_VERSION" <<'NODE'
+chmod 700 "$RELEASE_ROOT/acceptance"
+UPDATER="$UPDATER_DIR/gajae-app-desktop-$VERSION-macos-arm64.app.tar.gz"
+node --input-type=module - "$DMG" "$RELEASE_ROOT/acceptance" "$VERSION" "$DESKTOP_VERSION" "$UPDATER" <<'NODE'
 import { verifyMacosRelease } from './scripts/release/local-release-macos.mjs';
 import { assertOutOfTree } from './scripts/release/out-of-tree.mjs';
-const [dmg, root, version, desktopVersion] = process.argv.slice(2);
+const [dmg, root, version, desktopVersion, updaterArchivePath] = process.argv.slice(2);
 await assertOutOfTree(root, 'Installed candidate');
-await verifyMacosRelease({ dmg, root, version, desktopVersion, teamId: '5987KT43TJ' });
-console.log('Local DMG and quarantined-copy verification passed.');
+const result = await verifyMacosRelease({ dmg, root, version, desktopVersion, updaterArchivePath,
+  minimumSystemVersion: '13.0', teamId: '5987KT43TJ' });
+console.log(`Local DMG, quarantined-copy and updater verification passed (updateMode=${result.updateMode}).`);
 NODE
 COPIED_APP="$RELEASE_ROOT/acceptance/copy/Gajae Code App.app"
 PAYLOAD="$COPIED_APP/Contents/Resources/resources/server-payload"
