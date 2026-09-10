@@ -85,7 +85,11 @@ manual intervention was needed.
 
 ## Limitations
 
-- Real macOS 13 execution remains untested.
+- Real macOS 13 execution remains untested and is **deferred by owner
+  decision (2026-09-10)**: `minimumSystemVersion: 13.0` stays declared, but
+  no macOS 13 device is available for qualification, so it stays a disclosed
+  known limitation and will be addressed when a user issue or PR reports a
+  macOS 13 failure.
 - Administrator cancel/recovery and process ownership scenarios remain
   untested and are **deferred by owner decision (2026-09-10)**: they stay
   disclosed known limitations, not active work, and will be addressed when a

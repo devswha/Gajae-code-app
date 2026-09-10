@@ -16,10 +16,10 @@ that copy, and the password recorded independently of this Mac
 advertises the Linux desktop app (deb/AppImage links and stale
 macOS-or-Linux metadata removed; the Linux server archive stays).
 
-Deferred by owner decision (2026-09-10): administrator cancel/recovery and
-process ownership updater scenarios stay disclosed known limitations, not
-active work — address them on a user issue/PR. macOS 13 real-device
-verification stays open.
+Deferred by owner decision (2026-09-10): administrator cancel/recovery,
+process ownership and real macOS 13 execution updater scenarios stay
+disclosed known limitations, not active work — address them on a user
+issue/PR. `minimumSystemVersion: 13.0` stays declared.
 
 **Installed: v2.0.0-beta.12 / desktop 0.2.6**, source `48fffce`.
 Release `385189777` contains the signed/notarized macOS DMG and click-update
