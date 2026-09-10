@@ -68,10 +68,23 @@ This Mac ran the updater-disabled beta.13, so the published DMG was installed
 manually after a bundle backup (`Gajae Code App Backups/before-beta14-*`).
 The installed bundle reports `updateMode: production` and launched normally.
 
+## Public A-to-B observation (beta.12 to beta.14)
+
+After the operator install above, the public beta.12 DMG (SHA `c6351841…`)
+was reinstalled over `/Applications` and launched at 20:38:32 KST. Its startup
+check reached GitHub (anonymous quota 10 to 16), the sidebar offered 0.2.8,
+and the operator pressed Update twice (download, then restart). Observed from
+the data root: 20:46:13 cached archive/record, `manual-intent.json` consumed,
+beta.12 exited; 20:46:18 bundle at 0.2.8 with the journal in
+`awaiting_health`; 20:46:33 journal retired and
+`desktop-update-completed.json` written as schema 2 `committed`
+(`completed_by_pid` 31552, `server_pid` 31575, target 0.2.6 to 0.2.8, archive
+`d7b9fb05…`). The running bundle reports `2.0.0-beta.14 / 0.2.8 / production`
+with the release payload manifest digest, valid signature and staple. No
+manual intervention was needed.
+
 ## Limitations
 
-- The beta.12 to beta.14 in-app update has not been observed on a real
-  beta.12 installation yet (this Mac no longer has one).
 - Real macOS 13 execution, administrator cancel/recovery and process
   ownership scenarios remain untested.
 - Independent external backup of the updater key is still pending.
