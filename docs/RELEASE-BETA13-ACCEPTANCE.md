@@ -86,6 +86,30 @@ native discovery code against the live listing and manifests
 `e2f761e` makes unchanged checks free with `If-None-Match` and a per-process
 manifest cache. Neither is in the beta.13 binary.
 
+## Incident: the published beta.13 binary has its updater disabled
+
+The first public A-to-B run (16:49 KST) installed beta.13 and then blocked the
+next launch with "Unfinished update requires the matching updater-enabled app
+for verification." `--desktop-build-info` on the installed bundle reports
+`updateMode: disabled`: the acceptance build ran without
+`GJC_UPDATE_MODE=production` / `GJC_UPDATE_FEED_ORIGIN` / `GJC_UPDATE_PUBKEY`,
+which `MACOS-ACCEPTANCE.md` never listed, and the updater-lane verifier only
+read the build diagnostic on the manual lane. A disabled successor cannot
+verify the journaled installation, and there is no automatic recovery: a
+rebuilt binary fails the journal's inventory hash and beta.12 fails the
+version match.
+
+Operator recovery on this Mac: the journal and cache were moved to
+`~/Library/Application Support/Gajae Code App Backups/beta13-incident-*/`,
+and the installed (updater-disabled) beta.13 starts normally. User data was
+not touched. The beta.13 release notes now carry a warning. Fixes on `main`:
+`2095beb` runs `--desktop-build-info` on every verifier lane and refuses
+anything but `production` for an updater release; the acceptance procedure
+now exports the binding and checks the key fingerprint. **This release is
+superseded**: a corrected desktop 0.2.8 must be published, beta.12 users will
+be offered it directly, and users already on beta.13 need one manual DMG
+install because their updater is compiled out.
+
 ## Limitations
 
 - Public beta.12 to beta.13 in-app update is not yet observed; the sidebar
