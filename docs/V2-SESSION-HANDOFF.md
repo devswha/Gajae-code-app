@@ -9,12 +9,12 @@ startup. beta.12 clients are offered 0.2.8 directly; beta.13 users need one
 manual DMG. PR #53 is merged; PR #44 (Windows) stays open with conflicts. See
 [RELEASE-BETA14-ACCEPTANCE.md](RELEASE-BETA14-ACCEPTANCE.md).
 
-Post-beta.14 follow-ups (2026-09-10): the updater key backup is now staged in
-iCloud Drive with hash-verified copies and recovery instructions
-(`scripts/release/UPDATER-KEY-CUSTODY.md`; restore/sign/verify test and an
-off-Mac password record remain owner-gated), and the website no longer
-advertises the Linux desktop app (deb/AppImage links removed; the Linux
-server archive stays).
+Post-beta.14 follow-ups (2026-09-10): the updater key backup is complete —
+hash-verified iCloud Drive copy, a passing restore/sign/verify test from
+that copy, and the password recorded independently of this Mac
+(`scripts/release/UPDATER-KEY-CUSTODY.md`). The website no longer
+advertises the Linux desktop app (deb/AppImage links and stale
+macOS-or-Linux metadata removed; the Linux server archive stays).
 
 **Installed: v2.0.0-beta.12 / desktop 0.2.6**, source `48fffce`.
 Release `385189777` contains the signed/notarized macOS DMG and click-update

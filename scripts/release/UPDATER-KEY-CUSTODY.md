@@ -38,7 +38,7 @@ app change, or final release acceptance. The release verifier must still use
 official Minisign 0.12 as required by `LOCAL-RELEASE.md`. The original provisioning
 proof preceded the beta.12 publication recorded above.
 
-## Independent recovery backup — partial (2026-09-10)
+## Independent recovery backup — complete (2026-09-10)
 
 The encrypted private key, public key and recovery instructions were copied to
 iCloud Drive at `~/Library/Mobile Documents/com~apple~CloudDocs/gajae-release-backup/`
@@ -46,7 +46,7 @@ iCloud Drive at `~/Library/Mobile Documents/com~apple~CloudDocs/gajae-release-ba
 the source files (`updater.key` `22d01b6b…f4a45`, `updater.key.pub` `f4ac38b7…83e26`).
 The key file itself stays password-encrypted; no password is stored beside it.
 
-Still owner-gated before this backup counts as complete:
+Completed gates:
 
 - ~~A restore/sign/verify test FROM the backup copy~~ **Done 2026-09-10**
   (`verify-backup-restore.mjs` next to the key): restored from the iCloud copy
@@ -54,11 +54,14 @@ Still owner-gated before this backup counts as complete:
   challenge with the official Tauri signer using the restored key, and the
   native verifier accepted the signature while rejecting tampering and a wrong
   key (`backupRestoreVerified: true`). The original key was never modified.
-- Recording the password in a password store independent of this Mac (the
-  Keychain item alone dies with the Mac). **This is the last open item.**
-- Optionally a second destination (encrypted USB) if iCloud is not considered
-  sufficiently independent.
+- ~~Recording the password in a password store independent of this Mac~~
+  **Done 2026-09-10** — the owner confirmed recording the password outside
+  this Mac (contents not disclosed to or verified by the agent, by design).
 
-Local key provisioning is now ready. Independent backup and remaining
-authorization/recovery/minimum-OS/public-release gates are still open. Do not
+Optional hardening, not required: a second destination (encrypted USB) if
+iCloud is not considered sufficiently independent.
+
+Local key provisioning is ready and the independent backup is complete. The
+remaining authorization/recovery/minimum-OS/public-release gates are still
+open. Do not
 regenerate the production key merely because a new app version is being built.
