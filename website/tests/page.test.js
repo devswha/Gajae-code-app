@@ -110,7 +110,7 @@ test('keeps page and social metadata aligned with the desktop app positioning', 
   const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
   assert.match(html, /<title>Gajae Code App — The desktop app for Gajae Code<\/title>/);
   assert.match(html, /property="og:title" content="Gajae Code App — The desktop app for Gajae Code"/);
-  assert.match(html, /Available for macOS and Linux\./);
+  assert.match(html, /Available for macOS, with a self-hosted Linux server archive\./);
   assert.equal(html.includes('with a desktop'), false);
 });
 
