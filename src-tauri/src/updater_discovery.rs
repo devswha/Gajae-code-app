@@ -256,6 +256,10 @@ pub struct DiscoveryResult {
 pub struct DiscoveryCursor {
     policy: Option<DiscoveryPolicy>,
     stamps: Vec<[u8; 32]>,
+    /// Request serial observed right after each stamped page was fetched.
+    page_serials: Vec<u64>,
+    /// Monotonic count of transport requests across bursts.
+    requests: u64,
     seen_ids: HashSet<u64>,
     seen_tags: HashSet<String>,
     seen_assets: HashSet<u64>,
@@ -271,6 +275,7 @@ struct PendingPage {
     stamp: [u8; 32],
     releases: Vec<ReleaseRecord>,
     next: usize,
+    serial: u64,
 }
 
 impl DiscoveryCursor {
@@ -278,10 +283,12 @@ impl DiscoveryCursor {
         let not_before = self.not_before;
         let policy = self.policy.take();
         let conditional = std::mem::take(&mut self.conditional);
+        let requests = self.requests;
         *self = Self {
             policy,
             not_before,
             conditional,
+            requests,
             ..Self::default()
         };
     }
@@ -355,6 +362,7 @@ async fn revalidate_prepared_with(
         deadline,
         requests: 0,
         pages: 0,
+        serial: 0,
     };
     let response = budget
         .fetch(
@@ -538,14 +546,16 @@ struct Budget {
     deadline: Instant,
     requests: usize,
     pages: usize,
+    serial: u64,
 }
 
 impl Budget {
-    fn new(duration: Duration) -> Self {
+    fn new(duration: Duration, serial: u64) -> Self {
         Self {
             deadline: Instant::now() + duration,
             requests: 0,
             pages: 0,
+            serial,
         }
     }
 
@@ -575,6 +585,7 @@ impl Budget {
             return Err(DiscoveryError::RequestBudget);
         }
         self.requests += 1;
+        self.serial += 1;
         let response = tokio::time::timeout_at(
             self.deadline,
             transport.fetch_conditional(url, accept, limit, if_none_match),
@@ -626,7 +637,9 @@ async fn discover_with(
         ));
     }
     cursor.not_before = None;
-    let result = scan(transport, policy, cursor, &mut Budget::new(duration)).await;
+    let mut budget = Budget::new(duration, cursor.requests);
+    let result = scan(transport, policy, cursor, &mut budget).await;
+    cursor.requests = budget.serial;
     let reason = match result {
         Ok(()) => {
             return Ok(cursor.result(DiscoveryCompleteness::CompleteObservedScan, None));
@@ -689,6 +702,13 @@ async fn scan(
                 return Ok(());
             }
             let expected = cursor.stamps[index];
+            if index + 1 == cursor.stamps.len() && cursor.page_serials[index] == budget.serial {
+                // The final page was this scan's last observation: no later
+                // response exists for it to disagree with, so re-reading it
+                // would only spend anonymous quota (GitHub charges 304s too).
+                cursor.verify_next = Some(index + 1);
+                continue;
+            }
             check_page(
                 transport,
                 policy,
@@ -725,6 +745,7 @@ async fn scan(
                 stamp,
                 releases,
                 next: 0,
+                serial: budget.serial,
             });
         }
         let pending = cursor.pending.as_mut().unwrap();
@@ -738,6 +759,7 @@ async fn scan(
         }
         let pending = cursor.pending.take().unwrap();
         cursor.stamps.push(pending.stamp);
+        cursor.page_serials.push(pending.serial);
         if pending.releases.len() < PAGE_SIZE {
             cursor.verify_next = Some(0);
         }
@@ -1031,7 +1053,7 @@ async fn fetch_archive_with(
     if selected.release.id == 0 || selected.release.api_url != expected_api {
         return Err(DiscoveryError::IdentityChanged);
     }
-    let mut budget = Budget::new(timeout.min(MAX_DOWNLOAD_TIME));
+    let mut budget = Budget::new(timeout.min(MAX_DOWNLOAD_TIME), 0);
     let response = budget
         .fetch(
             transport,
@@ -2075,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_listings_and_immutable_manifests_cost_no_quota_on_later_checks() {
+    fn quiet_checks_cost_one_request_and_a_new_release_costs_three() {
         let policy = policy(Channel::Beta);
         let fake = Fake::default();
         let (one, bytes_one) = release(&policy, 1, "2.0.0-beta.12", "0.2.6", "13.0");
@@ -2085,25 +2107,27 @@ mod tests {
         let page = |n: usize| policy.wire_url(&policy.api(&format!("?per_page=30&page={n}")));
         let listing = serde_json::to_vec(&json!([two, one])).unwrap();
         fake.set(&page(1), Reply::tagged(listing.clone(), "W/\"p1-a\""));
-        fake.set(&page(2), Reply::tagged(b"[]".to_vec(), "W/\"p2-a\""));
 
+        // First scan: the page, both manifests, then the page again because
+        // manifest requests were observed after it (all charged by GitHub).
         let mut cursor = DiscoveryCursor::default();
         let first = complete(&fake, &policy, &mut cursor);
         assert_eq!(first.selected.as_ref().unwrap().release.id, 2);
-        let fetched = fake.calls().len();
-        assert!(fake.calls().iter().any(|c| c.contains("/assets/21")));
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert!(calls[1].contains("/assets/21") && calls[2].contains("/assets/11"));
+        assert_eq!(calls[3], format!("{} 304", page(1)));
 
+        // Unchanged listing: one conditional request, no manifests, and no
+        // second read of a page nothing was fetched after.
         let second = complete(&fake, &policy, &mut cursor);
         assert_eq!(second.selected, first.selected);
-        // Even the first scan's page revalidation is already a free 304.
-        assert_eq!(fake.calls()[fetched - 1], format!("{} 304", page(1)));
-        // Same listing: page fetch and revalidation are both 304, no manifests.
-        let later = &fake.calls()[fetched..];
-        assert_eq!(later.len(), 2, "{later:?}");
-        assert!(later.iter().all(|c| c.ends_with(" 304")));
+        let later = &fake.calls()[4..];
+        assert_eq!(later, [format!("{} 304", page(1))]);
 
-        // A new release: the changed page is charged once, its manifest is
-        // fetched once, and the older manifests are still reused.
+        // A new release: the changed page, its manifest once, and the page
+        // re-read because the manifest request followed it. Older manifests
+        // are reused.
         let (three, bytes_three) = release(&policy, 3, "2.0.0-beta.14", "0.2.8", "13.0");
         fake.release(&policy, &three, &bytes_three);
         let listing = serde_json::to_vec(&json!([three, two, one])).unwrap();
@@ -2112,10 +2136,48 @@ mod tests {
         let third = complete(&fake, &policy, &mut cursor);
         assert_eq!(third.selected.unwrap().release.id, 3);
         let later = &fake.calls()[before..];
-        let charged: Vec<_> = later.iter().filter(|c| !c.ends_with(" 304")).collect();
-        assert_eq!(charged.len(), 2, "{later:?}");
-        assert!(charged[0].contains("?per_page=30&page=1"));
-        assert!(charged[1].contains("/assets/31"));
+        assert_eq!(later.len(), 3, "{later:?}");
+        assert_eq!(later[0], page(1).to_string());
+        assert!(later[1].contains("/assets/31"));
+        assert_eq!(later[2], format!("{} 304", page(1)));
+
+        // Two pages: page 1 is verified against the later observation, while
+        // the final page is not re-read inside the burst that fetched it. (The
+        // per-burst page budget then forces a continuation, whose own head
+        // and boundary checks are unchanged.)
+        let many: Vec<Value> = (10..40u64)
+            .map(|id| {
+                let (record, bytes) = release(
+                    &policy,
+                    id,
+                    &format!("2.0.0-beta.{id}"),
+                    &format!("0.3.{id}"),
+                    "13.0",
+                );
+                fake.release(&policy, &record, &bytes);
+                record
+            })
+            .collect();
+        fake.set(
+            &page(1),
+            Reply::tagged(serde_json::to_vec(&many).unwrap(), "W/\"p1-c\""),
+        );
+        fake.set(&page(2), Reply::tagged(b"[]".to_vec(), "W/\"p2-a\""));
+        let before = fake.calls().len();
+        let _ = complete(&fake, &policy, &mut DiscoveryCursor::default());
+        let pages: Vec<_> = fake.calls()[before..]
+            .iter()
+            .filter(|c| c.contains("per_page"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            pages[..3],
+            [
+                page(1).to_string(),
+                page(2).to_string(),
+                format!("{} 304", page(1))
+            ]
+        );
 
         // A listing without a validator is never confirmed by a stray 304, and
         // a manifest whose asset identity moved is refetched, not reused.
@@ -2267,7 +2329,7 @@ mod tests {
         let url = policy.api("/assets/11");
         fake.set(&url, Reply::ok(b"data".to_vec()));
         tauri::async_runtime::block_on(async {
-            let mut budget = Budget::new(DISCOVERY_BURST);
+            let mut budget = Budget::new(DISCOVERY_BURST, 0);
             budget.requests = MAX_REQUESTS - 1;
             budget.fetch(&fake, &url, Accept::Archive, 4).await.unwrap();
             assert!(matches!(

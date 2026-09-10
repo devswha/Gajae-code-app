@@ -22,12 +22,14 @@ notice immediately above Settings in the bottom-left sidebar.
    snapshot reports `discovery_rate_limited`, and a manual check inside that
    window is refused rather than retried. Rate-limited responses do not
    consume quota, so the wait ends at the reset. The app's own share is kept
-   near zero: listing pages are re-requested with `If-None-Match` (an
-   unchanged page answers 304, which GitHub does not charge) and a manifest is
-   fetched once per release/asset ID for the life of the process, so a quiet
-   6-hourly check costs no quota and a new release costs two requests. Cached
-   bodies are re-validated by the same stamps and manifest checks and are
-   discarded with the cursor on any hard discovery error.
+   small: a manifest is fetched once per release/asset ID for the life of the
+   process, listing pages are re-requested with `If-None-Match` (a 304 saves
+   bandwidth only; measured on 2026-09-10, GitHub charges anonymous 304s like
+   any other request), and a page is not re-read for consistency when nothing
+   was fetched after it. A quiet 6-hourly check therefore costs one request
+   and a new release costs three, independent of how many releases exist.
+   Cached bodies are re-validated by the same stamps and manifest checks and
+   are discarded with the cursor on any hard discovery error.
 5. Busy work, target changes, connection loss, errors and unknown state stop
    that UI attempt. There is no automatic restart retry when work later ends.
    Rate-limited clicks are rejected without queueing a hidden download; retry
