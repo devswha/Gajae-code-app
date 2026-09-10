@@ -310,16 +310,6 @@ summary {
   gap: 1rem;
 }
 
-.download-formats {
-  display: grid;
-  gap: 0.75rem;
-  flex-shrink: 0;
-}
-
-.download-formats .text-button {
-  min-width: 10rem;
-}
-
 .text-button {
   min-height: 2.75rem;
   padding: 0.4rem 0.8rem;

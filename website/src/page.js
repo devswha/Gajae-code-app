@@ -2,7 +2,6 @@ import {
   APPLE_GATEKEEPER_HELP_URL,
   DOWNLOADS,
   DOCS_INSTALL_URL,
-  DOCS_LINUX_INSTALL_URL,
   DOCS_SELF_HOST_URL,
   GAJAE_CODE_URL,
   ISSUES_URL,
@@ -62,10 +61,6 @@ export function renderLandingPage() {
               </a>
               <p class="platform-note" id="macos-beta-notice">Apple Silicon · macOS 13+ · Notarized by Apple</p>
             </div>
-            <div class="platform-cta">
-              <a class="button button-secondary" href="#linux-download" aria-describedby="linux-desktop-notice">Download for Linux</a>
-              <p class="platform-note" id="linux-desktop-notice">x86_64 · .deb / AppImage</p>
-            </div>
           </div>
           <div class="hero-links">
             <a class="quiet-link" href="${GAJAE_CODE_URL}">About Gajae Code</a>
@@ -118,24 +113,6 @@ export function renderLandingPage() {
               <div class="download-actions">
                 <a class="text-button" href="${DOWNLOADS.macosArm64.href}">Download DMG</a>
                 <a class="quiet-link" href="${DOWNLOADS.macosArm64.checksumHref}" aria-label="SHA-256 for macOS DMG">SHA-256</a>
-              </div>
-            </div>
-            <div class="download-row" id="linux-download" tabindex="-1" role="region" aria-labelledby="linux-download-title">
-              <div>
-                <h3 id="linux-download-title">Linux desktop</h3>
-                <p>v${DOWNLOADS.linuxDesktopVersion} · x86_64 · Ubuntu 22.04 / 24.04</p>
-                <p>Node.js and Bun included.</p>
-                <a class="quiet-link" href="${DOCS_LINUX_INSTALL_URL}">Linux installation guide</a>
-              </div>
-              <div class="download-formats">
-                <div class="download-actions">
-                  <a class="text-button" href="${DOWNLOADS.linuxDeb.href}">Download .deb</a>
-                  <a class="quiet-link" href="${DOWNLOADS.linuxDeb.checksumHref}" aria-label="SHA-256 for Linux .deb">SHA-256</a>
-                </div>
-                <div class="download-actions">
-                  <a class="text-button" href="${DOWNLOADS.linuxAppImage.href}">Download AppImage</a>
-                  <a class="quiet-link" href="${DOWNLOADS.linuxAppImage.checksumHref}" aria-label="SHA-256 for Linux AppImage">SHA-256</a>
-                </div>
               </div>
             </div>
           </div>

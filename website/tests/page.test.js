@@ -5,7 +5,6 @@ import test from 'node:test';
 import { renderLandingPage } from '../src/page.js';
 import {
   APPLE_GATEKEEPER_HELP_URL,
-  DOCS_LINUX_INSTALL_URL,
   DOWNLOADS,
   GAJAE_CODE_URL,
   RELEASE,
@@ -21,12 +20,23 @@ function section(html, id) {
 test('landing page exposes the pinned GitHub download buttons', () => {
   const html = renderLandingPage();
   assert.match(html, /id="download"/);
-  for (const key of ['macosArm64', 'linuxDeb', 'linuxAppImage', 'linuxServer']) {
+  for (const key of ['macosArm64', 'linuxServer']) {
     assert.ok(html.includes(`href="${DOWNLOADS[key].href}"`), `${key} download is linked`);
     assert.ok(html.includes(`href="${DOWNLOADS[key].checksumHref}"`), `${key} checksum is linked`);
   }
   assert.match(html, /Download for macOS/);
-  assert.match(html, /Download for Linux/);
+  assert.equal(html.includes('Download for Linux'), false);
+  const releaseHrefs = [...html.matchAll(/href="([^"]*\/releases\/download\/[^"]+)"/g)].map(
+    (match) => match[1],
+  );
+  assert.deepEqual(releaseHrefs.sort(), [
+    DOWNLOADS.macosArm64.href,
+    DOWNLOADS.macosArm64.href,
+    DOWNLOADS.macosArm64.checksumHref,
+    DOWNLOADS.linuxServer.href,
+    DOWNLOADS.linuxServer.checksumHref,
+  ].sort(), 'only the pinned macOS and server artifacts are linked');
+  assert.equal(html.includes('linux-download'), false);
   assert.equal(html.includes('Windows용 내려받기'), false);
   assert.equal(html.includes('Download for Windows'), false);
   assert.equal(html.includes('/latest/download/'), false);
@@ -40,11 +50,13 @@ test('introduces the desktop app for Gajae Code without positioning it as a sepa
   assert.ok(hero.includes(`href="${GAJAE_CODE_URL}">About Gajae Code</a>`));
 });
 
-test('makes the two desktop platforms primary and source and server setup secondary', () => {
+test('makes the macOS download primary and source and server setup secondary', () => {
   const hero = section(renderLandingPage(), 'top');
   const primary = hero.slice(hero.indexOf('class="cta-row"'), hero.indexOf('class="hero-links"'));
   assert.ok(primary.includes(`href="${DOWNLOADS.macosArm64.href}"`));
-  assert.match(primary, /href="#linux-download"/);
+  assert.match(primary, /Download for macOS/);
+  assert.equal(primary.includes('Download for Linux'), false);
+  assert.equal(primary.includes('#linux-download'), false);
   assert.equal(primary.includes(DOWNLOADS.linuxServer.href), false);
   assert.equal(primary.includes(REPOSITORY_URL + '"'), false);
   assert.equal(hero.includes('button-icon'), false);
@@ -52,34 +64,36 @@ test('makes the two desktop platforms primary and source and server setup second
   assert.ok(hero.includes(`href="${REPOSITORY_URL}">Source code</a>`));
 });
 
-test('separates the Linux desktop packages from self-hosted server downloads', () => {
+test('keeps the desktop download section macOS-only and the server archive under self-host', () => {
   const html = renderLandingPage();
   const desktop = section(html, 'download');
   const selfHost = section(html, 'self-host');
-  assert.match(desktop, /Linux desktop/);
-  assert.match(desktop, /Download \.deb/);
-  assert.match(desktop, /Download AppImage/);
-  assert.ok(desktop.includes(DOCS_LINUX_INSTALL_URL));
-  assert.ok(desktop.includes(DOWNLOADS.linuxDeb.href));
-  assert.ok(desktop.includes(DOWNLOADS.linuxAppImage.href));
+  assert.ok(desktop.includes(DOWNLOADS.macosArm64.href));
+  assert.equal(desktop.includes('Linux desktop'), false);
+  for (const [, href] of desktop.matchAll(/href="([^"]+)"/g)) {
+    assert.ok(
+      [DOWNLOADS.macosArm64.href, DOWNLOADS.macosArm64.checksumHref, '#macos-install'].includes(href),
+      `desktop section links macOS artifacts only, got: ${href}`,
+    );
+  }
+  assert.equal(desktop.includes('DESKTOP-LINUX.md'), false);
   assert.equal(desktop.includes(DOWNLOADS.linuxServer.href), false);
   assert.match(desktop, /Intel Mac and Windows builds are not available yet\./);
   assert.equal(html.includes('Linux desktop builds are not available yet'), false);
   assert.ok(selfHost.includes(DOWNLOADS.linuxServer.href));
   assert.match(selfHost, /Requires Node\.js 22\.22\.2\+ \(22\.x\)/);
-  assert.equal(selfHost.includes(DOWNLOADS.linuxDeb.href), false);
 });
 
 test('gives each checksum link a distinct accessible name', () => {
   const html = renderLandingPage();
   for (const [key, label] of [
     ['macosArm64', 'macOS DMG'],
-    ['linuxDeb', 'Linux .deb'],
-    ['linuxAppImage', 'Linux AppImage'],
     ['linuxServer', 'Linux server archive'],
   ]) {
     assert.ok(html.includes(`href="${DOWNLOADS[key].checksumHref}" aria-label="SHA-256 for ${label}"`));
   }
+  const checksumLabels = [...html.matchAll(/aria-label="SHA-256 for ([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(checksumLabels.sort(), ['Linux server archive', 'macOS DMG']);
 });
 
 test('every in-page link and accessibility reference has a unique target', () => {
@@ -89,7 +103,7 @@ test('every in-page link and accessibility reference has a unique target', () =>
   for (const [, target] of html.matchAll(/(?:href="#|aria-describedby="|aria-labelledby=")([^"]+)"/g)) {
     assert.ok(ids.includes(target), `#${target} exists`);
   }
-  assert.match(html, /id="linux-download" tabindex="-1"/);
+  assert.equal(html.includes('linux-download'), false);
 });
 
 test('keeps page and social metadata aligned with the desktop app positioning', () => {
