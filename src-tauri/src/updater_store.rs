@@ -382,6 +382,15 @@ impl Store {
         }))
     }
 
+    /// Read-only: is there an unconsumed click waiting for startup? Ordinary
+    /// launches with only a cached download owe the user no install screen.
+    pub(crate) fn manual_pending(&self) -> bool {
+        self.read_manual_intent()
+            .ok()
+            .flatten()
+            .is_some_and(|intent| !intent.consumed)
+    }
+
     #[cfg(test)]
     pub(crate) fn manual_requested(
         &self,

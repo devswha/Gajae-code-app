@@ -22,6 +22,7 @@ use crate::{
     },
     updater_location::InstallLocation,
     updater_screen::{self, Screen, ScreenState},
+    updater_store::Store,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,15 +376,11 @@ async fn start_inner(app: &AppHandle) -> Result<(), String> {
         normal_start(app);
         return Ok(());
     }
-    // With no cached candidate or pending click, ordinary startup adds no
-    // update I/O/network work.
-    let cached = root.join("desktop-update-cache/ready.json");
-    if absent
-        && !cached.exists()
-        && !root
-            .join("desktop-update-cache/manual-intent.json")
-            .exists()
-    {
+    // Only a pending click or an unfinished installation owes the user an
+    // install screen. A cached download alone is background state: the app
+    // opens normally and the preparation owner re-verifies the cache itself.
+    let pending_click = Store::open(&root).is_ok_and(|store| store.manual_pending());
+    if absent && !pending_click {
         normal_start(app);
         return Ok(());
     }
@@ -697,7 +694,11 @@ mod tests {
             store
                 .request_manual(&record.target_id(), &record.archive_sha256)
                 .unwrap();
+            // Only an unconsumed click owes the user a launch install screen;
+            // a cached download alone must open the app normally.
+            assert!(store.manual_pending());
             let request = store.consume_manual().unwrap();
+            assert!(!store.manual_pending());
             assert!(
                 installation_requested(request.as_ref(), &record),
                 "matching persisted manual intent admits the install gate"
