@@ -963,3 +963,191 @@ test('history carries the runtime tool details the transcript persisted', { conc
     await rm(tempRoot, { recursive: true, force: true });
   }
 });
+
+/**
+ * Counts `createReadStream` calls against one transcript path. Each history
+ * read pass (lineage, descriptor index, payload) opens the file exactly once,
+ * so the counter separates index reuse from payload streaming.
+ */
+const countTranscriptStreams = (filePath: string) => {
+  const originalCreateReadStream = fs.createReadStream;
+  let count = 0;
+  (fs as { createReadStream: unknown }).createReadStream = (...args: Parameters<typeof fs.createReadStream>) => {
+    if (args[0] === filePath) count += 1;
+    return (originalCreateReadStream as (...inner: typeof args) => unknown)(...args);
+  };
+  return {
+    get count() { return count; },
+    restore() { (fs as { createReadStream: unknown }).createReadStream = originalCreateReadStream; },
+  };
+};
+
+test('gjc history index cache reuses the descriptor index while payloads still stream', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gjc-history-cache-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  try {
+    const sessionId = 'cached-history';
+    const filePath = await writeGjcTranscript(tempRoot, sessionId, workspacePath, {
+      firstUserMessage: 'cached prompt',
+      withConversation: true,
+    });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession(sessionId, 'gjc', workspacePath, undefined, undefined, undefined, filePath);
+      const provider = new GjcSessionsProvider();
+      const counter = countTranscriptStreams(filePath);
+      try {
+        const first = await provider.fetchHistory(sessionId, { limit: 2 });
+        assert.equal(counter.count, 3, 'a cold read streams lineage, index and payload passes');
+        assert.equal(first.total, 4);
+
+        const second = await provider.fetchHistory(sessionId, { limit: 2, offset: 2 });
+        assert.equal(counter.count, 4, 'a cache hit re-streams only the payload pass');
+        assert.equal(second.total, 4);
+        assert.equal(second.hasMore, false);
+        assert.equal(second.messages[0]?.content, 'cached prompt');
+        assert.equal(second.messages[0]?.role, 'user');
+      } finally {
+        counter.restore();
+      }
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('gjc history index cache invalidates when the transcript grows', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gjc-history-cache-grow-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  try {
+    const sessionId = 'growing-history';
+    const filePath = await writeGjcTranscript(tempRoot, sessionId, workspacePath, {
+      firstUserMessage: 'original prompt',
+      withConversation: true,
+    });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession(sessionId, 'gjc', workspacePath, undefined, undefined, undefined, filePath);
+      const provider = new GjcSessionsProvider();
+      const counter = countTranscriptStreams(filePath);
+      try {
+        const first = await provider.fetchHistory(sessionId, { limit: 10 });
+        assert.equal(counter.count, 3);
+        assert.equal(first.total, 4);
+
+        await appendFile(filePath, `${JSON.stringify({
+          type: 'message',
+          id: 'msg-appended',
+          parentId: 'msg-3',
+          timestamp: '2026-07-09T00:00:05.000Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'appended question' }] },
+        })}\n`, 'utf8');
+
+        const second = await provider.fetchHistory(sessionId, { limit: 10 });
+        assert.equal(counter.count, 6, 'a changed transcript rebuilds the index');
+        assert.equal(second.total, 5);
+        assert.equal(second.messages.at(-1)?.content, 'appended question');
+
+        const third = await provider.fetchHistory(sessionId, { limit: 10 });
+        assert.equal(counter.count, 7, 'the rebuilt revision is cached again');
+        assert.equal(third.total, 5);
+      } finally {
+        counter.restore();
+      }
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('gjc history index cache keys entries per session path', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gjc-history-cache-paths-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  try {
+    const filePathA = await writeGjcTranscript(tempRoot, 'cache-path-a', workspacePath, { firstUserMessage: 'prompt a' });
+    const filePathB = await writeGjcTranscript(tempRoot, 'cache-path-b', workspacePath, { firstUserMessage: 'prompt b' });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession('cache-path-a', 'gjc', workspacePath, undefined, undefined, undefined, filePathA);
+      sessionsDb.createSession('cache-path-b', 'gjc', workspacePath, undefined, undefined, undefined, filePathB);
+      const provider = new GjcSessionsProvider();
+      const counterA = countTranscriptStreams(filePathA);
+      const counterB = countTranscriptStreams(filePathB);
+      try {
+        await provider.fetchHistory('cache-path-a', { limit: 1 });
+        assert.equal(counterA.count, 3);
+        assert.equal(counterB.count, 0);
+
+        await provider.fetchHistory('cache-path-b', { limit: 1 });
+        assert.equal(counterA.count, 3, 'reading another transcript must not churn this entry');
+        assert.equal(counterB.count, 3);
+
+        await appendFile(filePathB, `${JSON.stringify({
+          type: 'message',
+          id: 'msg-b-appended',
+          parentId: 'msg-1',
+          timestamp: '2026-07-09T00:00:02.000Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'b grows' }] },
+        })}\n`, 'utf8');
+
+        const againA = await provider.fetchHistory('cache-path-a', { limit: 1 });
+        assert.equal(counterA.count, 4, "one transcript's invalidation leaves the other entry intact");
+        assert.equal(againA.total, 1);
+
+        const againB = await provider.fetchHistory('cache-path-b', { limit: 10 });
+        assert.equal(counterB.count, 6, 'only the appended transcript rebuilds its index');
+        assert.equal(againB.total, 2);
+        assert.equal(againB.messages.at(-1)?.content, 'b grows');
+      } finally {
+        counterA.restore();
+        counterB.restore();
+      }
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('gjc history index cache keeps mid-read HISTORY_CHANGED retry behavior', { concurrency: false }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'gjc-history-cache-live-'));
+  const workspacePath = path.join(tempRoot, 'workspace');
+  await mkdir(workspacePath, { recursive: true });
+  try {
+    const sessionId = 'live-cached-history';
+    const filePath = await writeGjcTranscript(tempRoot, sessionId, workspacePath, {
+      firstUserMessage: 'live prompt',
+      withConversation: true,
+    });
+    await withIsolatedDatabase(async () => {
+      sessionsDb.createSession(sessionId, 'gjc', workspacePath, undefined, undefined, undefined, filePath);
+      const provider = new GjcSessionsProvider();
+      // Warm the cache so the live writer races a request served from it.
+      await provider.fetchHistory(sessionId, { limit: 2 });
+
+      const originalStat = fs.promises.stat;
+      let stats = 0;
+      let appendsPerRead = 1;
+      (fs.promises as { stat: unknown }).stat = async (...args: Parameters<typeof fs.promises.stat>) => {
+        stats += 1;
+        // Even calls are the post-read revision check; grow the file just before it.
+        if (stats % 2 === 0 && appendsPerRead > 0) {
+          appendsPerRead -= 1;
+          await appendFile(filePath, `${JSON.stringify({ type: 'message', id: `live-${stats}`, parentId: 'msg-1',
+            timestamp: new Date(Date.UTC(2026, 6, 11, 0, 0, stats)).toISOString(), message: { role: 'user', content: [{ type: 'text', text: `live ${stats}` }] } })}\n`, 'utf8');
+        }
+        return originalStat(...args);
+      };
+      try {
+        const settled = await provider.fetchHistory(sessionId, { limit: 10 });
+        assert.equal(settled.total, 5, 'the retry sees the row appended during the first attempt');
+        assert.equal(settled.messages.at(-1)?.content, 'live 2');
+        appendsPerRead = Number.POSITIVE_INFINITY;
+        await assert.rejects(provider.fetchHistory(sessionId, { limit: 10 }), { code: 'HISTORY_CHANGED', statusCode: 409 });
+      } finally {
+        (fs.promises as { stat: unknown }).stat = originalStat;
+      }
+    });
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});

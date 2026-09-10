@@ -13,7 +13,15 @@ const MAX_JSONL_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_BUFFERED_HISTORY_RECORDS = 5_000;
 const MAX_BUFFERED_HISTORY_BYTES = 64 * 1024 * 1024;
 const HISTORY_READ_ATTEMPTS = 3;
+const HISTORY_INDEX_CACHE_CAPACITY = 16;
 type HistoryRow = { ordinal: number; time: number; kind: NormalizedMessage['kind']; toolId?: string };
+type HistoryIndexCacheEntry = {
+  size: number;
+  mtimeMs: number;
+  turns: ReturnType<typeof assignTranscriptTurns>;
+  chronological: HistoryRow[];
+  visible: HistoryRow[];
+};
 
 /**
  * Streams newline-delimited UTF-8 text while discarding a line as soon as it
@@ -284,6 +292,37 @@ async function streamGjcSessionMessages(
 
 export class GjcSessionsProvider implements IProviderSessions {
   /**
+   * Bounded LRU of the lineage+descriptor index for one transcript revision,
+   * keyed by session file path. Descriptor rows are tiny ({ordinal,time,kind,
+   * toolId}) and payloads are never cached, so the capacity is the memory
+   * bound. The instance lives on the singleton provider, so the cache survives
+   * page requests but not server restarts.
+   */
+  private readonly historyIndexCache = new Map<string, HistoryIndexCacheEntry>();
+
+  private readHistoryIndexCache(sessionFilePath: string, size: number, mtimeMs: number): HistoryIndexCacheEntry | undefined {
+    const entry = this.historyIndexCache.get(sessionFilePath);
+    if (!entry) return undefined;
+    if (entry.size !== size || entry.mtimeMs !== mtimeMs) {
+      this.historyIndexCache.delete(sessionFilePath);
+      return undefined;
+    }
+    // Refresh recency on hit.
+    this.historyIndexCache.delete(sessionFilePath);
+    this.historyIndexCache.set(sessionFilePath, entry);
+    return entry;
+  }
+
+  private writeHistoryIndexCache(sessionFilePath: string, entry: HistoryIndexCacheEntry): void {
+    this.historyIndexCache.delete(sessionFilePath);
+    this.historyIndexCache.set(sessionFilePath, entry);
+    while (this.historyIndexCache.size > HISTORY_INDEX_CACHE_CAPACITY) {
+      const oldest = this.historyIndexCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.historyIndexCache.delete(oldest);
+    }
+  }
+  /**
    * Normalizes one flattened gjc content-part record into the shared envelope.
    */
   /**
@@ -436,18 +475,30 @@ export class GjcSessionsProvider implements IProviderSessions {
     normalizedOffset: number,
   ): Promise<FetchHistoryResult> {
     const revision = await fsSync.promises.stat(sessionFilePath);
-    const turns = assignTranscriptTurns(await readTranscriptLineage(sessionFilePath));
-    // Index only small descriptors. Tool-result rows must not consume visible
-    // pagination offsets or evict older messages from a payload ring.
-    const index: HistoryRow[] = [];
-    await streamGjcSessionMessages(sessionFilePath, turns, raw => {
-      for (const message of this.normalizeHistoryEntry(raw, sessionId)) {
-        const time = Date.parse(message.timestamp);
-        index.push({ ordinal: index.length, time: Number.isFinite(time) ? time : 0, kind: message.kind, toolId: message.toolId });
-      }
-    });
-    const chronological = index.sort((a, b) => a.time - b.time || a.ordinal - b.ordinal);
-    const visible = chronological.filter(row => row.kind !== 'tool_result');
+    const cached = this.readHistoryIndexCache(sessionFilePath, revision.size, revision.mtimeMs);
+    let turns: HistoryIndexCacheEntry['turns'];
+    let chronological: HistoryRow[];
+    let visible: HistoryRow[];
+    if (cached) {
+      // Same revision: the cached size/mtimeMs exactly equal the fresh stat, so
+      // the post-read comparison below still guards the revision the index was
+      // computed from.
+      ({ turns, chronological, visible } = cached);
+    } else {
+      turns = assignTranscriptTurns(await readTranscriptLineage(sessionFilePath));
+      // Index only small descriptors. Tool-result rows must not consume visible
+      // pagination offsets or evict older messages from a payload ring.
+      const index: HistoryRow[] = [];
+      await streamGjcSessionMessages(sessionFilePath, turns, raw => {
+        for (const message of this.normalizeHistoryEntry(raw, sessionId)) {
+          const time = Date.parse(message.timestamp);
+          index.push({ ordinal: index.length, time: Number.isFinite(time) ? time : 0, kind: message.kind, toolId: message.toolId });
+        }
+      });
+      chronological = index.sort((a, b) => a.time - b.time || a.ordinal - b.ordinal);
+      visible = chronological.filter(row => row.kind !== 'tool_result');
+      this.writeHistoryIndexCache(sessionFilePath, { size: revision.size, mtimeMs: revision.mtimeMs, turns, chronological, visible });
+    }
     const end = Math.max(0, visible.length - normalizedOffset);
     if (normalizedLimit === null && end > MAX_BUFFERED_HISTORY_RECORDS) {
       throw new AppError('History is too large to load at once; use paginated history.', { code: 'HISTORY_PAGE_TOO_LARGE', statusCode: 413 });
