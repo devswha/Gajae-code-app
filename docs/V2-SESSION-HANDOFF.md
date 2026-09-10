@@ -122,8 +122,10 @@ app is complete. Consequences, all landed the same day:
   and no entry under `CLA.md` § Signatories; a request is on #43, and a
   reminder was posted there 2026-09-10. Waiting on the contributor.
 - Still open: #44 (owner's draft Windows preview branch, 72 files,
-  conflicting, 128 commits behind main, pinned at beta.9) and #3 (needs
-  Cursor/Anthropic live skill qualification, which the owner excluded).
+  conflicting, 128 commits behind main, pinned at beta.9). #3 was closed
+  2026-09-10 as addressed-by-design: the follow-up implementation covers the
+  analyzed root causes, while live Cursor/Anthropic qualification stays
+  excluded and moves to fresh user reports.
 
 ## Follow-up checkpoint — SDK32 and durable notification handoff
 
