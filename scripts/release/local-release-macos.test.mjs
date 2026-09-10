@@ -96,7 +96,8 @@ async function fixture(t) {
       }
     }
     if (args[0] === '--desktop-build-info') {
-      assert.ok(program.includes('/copy/'));
+      // The read-only mount, never the quarantined copy (Gatekeeper prompt).
+      assert.ok(program.includes('/mount/'), program);
       assert.equal(options.timeout, 10_000);
       assert.equal(options.maxOutputBytes, 4096);
       await writeFile(options.output, state.buildInfoText ?? JSON.stringify({
@@ -402,7 +403,7 @@ test('an updater release must attest a production updater after every Apple chec
   assert.equal(result.payloadRuntimeManifestSha256, createHash('sha256').update('{"signed":"fixture"}\n').digest('hex'));
   const diagnostics = state.calls.filter(call => call.args[0] === '--desktop-build-info');
   assert.equal(diagnostics.length, 1);
-  assert.ok(diagnostics[0].program.includes('/copy/'));
+  assert.ok(diagnostics[0].program.includes('/mount/'));
   const diagnosticIndex = state.calls.findIndex(call => call.args[0] === '--desktop-build-info');
   for (const target of [state.input.dmg, join(state.input.root, 'mount/Gajae Code App.app'), result.copiedApp, result.extractedApp]) {
     for (const program of ['codesign', 'spctl', 'xcrun']) {
@@ -491,7 +492,7 @@ async function manualFixture(t) {
   return state;
 }
 
-test('explicit manual mode validates DMG and both apps before the bounded copied-binary diagnostic', async t => {
+test('explicit manual mode validates DMG and both apps before the bounded mounted-binary diagnostic', async t => {
   const state = await manualFixture(t);
   const result = await state.execute();
   assert.equal(result.updateMode, 'disabled');

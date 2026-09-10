@@ -418,9 +418,12 @@ export async function verifyMacosRelease({
     // diagnostic is run only after *all* copied-app and Apple checks pass. An
     // updater release must attest `production`: a `disabled` successor cannot
     // verify the installation that produced it and blocks every updated user.
+    // It runs from the read-only mounted image, whose bytes the copied app was
+    // just proven to equal: executing the quarantined copy makes Gatekeeper wait
+    // for a first-launch prompt no automation can answer.
     const updateMode = manualDisabled ? 'disabled' : 'production';
     const output = join(root, 'desktop-build-info.json');
-    const result = await run(join(copiedApp, 'Contents/MacOS', `${PRODUCT_TOKEN}-desktop`),
+    const result = await run(join(mountedApp, 'Contents/MacOS', `${PRODUCT_TOKEN}-desktop`),
       ['--desktop-build-info'], { output, timeout: 10_000, maxOutputBytes: MAX_BUILD_INFO_BYTES });
     requireValue(result?.stderr === '', 'Desktop build info wrote unexpected diagnostics.');
     const payloadManifest = await readUpdaterSidecar(join(copiedApp,
