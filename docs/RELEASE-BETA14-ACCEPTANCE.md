@@ -85,6 +85,11 @@ manual intervention was needed.
 
 ## Limitations
 
-- Real macOS 13 execution, administrator cancel/recovery and process
-  ownership scenarios remain untested.
-- Independent external backup of the updater key is still pending.
+- Real macOS 13 execution remains untested.
+- Administrator cancel/recovery and process ownership scenarios remain
+  untested and are **deferred by owner decision (2026-09-10)**: they stay
+  disclosed known limitations, not active work, and will be addressed when a
+  user issue or PR reports them. The designed behavior (cancel → update held,
+  old bundle intact, no automatic retry, explicit recovery) is unchanged.
+- Independent external backup of the updater key: **completed 2026-09-10**
+  (see `../scripts/release/UPDATER-KEY-CUSTODY.md`).
