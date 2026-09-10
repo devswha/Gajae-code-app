@@ -48,11 +48,14 @@ The key file itself stays password-encrypted; no password is stored beside it.
 
 Still owner-gated before this backup counts as complete:
 
-- A restore/sign/verify test FROM the backup copy (official Tauri CLI sign +
-  Minisign 0.12 verify), which needs the Keychain password interactively. Never
-  overwrite the original to test recovery.
+- ~~A restore/sign/verify test FROM the backup copy~~ **Done 2026-09-10**
+  (`verify-backup-restore.mjs` next to the key): restored from the iCloud copy
+  into a temp dir, hash-matched the manifest and the original, signed a random
+  challenge with the official Tauri signer using the restored key, and the
+  native verifier accepted the signature while rejecting tampering and a wrong
+  key (`backupRestoreVerified: true`). The original key was never modified.
 - Recording the password in a password store independent of this Mac (the
-  Keychain item alone dies with the Mac).
+  Keychain item alone dies with the Mac). **This is the last open item.**
 - Optionally a second destination (encrypted USB) if iCloud is not considered
   sufficiently independent.
 
