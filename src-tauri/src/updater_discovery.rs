@@ -4,7 +4,7 @@
 //! unchanged, NOT an atomic GitHub snapshot or a promise of globally latest data.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 use crate::updater_manifest::{parse_manifest, Channel, Manifest, ProductIdentity};
-use crate::updater_transport::{fetch_response, Accept, BoundedResponse, HttpsClient};
+use crate::updater_transport::{fetch_response_conditional, Accept, BoundedResponse, HttpsClient};
 
 pub const PAGE_SIZE: usize = 30;
 pub const MAX_PAGES_PER_BURST: usize = 3;
@@ -264,6 +264,7 @@ pub struct DiscoveryCursor {
     complete: bool,
     best: Option<SelectedRelease>,
     not_before: Option<Instant>,
+    conditional: ConditionalCache,
 }
 
 struct PendingPage {
@@ -276,9 +277,11 @@ impl DiscoveryCursor {
     fn reset_scan(&mut self) {
         let not_before = self.not_before;
         let policy = self.policy.take();
+        let conditional = std::mem::take(&mut self.conditional);
         *self = Self {
             policy,
             not_before,
+            conditional,
             ..Self::default()
         };
     }
@@ -406,16 +409,129 @@ type FetchFuture<'a> =
 
 trait Transport {
     fn fetch<'a>(&'a self, url: &'a Url, accept: Accept, limit: u64) -> FetchFuture<'a>;
+
+    /// `If-None-Match` variant. Transports without validator support answer
+    /// unconditionally; a 304 is only ever produced against a supplied tag.
+    fn fetch_conditional<'a>(
+        &'a self,
+        url: &'a Url,
+        accept: Accept,
+        limit: u64,
+        _if_none_match: Option<&'a str>,
+    ) -> FetchFuture<'a> {
+        self.fetch(url, accept, limit)
+    }
 }
 
 impl Transport for HttpsClient {
     fn fetch<'a>(&'a self, url: &'a Url, accept: Accept, limit: u64) -> FetchFuture<'a> {
+        self.fetch_conditional(url, accept, limit, None)
+    }
+
+    fn fetch_conditional<'a>(
+        &'a self,
+        url: &'a Url,
+        accept: Accept,
+        limit: u64,
+        if_none_match: Option<&'a str>,
+    ) -> FetchFuture<'a> {
         Box::pin(async move {
-            fetch_response(self, url, accept, limit)
+            fetch_response_conditional(self, url, accept, limit, if_none_match)
                 .await
                 .map_err(|_| DiscoveryError::Network)
         })
     }
+}
+
+/// Validated bodies reusable across checks. GitHub charges no anonymous quota
+/// for a 304 listing reply, and a release asset's bytes are immutable for its
+/// ID, so a quiet check costs nothing. Nothing here is install authority: every
+/// reused body still passes the same identity, stamp and manifest checks, and
+/// a hard discovery error discards the cache with the cursor.
+#[derive(Default)]
+pub(crate) struct ConditionalCache {
+    pages: HashMap<String, CachedPage>,
+    manifests: HashMap<(u64, u64), CachedManifest>,
+}
+
+struct CachedPage {
+    etag: String,
+    body: Vec<u8>,
+}
+
+struct CachedManifest {
+    size: u64,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+const MAX_CACHED_PAGES: usize = 8;
+const MAX_CACHED_MANIFESTS: usize = 64;
+
+impl ConditionalCache {
+    fn page_etag(&self, url: &Url) -> Option<&str> {
+        self.pages.get(url.as_str()).map(|page| page.etag.as_str())
+    }
+
+    fn page_body(&self, url: &Url) -> Option<Vec<u8>> {
+        self.pages.get(url.as_str()).map(|page| page.body.clone())
+    }
+
+    fn remember_page(&mut self, url: &Url, etag: Option<String>, body: &[u8]) {
+        let Some(etag) = etag.filter(|tag| entity_tag(tag)) else {
+            self.pages.remove(url.as_str());
+            return;
+        };
+        if !self.pages.contains_key(url.as_str()) && self.pages.len() == MAX_CACHED_PAGES {
+            self.pages.clear();
+        }
+        self.pages.insert(
+            url.as_str().to_owned(),
+            CachedPage {
+                etag,
+                body: body.to_vec(),
+            },
+        );
+    }
+
+    fn manifest(&self, release: &ReleaseIdentity, asset: &AssetIdentity) -> Option<Vec<u8>> {
+        let cached = self.manifests.get(&(release.id, asset.id))?;
+        (cached.size == asset.size
+            && cached.name == asset.name
+            && cached.bytes.len() as u64 == asset.size)
+            .then(|| cached.bytes.clone())
+    }
+
+    fn remember_manifest(
+        &mut self,
+        release: &ReleaseIdentity,
+        asset: &AssetIdentity,
+        bytes: &[u8],
+    ) {
+        if self.manifests.len() == MAX_CACHED_MANIFESTS {
+            self.manifests.clear();
+        }
+        self.manifests.insert(
+            (release.id, asset.id),
+            CachedManifest {
+                size: asset.size,
+                name: asset.name.clone(),
+                bytes: bytes.to_vec(),
+            },
+        );
+    }
+}
+
+/// RFC 9110 entity-tag: optional `W/` then a quoted, control-free string.
+fn entity_tag(value: &str) -> bool {
+    let tag = value.strip_prefix("W/").unwrap_or(value);
+    tag.len() >= 2
+        && tag.len() <= 256
+        && tag.starts_with('"')
+        && tag.ends_with('"')
+        && tag[1..tag.len() - 1]
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x7e).contains(&b))
 }
 
 struct Budget {
@@ -440,6 +556,18 @@ impl Budget {
         accept: Accept,
         limit: u64,
     ) -> Result<BoundedResponse, DiscoveryError> {
+        self.fetch_conditional(transport, url, accept, limit, None)
+            .await
+    }
+
+    async fn fetch_conditional(
+        &mut self,
+        transport: &impl Transport,
+        url: &Url,
+        accept: Accept,
+        limit: u64,
+        if_none_match: Option<&str>,
+    ) -> Result<BoundedResponse, DiscoveryError> {
         if Instant::now() >= self.deadline {
             return Err(DiscoveryError::Deadline);
         }
@@ -447,9 +575,12 @@ impl Budget {
             return Err(DiscoveryError::RequestBudget);
         }
         self.requests += 1;
-        let response = tokio::time::timeout_at(self.deadline, transport.fetch(url, accept, limit))
-            .await
-            .map_err(|_| DiscoveryError::Deadline)??;
+        let response = tokio::time::timeout_at(
+            self.deadline,
+            transport.fetch_conditional(url, accept, limit, if_none_match),
+        )
+        .await
+        .map_err(|_| DiscoveryError::Deadline)??;
         // Keep injection tests honest and defend against future transport edits.
         if response.body.len() as u64 > limit {
             return Err(DiscoveryError::SizeMismatch);
@@ -541,7 +672,15 @@ async fn scan(
         checks.push((cursor.stamps.len(), *cursor.stamps.last().unwrap()));
     }
     for (page, stamp) in checks {
-        check_page(transport, policy, budget, page, stamp).await?;
+        check_page(
+            transport,
+            policy,
+            budget,
+            &mut cursor.conditional,
+            page,
+            stamp,
+        )
+        .await?;
     }
     loop {
         if let Some(index) = cursor.verify_next {
@@ -549,7 +688,16 @@ async fn scan(
                 cursor.complete = true;
                 return Ok(());
             }
-            check_page(transport, policy, budget, index + 1, cursor.stamps[index]).await?;
+            let expected = cursor.stamps[index];
+            check_page(
+                transport,
+                policy,
+                budget,
+                &mut cursor.conditional,
+                index + 1,
+                expected,
+            )
+            .await?;
             cursor.verify_next = Some(index + 1);
             continue;
         }
@@ -557,8 +705,9 @@ async fn scan(
             if cursor.stamps.len() == MAX_SCAN_PAGES {
                 return Err(DiscoveryError::ScanLimit);
             }
+            let page = cursor.stamps.len() + 1;
             let (releases, stamp) =
-                fetch_page(transport, policy, budget, cursor.stamps.len() + 1).await?;
+                fetch_page(transport, policy, budget, &mut cursor.conditional, page).await?;
             for release in &releases {
                 if release.id == 0
                     || !cursor.seen_ids.insert(release.id)
@@ -580,7 +729,9 @@ async fn scan(
         }
         let pending = cursor.pending.as_mut().unwrap();
         while let Some(release) = pending.releases.get(pending.next) {
-            if let Some(candidate) = candidate(transport, policy, budget, release).await? {
+            if let Some(candidate) =
+                candidate(transport, policy, budget, &mut cursor.conditional, release).await?
+            {
                 consider(&mut cursor.best, candidate)?;
             }
             pending.next += 1;
@@ -597,10 +748,11 @@ async fn check_page(
     transport: &impl Transport,
     policy: &DiscoveryPolicy,
     budget: &mut Budget,
+    cache: &mut ConditionalCache,
     page: usize,
     expected: [u8; 32],
 ) -> Result<(), DiscoveryError> {
-    let (_, stamp) = fetch_page(transport, policy, budget, page).await?;
+    let (_, stamp) = fetch_page(transport, policy, budget, cache, page).await?;
     if stamp != expected {
         return Err(DiscoveryError::ScanChanged);
     }
@@ -611,6 +763,7 @@ async fn fetch_page(
     transport: &impl Transport,
     policy: &DiscoveryPolicy,
     budget: &mut Budget,
+    cache: &mut ConditionalCache,
     page: usize,
 ) -> Result<(Vec<ReleaseRecord>, [u8; 32]), DiscoveryError> {
     if budget.pages == MAX_PAGES_PER_BURST {
@@ -620,11 +773,26 @@ async fn fetch_page(
     let url = policy.wire_url(&policy.api(&format!("?per_page={PAGE_SIZE}&page={page}")));
     // No listing redirects, Link URLs, /latest shortcut or caller-supplied page URL.
     let response = budget
-        .fetch(transport, &url, Accept::GithubJson, MAX_PAGE_BYTES)
+        .fetch_conditional(
+            transport,
+            &url,
+            Accept::GithubJson,
+            MAX_PAGE_BYTES,
+            cache.page_etag(&url),
+        )
         .await?;
-    require_ok(&response)?;
+    let body = if response.status.as_u16() == 304 {
+        // Only a validator we sent can be confirmed; a stray 304 is an error.
+        cache
+            .page_body(&url)
+            .ok_or(DiscoveryError::HttpStatus(304))?
+    } else {
+        require_ok(&response)?;
+        cache.remember_page(&url, response.etag, &response.body);
+        response.body
+    };
     let releases: Vec<ReleaseRecord> =
-        serde_json::from_slice(&response.body).map_err(|_| DiscoveryError::InvalidRelease)?;
+        serde_json::from_slice(&body).map_err(|_| DiscoveryError::InvalidRelease)?;
     if releases.len() > PAGE_SIZE {
         return Err(DiscoveryError::InvalidRelease);
     }
@@ -772,12 +940,20 @@ async fn candidate(
     transport: &impl Transport,
     policy: &DiscoveryPolicy,
     budget: &mut Budget,
+    cache: &mut ConditionalCache,
     release: &ReleaseRecord,
 ) -> Result<Option<SelectedRelease>, DiscoveryError> {
     let Some((release, manifest_asset, archive_asset)) = release_assets(policy, release)? else {
         return Ok(None);
     };
-    let bytes = fetch_asset(transport, policy, budget, &manifest_asset).await?;
+    let bytes = match cache.manifest(&release, &manifest_asset) {
+        Some(bytes) => bytes,
+        None => {
+            let bytes = fetch_asset(transport, policy, budget, &manifest_asset).await?;
+            cache.remember_manifest(&release, &manifest_asset, &bytes);
+            bytes
+        }
+    };
     let manifest =
         parse_manifest(&bytes, &policy.identity()).map_err(|_| DiscoveryError::InvalidManifest)?;
     let selection = SelectedRelease {
@@ -1215,6 +1391,7 @@ mod tests {
         retry_after: Option<String>,
         ratelimit_remaining: Option<String>,
         ratelimit_reset: Option<String>,
+        etag: Option<String>,
     }
 
     impl Reply {
@@ -1226,17 +1403,22 @@ mod tests {
                 retry_after: None,
                 ratelimit_remaining: None,
                 ratelimit_reset: None,
+                etag: None,
             }
         }
 
         fn redirect(location: &str) -> Self {
             Self {
                 status: 302,
-                body: vec![],
                 location: Some(location.into()),
-                retry_after: None,
-                ratelimit_remaining: None,
-                ratelimit_reset: None,
+                ..Self::ok(vec![])
+            }
+        }
+
+        fn tagged(body: impl Into<Vec<u8>>, etag: &str) -> Self {
+            Self {
+                etag: Some(etag.into()),
+                ..Self::ok(body)
             }
         }
     }
@@ -1283,10 +1465,19 @@ mod tests {
     }
 
     impl Transport for Fake {
-        fn fetch<'a>(&'a self, url: &'a Url, _: Accept, _: u64) -> FetchFuture<'a> {
+        fn fetch<'a>(&'a self, url: &'a Url, accept: Accept, limit: u64) -> FetchFuture<'a> {
+            self.fetch_conditional(url, accept, limit, None)
+        }
+
+        fn fetch_conditional<'a>(
+            &'a self,
+            url: &'a Url,
+            _: Accept,
+            _: u64,
+            if_none_match: Option<&'a str>,
+        ) -> FetchFuture<'a> {
             Box::pin(async move {
                 let mut state = self.0.lock().unwrap();
-                state.calls.push(url.to_string());
                 let replies = state
                     .routes
                     .get_mut(url.as_str())
@@ -1296,13 +1487,24 @@ mod tests {
                 } else {
                     replies.front().unwrap().clone()
                 };
+                // Like GitHub: only a matching validator yields an empty 304.
+                let unchanged = reply.status == 200
+                    && reply.etag.is_some()
+                    && if_none_match == reply.etag.as_deref();
+                state.calls.push(if unchanged {
+                    format!("{url} 304")
+                } else {
+                    url.to_string()
+                });
                 Ok(BoundedResponse {
-                    status: StatusCode::from_u16(reply.status).unwrap(),
-                    body: reply.body,
+                    status: StatusCode::from_u16(if unchanged { 304 } else { reply.status })
+                        .unwrap(),
+                    body: if unchanged { vec![] } else { reply.body },
                     location: reply.location,
                     retry_after: reply.retry_after,
                     ratelimit_remaining: reply.ratelimit_remaining,
                     ratelimit_reset: reply.ratelimit_reset,
+                    etag: reply.etag,
                 })
             })
         }
@@ -1869,6 +2071,79 @@ mod tests {
                 retry_after(invalid, now),
                 Err(DiscoveryError::InvalidRetryAfter)
             );
+        }
+    }
+
+    #[test]
+    fn unchanged_listings_and_immutable_manifests_cost_no_quota_on_later_checks() {
+        let policy = policy(Channel::Beta);
+        let fake = Fake::default();
+        let (one, bytes_one) = release(&policy, 1, "2.0.0-beta.12", "0.2.6", "13.0");
+        let (two, bytes_two) = release(&policy, 2, "2.0.0-beta.13", "0.2.7", "13.0");
+        fake.release(&policy, &one, &bytes_one);
+        fake.release(&policy, &two, &bytes_two);
+        let page = |n: usize| policy.wire_url(&policy.api(&format!("?per_page=30&page={n}")));
+        let listing = serde_json::to_vec(&json!([two, one])).unwrap();
+        fake.set(&page(1), Reply::tagged(listing.clone(), "W/\"p1-a\""));
+        fake.set(&page(2), Reply::tagged(b"[]".to_vec(), "W/\"p2-a\""));
+
+        let mut cursor = DiscoveryCursor::default();
+        let first = complete(&fake, &policy, &mut cursor);
+        assert_eq!(first.selected.as_ref().unwrap().release.id, 2);
+        let fetched = fake.calls().len();
+        assert!(fake.calls().iter().any(|c| c.contains("/assets/21")));
+
+        let second = complete(&fake, &policy, &mut cursor);
+        assert_eq!(second.selected, first.selected);
+        // Even the first scan's page revalidation is already a free 304.
+        assert_eq!(fake.calls()[fetched - 1], format!("{} 304", page(1)));
+        // Same listing: page fetch and revalidation are both 304, no manifests.
+        let later = &fake.calls()[fetched..];
+        assert_eq!(later.len(), 2, "{later:?}");
+        assert!(later.iter().all(|c| c.ends_with(" 304")));
+
+        // A new release: the changed page is charged once, its manifest is
+        // fetched once, and the older manifests are still reused.
+        let (three, bytes_three) = release(&policy, 3, "2.0.0-beta.14", "0.2.8", "13.0");
+        fake.release(&policy, &three, &bytes_three);
+        let listing = serde_json::to_vec(&json!([three, two, one])).unwrap();
+        fake.set(&page(1), Reply::tagged(listing, "W/\"p1-b\""));
+        let before = fake.calls().len();
+        let third = complete(&fake, &policy, &mut cursor);
+        assert_eq!(third.selected.unwrap().release.id, 3);
+        let later = &fake.calls()[before..];
+        let charged: Vec<_> = later.iter().filter(|c| !c.ends_with(" 304")).collect();
+        assert_eq!(charged.len(), 2, "{later:?}");
+        assert!(charged[0].contains("?per_page=30&page=1"));
+        assert!(charged[1].contains("/assets/31"));
+
+        // A listing without a validator is never confirmed by a stray 304, and
+        // a manifest whose asset identity moved is refetched, not reused.
+        let mut cache = ConditionalCache::default();
+        assert!(cache.page_body(&page(1)).is_none());
+        cache.remember_page(&page(1), Some("not-a-tag".into()), b"[]");
+        assert!(cache.page_etag(&page(1)).is_none());
+        cache.remember_page(&page(1), Some("\"ok\"".into()), b"[]");
+        assert_eq!(cache.page_etag(&page(1)), Some("\"ok\""));
+        cache.remember_page(&page(1), None, b"[]");
+        assert!(cache.page_etag(&page(1)).is_none());
+        let record: ReleaseRecord = serde_json::from_value(two.clone()).unwrap();
+        let (identity, manifest, _) = release_assets(&policy, &record).unwrap().unwrap();
+        cache.remember_manifest(&identity, &manifest, &bytes_two);
+        assert_eq!(
+            cache.manifest(&identity, &manifest),
+            Some(bytes_two.clone())
+        );
+        let moved = AssetIdentity {
+            size: manifest.size + 1,
+            ..manifest.clone()
+        };
+        assert!(cache.manifest(&identity, &moved).is_none());
+        for tag in ["\"\"", "W/\"x\"", "\"abc\""] {
+            assert!(entity_tag(tag), "{tag}");
+        }
+        for tag in ["", "\"", "abc", "\"a\"b\"", "\"a b\"", "W/abc"] {
+            assert!(!entity_tag(tag), "{tag}");
         }
     }
 

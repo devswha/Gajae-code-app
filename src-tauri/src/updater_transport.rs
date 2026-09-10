@@ -64,6 +64,9 @@ pub struct BoundedResponse {
     /// request; they only lengthen the wait before the next scheduled attempt.
     pub ratelimit_remaining: Option<String>,
     pub ratelimit_reset: Option<String>,
+    /// Validator for a later `If-None-Match` request. A 304 reply carries no
+    /// body; the caller reuses the bytes it validated when this tag was issued.
+    pub etag: Option<String>,
 }
 
 /// Return bounded metadata without following redirects. The preparation owner
@@ -74,10 +77,25 @@ pub async fn fetch_response(
     accept: Accept,
     max_bytes: u64,
 ) -> Result<BoundedResponse, TransportError> {
+    fetch_response_conditional(client, url, accept, max_bytes, None).await
+}
+
+/// Same as [`fetch_response`], optionally sending `If-None-Match`. GitHub
+/// answers an unchanged resource with 304 without charging the anonymous
+/// primary rate limit, which keeps a quiet 6-hourly check at zero quota.
+pub async fn fetch_response_conditional(
+    client: &HttpsClient,
+    url: &Url,
+    accept: Accept,
+    max_bytes: u64,
+    if_none_match: Option<&str>,
+) -> Result<BoundedResponse, TransportError> {
     reject_url_credentials(url)?;
-    let response = client
-        .client
-        .get(url.clone())
+    let mut request = client.client.get(url.clone());
+    if let Some(tag) = if_none_match {
+        request = request.header(reqwest::header::IF_NONE_MATCH, tag);
+    }
+    let response = request
         .header(
             reqwest::header::USER_AGENT,
             concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
@@ -98,6 +116,7 @@ pub async fn fetch_response(
     let retry_after = bounded_header(response.headers(), "retry-after", 128)?;
     let ratelimit_remaining = bounded_header(response.headers(), "x-ratelimit-remaining", 32)?;
     let ratelimit_reset = bounded_header(response.headers(), "x-ratelimit-reset", 32)?;
+    let etag = bounded_header(response.headers(), "etag", 256)?;
     // Error/redirect bodies are not needed to make the policy decision.
     // Dropping them also avoids buffering arbitrary error-page content.
     let body = if status.is_success() {
@@ -112,6 +131,7 @@ pub async fn fetch_response(
         retry_after,
         ratelimit_remaining,
         ratelimit_reset,
+        etag,
     })
 }
 
