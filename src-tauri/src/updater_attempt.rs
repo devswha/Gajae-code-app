@@ -2113,7 +2113,7 @@ mod durable {
                 &compiled("1.1.0")
             )
             .is_err());
-            let journal = Journal::open(&fixture.root).unwrap();
+            let journal = after_descriptor_release(|| Journal::open(&fixture.root));
             let mut attempt = journal.begin(fixture.target()).unwrap();
             // An install permit (not yet installed) must stay blocked.
             assert!(super::super::set_aside_unverifiable(
@@ -2181,8 +2181,7 @@ mod durable {
                 &compiled("1.1.0")
             )
             .is_err());
-            assert!(Journal::open(&fixture.root)
-                .unwrap()
+            assert!(after_descriptor_release(|| Journal::open(&fixture.root))
                 .load()
                 .unwrap()
                 .is_none());
