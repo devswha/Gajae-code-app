@@ -308,6 +308,17 @@ pub(crate) fn request_manual_restart(app: &AppHandle) {
     app.request_restart();
 }
 
+/// The `.app` that owns the running executable: `<bundle>/Contents/MacOS/<exe>`.
+fn installed_bundle() -> Result<std::path::PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|_| "Current executable is unavailable.")?;
+    let bundle = exe
+        .ancestors()
+        .nth(3)
+        .filter(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .ok_or("The running executable is not inside an app bundle.")?;
+    std::fs::canonicalize(bundle).map_err(|_| "The app bundle path cannot be resolved.".to_owned())
+}
+
 fn normal_start(app: &AppHandle) {
     if app
         .state::<crate::lifecycle::SidecarLifecycle>()
@@ -343,10 +354,23 @@ async fn start_inner(app: &AppHandle) -> Result<(), String> {
     let absent = updater_attempt::check(&root).is_ok();
     if !active {
         if !absent {
-            return Err(
-                "Unfinished update requires the matching updater-enabled app for verification."
-                    .into(),
-            );
+            // This build cannot produce a successor proof. If the pending
+            // attempt installed exactly this app, set its record aside and
+            // start; otherwise stay blocked with a user-facing explanation.
+            let installed = installed_bundle()?;
+            let compiled = updater_attempt::CompiledIdentity {
+                desktop_version: env!("CARGO_PKG_VERSION"),
+                product_version: env!("GJC_EXPECTED_PAYLOAD_VERSION"),
+                runtime_manifest_sha256: env!("GJC_EXPECTED_RUNTIME_MANIFEST_SHA256"),
+            };
+            updater_attempt::set_aside_unverifiable(&root, &installed, &compiled).map_err(
+                |detail| {
+                    format!(
+                        "The installed app is not the version the last update recorded, and this build cannot verify updates. Reinstall from the official installer. ({detail})"
+                    )
+                },
+            )?;
+            trace("unverifiable-attempt-set-aside");
         }
         normal_start(app);
         return Ok(());

@@ -62,6 +62,70 @@ pub(crate) fn check(desktop_data_root: &Path) -> Result<(), String> {
     }
 }
 
+/// A build compiled without an updater can never mint the sealed successor
+/// proof that retires a blocker, so a journal left by the previous app would
+/// block it forever (beta.13). When the pending attempt targets exactly this
+/// binary's compiled identity, the bundle is at the recorded path and the app
+/// evidently launched, the installation demonstrably produced this app. Set the
+/// canonical entries aside under an attempt-specific name (never delete: a
+/// later updater-enabled build can still inspect them) and let the user work.
+/// Any other state stays blocked. This is a one-way concession for a build
+/// that cannot verify; it is not a startup permit for updater-enabled builds.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_aside_unverifiable(
+    desktop_data_root: &Path,
+    installed_app: &Path,
+    compiled: &CompiledIdentity,
+) -> Result<PathBuf, String> {
+    let root = normalize_absolute(desktop_data_root)?;
+    let loaded = Journal::open(&root)?
+        .load()?
+        .ok_or_else(|| "No pending update attempt to set aside.".to_owned())?;
+    if loaded.phase() != Phase::AwaitingHealth {
+        return Err(
+            "An interrupted installation cannot be retried by a build without an updater.".into(),
+        );
+    }
+    let target = loaded.target();
+    if target.app_path != installed_app
+        || target.target_desktop_version != compiled.desktop_version
+        || target.target_product_version != compiled.product_version
+        || target.runtime_manifest_sha256 != compiled.runtime_manifest_sha256
+    {
+        return Err("The running app is not the version this update installed.".into());
+    }
+    let attempt_id = loaded.attempt_id().to_owned();
+    drop(loaded);
+    let mut moved = None;
+    for name in [ATTEMPT_RECORD, COMPLETION_STAGE, COMPLETED_RECORD] {
+        let source = root.join(name);
+        match fs::symlink_metadata(&source) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Could not inspect {name}: {error}")),
+            Ok(_) => {}
+        }
+        let stem = name.strip_suffix(".json").unwrap_or(name);
+        let aside = root.join(format!("{stem}.unverified-{attempt_id}.json"));
+        if fs::symlink_metadata(&aside).is_ok() {
+            return Err(format!("{} already exists.", aside.display()));
+        }
+        fs::rename(&source, &aside)
+            .map_err(|error| format!("Could not set {name} aside: {error}"))?;
+        moved.get_or_insert(aside);
+    }
+    check(&root)?;
+    moved.ok_or_else(|| "No update attempt state was present.".to_owned())
+}
+
+/// Compile-time identity of the running binary, supplied by the caller so this
+/// module keeps no `env!` dependency of its own.
+#[cfg(target_os = "macos")]
+pub(crate) struct CompiledIdentity {
+    pub(crate) desktop_version: &'static str,
+    pub(crate) product_version: &'static str,
+    pub(crate) runtime_manifest_sha256: &'static str,
+}
+
 fn normalize_absolute(path: &Path) -> Result<PathBuf, String> {
     if path
         .components()
@@ -1465,7 +1529,6 @@ mod durable {
             self.record.owner_pid
         }
 
-        #[cfg(test)]
         pub(crate) fn attempt_id(&self) -> &str {
             &self.record.attempt_id
         }
@@ -2032,6 +2095,97 @@ mod durable {
             assert!(loaded.matches_target(&fixture.target()));
             assert!(check(&fixture.root).is_err());
             assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn a_build_without_an_updater_sets_aside_only_the_attempt_that_installed_it() {
+            let fixture = Fixture::new();
+            let compiled = |desktop: &'static str| super::super::CompiledIdentity {
+                desktop_version: desktop,
+                product_version: "2.0.0-beta.10",
+                runtime_manifest_sha256:
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            };
+            // Nothing pending: nothing to set aside, nothing changes.
+            assert!(super::super::set_aside_unverifiable(
+                &fixture.root,
+                &fixture.app,
+                &compiled("1.1.0")
+            )
+            .is_err());
+            let journal = Journal::open(&fixture.root).unwrap();
+            let mut attempt = journal.begin(fixture.target()).unwrap();
+            // An install permit (not yet installed) must stay blocked.
+            assert!(super::super::set_aside_unverifiable(
+                &fixture.root,
+                &fixture.app,
+                &compiled("1.1.0")
+            )
+            .is_err());
+            assert!(check(&fixture.root).is_err());
+            attempt
+                .record_installed(&ProofProjection::for_target(&fixture.target()))
+                .unwrap();
+            drop(attempt);
+            drop(journal);
+            // A different binary, bundle path or payload cannot claim the attempt.
+            for (app, identity) in [
+                (fixture.app.clone(), compiled("1.0.0")),
+                (fixture.temp.join("Other.app"), compiled("1.1.0")),
+                (
+                    fixture.app.clone(),
+                    super::super::CompiledIdentity {
+                        runtime_manifest_sha256:
+                            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                        ..compiled("1.1.0")
+                    },
+                ),
+            ] {
+                let error =
+                    after_descriptor_release(|| {
+                        match super::super::set_aside_unverifiable(&fixture.root, &app, &identity) {
+                            Err(message) if message.contains("another journal owner") => {
+                                Err(message)
+                            }
+                            other => Ok(other),
+                        }
+                    });
+                assert!(error.is_err(), "{app:?}");
+                assert!(check(&fixture.root).is_err());
+            }
+            // The exact installed successor: the record is renamed, not deleted,
+            // startup is admitted, and a second call has nothing to do.
+            let aside = after_descriptor_release(|| {
+                match super::super::set_aside_unverifiable(
+                    &fixture.root,
+                    &fixture.app,
+                    &compiled("1.1.0"),
+                ) {
+                    Err(message) if message.contains("another journal owner") => Err(message),
+                    other => Ok(other),
+                }
+            })
+            .unwrap();
+            assert!(check(&fixture.root).is_ok());
+            assert!(!fixture.record().exists());
+            assert!(aside
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("desktop-update-attempt.unverified-"));
+            assert!(fs::metadata(&aside).unwrap().len() > 0);
+            assert!(super::super::set_aside_unverifiable(
+                &fixture.root,
+                &fixture.app,
+                &compiled("1.1.0")
+            )
+            .is_err());
+            assert!(Journal::open(&fixture.root)
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_none());
         }
 
         #[test]
