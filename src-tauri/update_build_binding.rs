@@ -186,6 +186,16 @@ pub fn validate(package: &PackageMetadata, inputs: &BuildInputs) -> Result<Build
     reject_control_fields(inputs)?;
 
     let mode = match inputs.mode.as_deref() {
+        // A release-profile macOS bundle is what the updater lane ships. Falling
+        // back to `disabled` there produced beta.13: a valid signed update whose
+        // successor could not verify its own installation. Silence is not consent;
+        // a manual-install build must say `disabled` explicitly.
+        None if inputs.target_os == "macos" && !inputs.debug => {
+            return Err(
+                "GJC_UPDATE_MODE is required for a release macOS build: set production for an updater release or disabled for a manual-install build"
+                    .to_owned(),
+            );
+        }
         None => UpdateMode::Disabled,
         Some(UPDATE_MODE_DISABLED) => UpdateMode::Disabled,
         Some(UPDATE_MODE_PRODUCTION) => UpdateMode::Production,

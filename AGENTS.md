@@ -34,6 +34,11 @@ job projection protocol). `scripts/` holds build/release/verify tooling.
 - Server binds loopback by default (fail-closed; it can run shell commands).
   `SERVER_PORT` defaults to 3001, Vite dev on 5173. Do not export `SERVER_PORT=0`.
 - Tauri builds choke on `CI=1`: use `env -u CI npm run tauri -- build`.
+- A release-profile macOS build refuses to guess its updater mode: set
+  `GJC_UPDATE_MODE=disabled` for ad-hoc/manual bundles, or the full production
+  binding (`GJC_UPDATE_MODE=production`, `GJC_UPDATE_FEED_ORIGIN`,
+  `GJC_UPDATE_PUBKEY`) for anything the updater will ship. See
+  `scripts/release/MACOS-ACCEPTANCE.md`.
 - **Desktop scope (owner decision, 2026-09-09): macOS (Apple Silicon) first.**
   The Linux desktop app is out of active development until the macOS app is
   complete. Do not plan, build, smoke, or gate work on Linux desktop packages;
@@ -55,7 +60,7 @@ npm run verify           # FULL GATE: audit + typecheck + check:core + test + li
 npm run test:e2e:gjc     # 7 GJC wire/browser e2e tests (separate from npm test)
 npm run desktop:dev      # Tauri dev shell
 npm run server:payload:macos # embedded macOS server payload + sidecar (prerequisite for src-tauri cargo test)
-env -u CI npm run tauri -- build --bundles app # ad-hoc macOS app bundle (unsigned)
+GJC_UPDATE_MODE=disabled env -u CI npm run tauri -- build --bundles app # ad-hoc macOS app bundle (unsigned, no updater)
 npm run server:payload:linux # Linux x64 self-host payload + pinned runtimes
 # Linux desktop (out of scope; owner request only): env -u CI npm run desktop:build:linux,
 # then npm run smoke:packaged-server -- --linux-root <extracted-dir> [--data-survival|--appimage-env]

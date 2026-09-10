@@ -79,6 +79,10 @@ jobs:
           env -u CI cargo test --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Build ad-hoc Tauri app bundle
+        # A pull-request bundle is never shipped through the updater. The mode
+        # is explicit because a release build refuses to guess it.
+        env:
+          GJC_UPDATE_MODE: disabled
         run: env -u CI npm run tauri -- build --bundles app
 
       - name: Inspect the assembled bundle

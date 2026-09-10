@@ -275,7 +275,19 @@ jobs:
           echo "Signing as: $IDENTITY"
 
       - name: Build Tauri app bundle (Tauri's own ad-hoc pass)
-        run: env -u CI npm run tauri -- build --bundles app
+        # This bundle becomes the signed updater archive, so it must compile the
+        # production updater in. The public key is repository configuration,
+        # not a secret; the build fails if it is absent or not the pinned key.
+        env:
+          GJC_UPDATE_MODE: production
+          GJC_UPDATE_FEED_ORIGIN: https://api.github.com
+          GJC_UPDATE_PUBKEY: ${{ vars.GJC_UPDATE_PUBKEY }}
+        run: |
+          set -euo pipefail
+          test -n "${GJC_UPDATE_PUBKEY:-}" || { echo "Repository variable GJC_UPDATE_PUBKEY is required for an updater release." >&2; exit 1; }
+          env -u CI npm run tauri -- build --bundles app
+          APP="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Gajae Code App.app"
+          test "$("$APP/Contents/MacOS/gajae-app-desktop" --desktop-build-info | node -pe 'JSON.parse(require("fs").readFileSync(0)).updateMode')" = production
 
       - name: Sign the bundle with the Developer ID
         if: steps.identity.outputs.signed == 'true'

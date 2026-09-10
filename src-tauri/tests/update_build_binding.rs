@@ -91,7 +91,7 @@ fn inputs(temp_root: &Path) -> BuildInputs {
         target_os: "macos".into(),
         debug: false,
         feed_origin: None,
-        mode: None,
+        mode: Some(UPDATE_MODE_DISABLED.into()),
         pubkey: None,
         qa_root: None,
         temp_root: Some(temp_root.to_owned()),
@@ -119,6 +119,37 @@ fn qa_inputs(temp_root: &Path, qa_root: PathBuf) -> BuildInputs {
         pubkey: Some(key_config()),
         qa_root: Some(qa_root),
         temp_root: Some(temp_root.to_owned()),
+    }
+}
+
+#[test]
+fn release_macos_builds_must_name_their_updater_mode() {
+    let temp = TempRoot::new();
+    // beta.13 regression: an unset mode silently produced a disabled updater
+    // inside a release bundle that the updater lane then shipped.
+    let unset = BuildInputs {
+        mode: None,
+        ..inputs(&temp.0)
+    };
+    let error = binding::validate(&package(), &unset).unwrap_err();
+    assert!(error.contains("GJC_UPDATE_MODE is required"), "{error}");
+    // Debug and non-macOS builds keep the implicit disabled default.
+    for implicit in [
+        BuildInputs {
+            mode: None,
+            debug: true,
+            ..inputs(&temp.0)
+        },
+        BuildInputs {
+            mode: None,
+            target_os: "linux".into(),
+            ..inputs(&temp.0)
+        },
+    ] {
+        assert_eq!(
+            binding::validate(&package(), &implicit).unwrap().mode,
+            UpdateMode::Disabled
+        );
     }
 }
 

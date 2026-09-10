@@ -40,7 +40,7 @@ do not establish Linux package or GUI compatibility.
 cd ~/workspace/gajae-code-app
 npm ci
 npm run server:payload:macos            # darwin-arm64 Node payload + externalBin
-env -u CI npm run tauri -- build --bundles app # ad-hoc .app bundle
+GJC_UPDATE_MODE=disabled env -u CI npm run tauri -- build --bundles app # ad-hoc .app bundle (no updater)
 npm run desktop:dmg:macos               # headless functional DMG via hdiutil + sha256
 ```
 
@@ -522,7 +522,7 @@ security find-identity -v -p codesigning        # must list that identity
 export GITHUB_TOKEN="$(gh auth token)"          # see note below
 
 npm run server:payload:macos
-env -u CI npm run tauri -- build --bundles app  # Tauri's own ad-hoc pass
+GJC_UPDATE_MODE=disabled env -u CI npm run tauri -- build --bundles app  # Tauri's own ad-hoc pass
 npm run desktop:sign:macos                      # re-signs everything with the identity
 
 # 1. notarize the app, so a copied-out .app carries its own ticket
