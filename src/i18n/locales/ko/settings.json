@@ -21,7 +21,8 @@
       "discoveryFailed": "릴리즈 탐색에 실패했습니다.",
       "cacheInvalid": "캐시된 업데이트를 검증하지 못했습니다.",
       "preparationCancelled": "업데이트 준비가 취소되었습니다.",
-      "preferencesNotPersisted": "업데이트 자동 확인 설정을 저장하지 못했습니다."
+      "preferencesNotPersisted": "업데이트 자동 확인 설정을 저장하지 못했습니다.",
+      "discoveryRateLimited": "GitHub 익명 API 요청 한도에 도달했습니다. 한도가 초기화되면 다음 확인이 자동으로 실행됩니다."
     },
     "title": "데스크톱 업데이트",
     "connecting": "데스크톱 업데이트에 연결하는 중…",

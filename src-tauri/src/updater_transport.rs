@@ -60,6 +60,10 @@ pub struct BoundedResponse {
     pub body: Vec<u8>,
     pub location: Option<String>,
     pub retry_after: Option<String>,
+    /// GitHub primary rate-limit metadata. Neither header is authority for a
+    /// request; they only lengthen the wait before the next scheduled attempt.
+    pub ratelimit_remaining: Option<String>,
+    pub ratelimit_reset: Option<String>,
 }
 
 /// Return bounded metadata without following redirects. The preparation owner
@@ -92,6 +96,8 @@ pub async fn fetch_response(
     let status = response.status();
     let location = bounded_header(response.headers(), "location", 4096)?;
     let retry_after = bounded_header(response.headers(), "retry-after", 128)?;
+    let ratelimit_remaining = bounded_header(response.headers(), "x-ratelimit-remaining", 32)?;
+    let ratelimit_reset = bounded_header(response.headers(), "x-ratelimit-reset", 32)?;
     // Error/redirect bodies are not needed to make the policy decision.
     // Dropping them also avoids buffering arbitrary error-page content.
     let body = if status.is_success() {
@@ -104,6 +110,8 @@ pub async fn fetch_response(
         body,
         location,
         retry_after,
+        ratelimit_remaining,
+        ratelimit_reset,
     })
 }
 

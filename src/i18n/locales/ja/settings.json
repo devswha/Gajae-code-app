@@ -21,7 +21,8 @@
       "discoveryFailed": "リリースの検索に失敗しました。",
       "cacheInvalid": "キャッシュされた更新の検証に失敗しました。",
       "preparationCancelled": "更新の準備がキャンセルされました。",
-      "preferencesNotPersisted": "更新の自動確認設定を保存できませんでした。"
+      "preferencesNotPersisted": "更新の自動確認設定を保存できませんでした。",
+      "discoveryRateLimited": "GitHub の匿名 API 上限に達しました。上限がリセットされると次回の確認が自動的に実行されます。"
     },
     "title": "デスクトップの更新",
     "connecting": "デスクトップ更新に接続中…",

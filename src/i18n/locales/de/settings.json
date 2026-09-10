@@ -21,7 +21,8 @@
       "discoveryFailed": "Die Release-Suche ist fehlgeschlagen.",
       "cacheInvalid": "Das zwischengespeicherte Update hat die Prüfung nicht bestanden.",
       "preparationCancelled": "Die Update-Vorbereitung wurde abgebrochen.",
-      "preferencesNotPersisted": "Die Einstellung für automatische Prüfungen konnte nicht gespeichert werden."
+      "preferencesNotPersisted": "Die Einstellung für automatische Prüfungen konnte nicht gespeichert werden.",
+      "discoveryRateLimited": "Das anonyme API-Limit von GitHub wurde erreicht. Die nächste Prüfung läuft automatisch, sobald das Limit zurückgesetzt wird."
     },
     "title": "Desktop-Updates",
     "connecting": "Verbindung zur Desktop-Aktualisierung…",

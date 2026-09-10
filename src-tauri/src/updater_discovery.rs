@@ -461,7 +461,15 @@ impl Budget {
             )?));
         }
         if matches!(response.status.as_u16(), 403 | 429 | 503) {
-            return Err(DiscoveryError::RetryAfter(Duration::from_secs(60)));
+            // GitHub's primary limit sends no Retry-After; blind 60s retries
+            // would poll a rejected endpoint for up to an hour.
+            let delay = rate_limit_reset(
+                response.ratelimit_remaining.as_deref(),
+                response.ratelimit_reset.as_deref(),
+                SystemTime::now(),
+            )
+            .unwrap_or(Duration::from_secs(60));
+            return Err(DiscoveryError::RetryAfter(delay));
         }
         Ok(response)
     }
@@ -1095,6 +1103,33 @@ fn retry_after(value: &str, now: SystemTime) -> Result<Duration, DiscoveryError>
     Ok(Duration::from_secs(seconds.max(1)))
 }
 
+/// Wait for an exhausted GitHub primary rate limit. Only an explicit
+/// `remaining: 0` with a plausible epoch reset lengthens the delay; anything
+/// else keeps the caller's default. The wait is bounded like Retry-After.
+fn rate_limit_reset(
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    now: SystemTime,
+) -> Option<Duration> {
+    if remaining? != "0" {
+        return None;
+    }
+    let reset = reset?;
+    if reset.is_empty() || reset.len() > 20 || !reset.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let reset = UNIX_EPOCH + Duration::from_secs(reset.parse::<u64>().ok()?);
+    let seconds = reset
+        .duration_since(now)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(1);
+    if seconds > MAX_RETRY_AFTER.as_secs() {
+        return None;
+    }
+    Some(Duration::from_secs(seconds.max(1)))
+}
+
 fn http_date(value: &str) -> Result<SystemTime, DiscoveryError> {
     let b = value.as_bytes();
     if b.len() != 29
@@ -1178,6 +1213,8 @@ mod tests {
         body: Vec<u8>,
         location: Option<String>,
         retry_after: Option<String>,
+        ratelimit_remaining: Option<String>,
+        ratelimit_reset: Option<String>,
     }
 
     impl Reply {
@@ -1187,6 +1224,8 @@ mod tests {
                 body: body.into(),
                 location: None,
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset: None,
             }
         }
 
@@ -1196,6 +1235,8 @@ mod tests {
                 body: vec![],
                 location: Some(location.into()),
                 retry_after: None,
+                ratelimit_remaining: None,
+                ratelimit_reset: None,
             }
         }
     }
@@ -1260,6 +1301,8 @@ mod tests {
                     body: reply.body,
                     location: reply.location,
                     retry_after: reply.retry_after,
+                    ratelimit_remaining: reply.ratelimit_remaining,
+                    ratelimit_reset: reply.ratelimit_reset,
                 })
             })
         }
@@ -1830,6 +1873,65 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_primary_rate_limit_waits_for_its_reset_instead_of_polling_every_minute() {
+        let policy = policy(Channel::Beta);
+        let fake = Fake::default();
+        // GitHub's primary limit answers 403 without Retry-After but with
+        // x-ratelimit-remaining: 0 and an epoch reset (observed 2026-09-10).
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1800;
+        let mut reply = Reply::ok(vec![]);
+        reply.status = 403;
+        reply.ratelimit_remaining = Some("0".into());
+        reply.ratelimit_reset = Some(reset.to_string());
+        let listing = policy.wire_url(&policy.api("?per_page=30&page=1"));
+        fake.set(&listing, reply);
+        let mut cursor = DiscoveryCursor::default();
+        let result = burst(&fake, &policy, &mut cursor);
+        assert_eq!(
+            result.completeness,
+            DiscoveryCompleteness::Incomplete(IncompleteReason::RetryAfter)
+        );
+        let delay = result.retry_after.unwrap();
+        assert!(delay > Duration::from_secs(1790) && delay <= Duration::from_secs(1801));
+        // The scheduler-side wait is honored without another request.
+        let calls = fake.calls().len();
+        burst(&fake, &policy, &mut cursor);
+        assert_eq!(fake.calls().len(), calls);
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_789_021_000);
+        assert_eq!(
+            rate_limit_reset(Some("0"), Some("1789021009"), now),
+            Some(Duration::from_secs(10))
+        );
+        // Remaining quota, a past reset, or malformed values keep the default.
+        assert_eq!(rate_limit_reset(Some("12"), Some("1789021009"), now), None);
+        assert_eq!(rate_limit_reset(None, Some("1789021009"), now), None);
+        assert_eq!(
+            rate_limit_reset(Some("0"), Some("1789020000"), now),
+            Some(Duration::from_secs(1))
+        );
+        for invalid in [
+            "",
+            "-1",
+            "1.5",
+            "abc",
+            "999999999999999999999",
+            "1789200000",
+        ] {
+            assert_eq!(rate_limit_reset(Some("0"), Some(invalid), now), None);
+        }
+        let mut plain = Reply::ok(vec![]);
+        plain.status = 403;
+        fake.set(&listing, plain);
+        let result = burst(&fake, &policy, &mut DiscoveryCursor::default());
+        assert_eq!(result.retry_after, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
     fn interrupted_manifest_page_resumes_without_restarting_completed_assets() {
         let policy = policy(Channel::Beta);
         let fake = Fake::default();
@@ -1842,9 +1944,8 @@ mod tests {
             &policy.api("/assets/21"),
             Reply {
                 status: 503,
-                body: vec![],
-                location: None,
                 retry_after: Some("10".into()),
+                ..Reply::ok(vec![])
             },
         );
         let mut cursor = DiscoveryCursor::default();

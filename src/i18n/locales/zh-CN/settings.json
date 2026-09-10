@@ -21,7 +21,8 @@
       "discoveryFailed": "发行版搜索失败。",
       "cacheInvalid": "缓存的更新未通过验证。",
       "preparationCancelled": "更新准备已取消。",
-      "preferencesNotPersisted": "无法保存自动检查更新设置。"
+      "preferencesNotPersisted": "无法保存自动检查更新设置。",
+      "discoveryRateLimited": "已达到 GitHub 匿名 API 请求上限。上限重置后将自动执行下一次检查。"
     },
     "title": "桌面更新",
     "connecting": "正在连接桌面更新服务…",

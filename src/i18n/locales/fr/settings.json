@@ -21,7 +21,8 @@
       "discoveryFailed": "La recherche des versions a échoué.",
       "cacheInvalid": "La validation de la mise à jour en cache a échoué.",
       "preparationCancelled": "La préparation de la mise à jour a été annulée.",
-      "preferencesNotPersisted": "Le réglage des vérifications automatiques n’a pas pu être enregistré."
+      "preferencesNotPersisted": "Le réglage des vérifications automatiques n’a pas pu être enregistré.",
+      "discoveryRateLimited": "La limite d’API anonyme de GitHub a été atteinte. La prochaine vérification s’exécutera automatiquement après la réinitialisation de la limite."
     },
     "title": "Mises à jour du bureau",
     "connecting": "Connexion au service de mise à jour…",

@@ -765,6 +765,13 @@ async fn discover(
             return Err(PrepareError::Cancelled);
         }
         restore_target(&mut control);
+        // A throttled listing is neither idle nor an error: name the wait so a
+        // manual check inside the server's window is not a silent no-op.
+        if result.completeness
+            == DiscoveryCompleteness::Incomplete(updater_discovery::IncompleteReason::RetryAfter)
+        {
+            control.snapshot.reason = Some("discovery_rate_limited");
+        }
         return Ok((incomplete, result.retry_after));
     };
     offer(owner, generation, selected)?;
@@ -1143,6 +1150,52 @@ mod tests {
                 automatic
             );
         }
+    }
+
+    #[test]
+    fn throttled_discovery_names_the_wait_and_blocks_manual_checks_until_reset() {
+        let (_temp, owner) = active_owner(true);
+        let (generation, work) = owner.claim_work(Instant::now()).unwrap();
+        assert!(matches!(work, Work::Check));
+        let result = tauri::async_runtime::block_on(discover(&owner, generation, async {
+            Ok(updater_discovery::DiscoveryResult {
+                selected: None,
+                completeness: DiscoveryCompleteness::Incomplete(
+                    updater_discovery::IncompleteReason::RetryAfter,
+                ),
+                pages_observed: 0,
+                retry_after: Some(Duration::from_secs(1800)),
+            })
+        }));
+        assert!(!owner.finish_work(generation, result));
+        let snapshot = owner.snapshot();
+        assert_eq!(snapshot.phase, Phase::Idle);
+        assert!(snapshot.discovery_incomplete);
+        assert_eq!(snapshot.reason, Some("discovery_rate_limited"));
+        // A click inside the server's window is refused, not silently retried.
+        owner.manual_check().unwrap();
+        assert!(owner.claim_work(Instant::now()).is_none());
+        let (generation, work) = owner
+            .claim_work(Instant::now() + Duration::from_secs(1801))
+            .unwrap();
+        assert!(matches!(work, Work::Check));
+        // The next check clears the throttle reason before it runs.
+        owner.phase(generation, Phase::Checking).unwrap();
+        assert_eq!(owner.snapshot().reason, None);
+        let result = tauri::async_runtime::block_on(discover(&owner, generation, async {
+            Ok(updater_discovery::DiscoveryResult {
+                selected: None,
+                completeness: DiscoveryCompleteness::Incomplete(
+                    updater_discovery::IncompleteReason::PageBudget,
+                ),
+                pages_observed: 3,
+                retry_after: None,
+            })
+        }));
+        owner.finish_work(generation, result);
+        let snapshot = owner.snapshot();
+        assert!(snapshot.discovery_incomplete);
+        assert_eq!(snapshot.reason, None);
     }
 
     #[test]

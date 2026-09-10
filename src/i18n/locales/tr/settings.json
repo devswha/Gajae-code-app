@@ -21,7 +21,8 @@
       "discoveryFailed": "Sürüm araması başarısız oldu.",
       "cacheInvalid": "Önbellekteki güncelleme doğrulanamadı.",
       "preparationCancelled": "Güncelleme hazırlığı iptal edildi.",
-      "preferencesNotPersisted": "Otomatik denetim ayarı kaydedilemedi."
+      "preferencesNotPersisted": "Otomatik denetim ayarı kaydedilemedi.",
+      "discoveryRateLimited": "GitHub anonim API sınırına ulaşıldı. Sınır sıfırlandığında bir sonraki denetim otomatik olarak çalışır."
     },
     "title": "Masaüstü güncellemeleri",
     "connecting": "Masaüstü güncelleyicisine bağlanılıyor…",

@@ -15,7 +15,14 @@ notice immediately above Settings in the bottom-left sidebar.
 3. After signature/archive verification, the same document requests one
    target-bound safe restart. Draft sealing, backend admission, owned-process
    shutdown, installation journal and successor health gates remain mandatory.
-4. Busy work, target changes, connection loss, errors and unknown state stop
+4. Discovery is an anonymous GitHub API client and shares the per-IP primary
+   limit (60 requests/hour) with every other anonymous caller on the network.
+   An exhausted limit answers 403 with `x-ratelimit-remaining: 0`; the check
+   then waits for `x-ratelimit-reset` instead of polling every minute, the
+   snapshot reports `discovery_rate_limited`, and a manual check inside that
+   window is refused rather than retried. Rate-limited responses do not
+   consume quota, so the wait ends at the reset.
+5. Busy work, target changes, connection loss, errors and unknown state stop
    that UI attempt. There is no automatic restart retry when work later ends.
    Rate-limited clicks are rejected without queueing a hidden download; retry
    requires another user click after the limit expires.

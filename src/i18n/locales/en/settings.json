@@ -21,7 +21,8 @@
       "discoveryFailed": "Release discovery failed.",
       "cacheInvalid": "The cached update failed validation.",
       "preparationCancelled": "Update preparation was cancelled.",
-      "preferencesNotPersisted": "The automatic check setting could not be saved."
+      "preferencesNotPersisted": "The automatic check setting could not be saved.",
+      "discoveryRateLimited": "GitHub's anonymous API limit was reached. The next check runs automatically after the limit resets."
     },
     "title": "Desktop updates",
     "connecting": "Connecting to the desktop updater…",

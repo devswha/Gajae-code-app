@@ -11,6 +11,7 @@ const REASON_KEYS: Record<string, string> = {
   cache_invalid: 'desktopUpdate.reasons.cacheInvalid',
   preparation_cancelled: 'desktopUpdate.reasons.preparationCancelled',
   preferences_not_persisted: 'desktopUpdate.reasons.preferencesNotPersisted',
+  discovery_rate_limited: 'desktopUpdate.reasons.discoveryRateLimited',
 };
 
 export function desktopUpdateControls(update: Props['update']) {

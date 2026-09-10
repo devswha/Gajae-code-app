@@ -21,7 +21,8 @@
       "discoveryFailed": "La ricerca delle versioni non è riuscita.",
       "cacheInvalid": "La verifica dell’aggiornamento nella cache non è riuscita.",
       "preparationCancelled": "La preparazione dell’aggiornamento è stata annullata.",
-      "preferencesNotPersisted": "Non è stato possibile salvare l’impostazione dei controlli automatici."
+      "preferencesNotPersisted": "Non è stato possibile salvare l’impostazione dei controlli automatici.",
+      "discoveryRateLimited": "È stato raggiunto il limite dell’API anonima di GitHub. Il prossimo controllo verrà eseguito automaticamente dopo il ripristino del limite."
     },
     "title": "Aggiornamenti desktop",
     "connecting": "Connessione al servizio di aggiornamento…",
