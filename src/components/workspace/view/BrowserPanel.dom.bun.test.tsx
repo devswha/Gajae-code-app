@@ -14,7 +14,13 @@ const originalCreateObjectURL = URL.createObjectURL;
 const originalRevokeObjectURL = URL.revokeObjectURL;
 const originalBounds = HTMLElement.prototype.getBoundingClientRect;
 const originalResizeObserver = globalThis.ResizeObserver;
+const originalDevicePixelRatio = window.devicePixelRatio;
+const originalClipboard = navigator.clipboard;
+const originalClipboardItem = globalThis.ClipboardItem;
 const sockets: TestSocket[] = [];
+class TestClipboardItem {
+  constructor(readonly data: Record<string, unknown>) {}
+}
 class TestSocket {
   binaryType = '';
   onopen: (() => void) | null = null;
@@ -56,6 +62,9 @@ afterEach(() => {
   URL.revokeObjectURL = originalRevokeObjectURL;
   HTMLElement.prototype.getBoundingClientRect = originalBounds;
   globalThis.ResizeObserver = originalResizeObserver;
+  Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: originalDevicePixelRatio });
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: originalClipboard });
+  Object.defineProperty(globalThis, 'ClipboardItem', { configurable: true, value: originalClipboardItem });
   sockets.length = 0;
 });
 
@@ -192,6 +201,228 @@ test('a new connection resends the viewport even for the same tab and size', asy
   inputs.length = 0;
   act(() => { sockets[1].state('a', 'Same tab'); sockets[1].onopen?.(); });
   await waitFor(() => assert.deepEqual(inputs, [{ kind: 'viewport', width: 400, height: 300 }]));
+});
+
+test('viewport sync sends a bounded device scale factor while keeping CSS dimensions', async () => {
+  const { inputs, capture } = viewportHarness();
+  Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2.5 });
+  installFetch(capture);
+  render(createElement(BrowserPanel, { sessionId: 'a' }));
+  await screen.findByLabelText('Web address');
+  act(() => sockets[0].state('a', 'Retina page'));
+  await waitFor(() => assert.deepEqual(inputs, [{
+    kind: 'viewport',
+    width: 400,
+    height: 300,
+    deviceScaleFactor: 2,
+  }]));
+});
+
+test('Ctrl and Cmd clipboard shortcuts bridge text only from the focused browser surface', async () => {
+  const inputs: Record<string, unknown>[] = [];
+  let resolveSelection!: (response: Response) => void;
+  const localText = 'paste from host';
+  const writes: ClipboardItem[] = [];
+  Object.defineProperty(globalThis, 'ClipboardItem', { configurable: true, value: TestClipboardItem });
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      readText: async () => localText,
+      write: async (items: ClipboardItem[]) => { writes.push(...items); },
+    },
+  });
+  installFetch((url, init) => {
+    if (!url.endsWith('/input')) return undefined;
+    const input = (JSON.parse(String(init?.body)) as { input: Record<string, unknown> }).input;
+    inputs.push(input);
+    if (input.kind === 'clipboard' && input.event === 'read') {
+      return new Promise((resolve) => { resolveSelection = resolve; });
+    }
+    return Promise.resolve(new Response(JSON.stringify(
+      input.event === 'delete' ? { accepted: true, deleted: true } : { accepted: true },
+    )));
+  });
+  render(createElement(BrowserPanel, { sessionId: 'a' }));
+  await screen.findByLabelText('Web address');
+  act(() => sockets[0].state('a', 'Clipboard page'));
+  const surface = document.querySelector('[tabindex="0"]') as HTMLElement;
+  const address = screen.getByLabelText('Web address');
+
+  fireEvent.keyDown(surface, { key: 'c', code: 'KeyC', ctrlKey: true });
+  assert.equal(writes.length, 1, 'ClipboardItem write starts during the keyboard activation');
+  assert.deepEqual(inputs[0], { kind: 'clipboard', event: 'read', tabId: 'tab' });
+  await act(async () => resolveSelection(new Response(JSON.stringify({
+    accepted: true,
+    text: 'remote copy',
+    editable: true,
+    selectionId: 'selection-1',
+  }))));
+  fireEvent.keyUp(surface, { key: 'Control', code: 'ControlLeft' });
+  assert.equal(screen.queryByRole('alert'), null);
+
+  fireEvent.keyDown(address, { key: 'c', code: 'KeyC', ctrlKey: true });
+  assert.equal(inputs.length, 1, 'address input shortcuts stay local');
+
+  fireEvent.keyDown(surface, { key: 'x', code: 'KeyX', metaKey: true });
+  await act(async () => resolveSelection(new Response(JSON.stringify({
+    accepted: true,
+    text: 'remote cut',
+    editable: true,
+    selectionId: 'selection-2',
+  }))));
+  await waitFor(() => assert.deepEqual(inputs.at(-1), {
+    kind: 'clipboard',
+    event: 'delete',
+    tabId: 'tab',
+    text: 'remote cut',
+    selectionId: 'selection-2',
+  }));
+  fireEvent.keyUp(surface, { key: 'Meta', code: 'MetaLeft' });
+
+  fireEvent.keyDown(surface, { key: 'v', code: 'KeyV', ctrlKey: true });
+  await waitFor(() => assert.deepEqual(inputs.at(-1), {
+    kind: 'clipboard',
+    event: 'paste',
+    tabId: 'tab',
+    text: 'paste from host',
+  }));
+  fireEvent.keyUp(surface, { key: 'Control', code: 'ControlLeft' });
+});
+
+test('mixed clipboard and editing shortcuts keep the remote modifier lifecycle balanced', async () => {
+  const inputs: Record<string, unknown>[] = [];
+  Object.defineProperty(globalThis, 'ClipboardItem', { configurable: true, value: TestClipboardItem });
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { write: async () => {}, readText: async () => '' },
+  });
+  installFetch((url, init) => {
+    if (!url.endsWith('/input')) return undefined;
+    const input = (JSON.parse(String(init?.body)) as { input: Record<string, unknown> }).input;
+    inputs.push(input);
+    if (input.kind === 'clipboard' && input.event === 'read') {
+      return Promise.resolve(new Response(JSON.stringify({
+        accepted: true,
+        text: 'selected',
+        editable: true,
+        selectionId: 'selection-1',
+      })));
+    }
+    return Promise.resolve(new Response('{"accepted":true}'));
+  });
+  render(createElement(BrowserPanel, { sessionId: 'a' }));
+  await screen.findByLabelText('Web address');
+  act(() => sockets[0].state('a', 'Modifier lifecycle'));
+  const surface = document.querySelector('[tabindex="0"]') as HTMLElement;
+  const keyInputs = () => inputs.filter((input) => input.kind === 'key');
+
+  fireEvent.keyDown(surface, { key: 'Meta', code: 'MetaLeft', metaKey: true });
+  fireEvent.keyDown(surface, { key: 'a', code: 'KeyA', metaKey: true });
+  fireEvent.keyUp(surface, { key: 'a', code: 'KeyA', metaKey: true });
+  fireEvent.keyDown(surface, { key: 'ㅊ', code: 'KeyC', metaKey: true });
+  fireEvent.keyUp(surface, { key: 'ㅊ', code: 'KeyC', metaKey: true });
+  fireEvent.keyUp(surface, { key: 'Meta', code: 'MetaLeft' });
+  await waitFor(() => assert.deepEqual(keyInputs(), [
+    { kind: 'key', event: 'down', key: 'Meta', code: 'MetaLeft', modifiers: 4 },
+    { kind: 'key', event: 'down', key: 'a', code: 'KeyA', modifiers: 4 },
+    { kind: 'key', event: 'up', key: 'a', code: 'KeyA', modifiers: 4 },
+    { kind: 'key', event: 'up', key: 'Meta', code: 'MetaLeft', modifiers: 4 },
+  ]));
+
+  inputs.length = 0;
+  fireEvent.keyDown(surface, { key: 'Meta', code: 'MetaLeft', metaKey: true });
+  fireEvent.keyDown(surface, { key: 'ㅊ', code: 'KeyC', metaKey: true });
+  fireEvent.keyUp(surface, { key: 'ㅊ', code: 'KeyC', metaKey: true });
+  fireEvent.keyDown(surface, { key: 'a', code: 'KeyA', metaKey: true });
+  fireEvent.keyUp(surface, { key: 'a', code: 'KeyA', metaKey: true });
+  fireEvent.keyUp(surface, { key: 'Meta', code: 'MetaLeft' });
+  await waitFor(() => assert.deepEqual(keyInputs(), [
+    { kind: 'key', event: 'down', key: 'Meta', code: 'MetaLeft', modifiers: 4 },
+    { kind: 'key', event: 'down', key: 'a', code: 'KeyA', modifiers: 4 },
+    { kind: 'key', event: 'up', key: 'a', code: 'KeyA', modifiers: 4 },
+    { kind: 'key', event: 'up', key: 'Meta', code: 'MetaLeft', modifiers: 4 },
+  ]));
+  assert.equal(inputs.some((input) => input.kind === 'key' && input.key === 'ㅊ'), false);
+});
+
+test('an empty remote selection rejects the pending clipboard item without cutting or replacing local text', async () => {
+  const inputs: Record<string, unknown>[] = [];
+  let resolveSelection!: (response: Response) => void;
+  let itemTextPromise!: Promise<Blob>;
+  let writeStarted = false;
+  let localClipboard = 'existing local clipboard';
+  Object.defineProperty(globalThis, 'ClipboardItem', { configurable: true, value: TestClipboardItem });
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      readText: async () => localClipboard,
+      write: async (items: TestClipboardItem[]) => {
+        writeStarted = true;
+        itemTextPromise = items[0].data['text/plain'] as Promise<Blob>;
+        const blob = await itemTextPromise;
+        localClipboard = await blob.text();
+      },
+    },
+  });
+  installFetch((url, init) => {
+    if (!url.endsWith('/input')) return undefined;
+    const input = (JSON.parse(String(init?.body)) as { input: Record<string, unknown> }).input;
+    inputs.push(input);
+    if (input.kind === 'clipboard' && input.event === 'read') {
+      return new Promise((resolve) => { resolveSelection = resolve; });
+    }
+    return Promise.resolve(new Response('{"accepted":true}'));
+  });
+  render(createElement(BrowserPanel, { sessionId: 'a' }));
+  await screen.findByLabelText('Web address');
+  act(() => sockets[0].state('a', 'Empty selection'));
+  const surface = document.querySelector('[tabindex="0"]') as HTMLElement;
+  fireEvent.keyDown(surface, { key: 'x', code: 'KeyX', ctrlKey: true });
+  assert.equal(writeStarted, true, 'the clipboard write starts during the transient keyboard activation');
+  await act(async () => resolveSelection(new Response(JSON.stringify({
+    accepted: true,
+    text: '',
+    editable: true,
+    selectionId: 'selection-empty',
+  }))));
+  await assert.rejects(itemTextPromise, /browser_clipboard_no_selection/);
+  await waitFor(() => assert.equal(inputs.some((input) => input.event === 'delete'), false));
+  assert.equal(localClipboard, 'existing local clipboard');
+  assert.equal(screen.queryByRole('alert'), null, 'the expected no-selection result is not surfaced as an error');
+});
+
+test('failed local clipboard writes leave the remote selection untouched and show the error', async () => {
+  const inputs: Record<string, unknown>[] = [];
+  let resolveSelection!: (response: Response) => void;
+  Object.defineProperty(globalThis, 'ClipboardItem', { configurable: true, value: TestClipboardItem });
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      write: async () => { throw new Error('Clipboard permission denied.'); },
+      readText: async () => '',
+    },
+  });
+  installFetch((url, init) => {
+    if (!url.endsWith('/input')) return undefined;
+    const input = (JSON.parse(String(init?.body)) as { input: Record<string, unknown> }).input;
+    inputs.push(input);
+    return input.event === 'read'
+      ? new Promise((resolve) => { resolveSelection = resolve; })
+      : Promise.resolve(new Response('{"accepted":true}'));
+  });
+  render(createElement(BrowserPanel, { sessionId: 'a' }));
+  await screen.findByLabelText('Web address');
+  act(() => sockets[0].state('a', 'Clipboard failure'));
+  const surface = document.querySelector('[tabindex="0"]') as HTMLElement;
+  fireEvent.keyDown(surface, { key: 'x', code: 'KeyX', ctrlKey: true });
+  await act(async () => resolveSelection(new Response(JSON.stringify({
+    accepted: true,
+    text: 'must remain selected',
+    editable: true,
+    selectionId: 'selection-1',
+  }))));
+  await waitFor(() => assert.match(screen.getByRole('alert').textContent ?? '', /permission denied/i));
+  assert.equal(inputs.some((input) => input.event === 'delete'), false);
 });
 
 test('click mapping follows the loaded frame, not the pending viewport resize or next frame', async () => {

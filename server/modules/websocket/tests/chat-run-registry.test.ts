@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 
-import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
+import { closeConnection, initializeDatabase, projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
 import { connectedClients } from '@/modules/websocket/services/websocket-state.service.js';
 
@@ -121,6 +121,23 @@ describe('chat run event protocol', () => {
       assert.deepEqual(framesOf(socket, 'session_upserted').map(({ sessionId, providerSessionId }) => ({ sessionId, providerSessionId })), [
         { sessionId: 'mapping', providerSessionId: 'native-7' },
       ]);
+    });
+  });
+
+  test('publishes archived project state without suppressing the upsert', async () => {
+    await openDatabase(async () => {
+      const { run, socket } = createRun('archived-project');
+      connectedClients.add(socket as never);
+      projectsDb.updateProjectIsArchived('/workspace/demo', true);
+
+      run.writer.send({ kind: 'session_created', provider: 'gjc', sessionId: 'native-archived', newSessionId: 'native-archived' });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const frames = framesOf(socket, 'session_upserted');
+      assert.equal(frames.length, 1);
+      const archivedProject = frames[0]?.project as { isArchived?: unknown } | null | undefined;
+      assert.equal(typeof archivedProject?.isArchived, 'boolean');
+      assert.equal(archivedProject?.isArchived, true);
     });
   });
 

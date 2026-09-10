@@ -168,6 +168,97 @@ test('session upserts write directly to the project cache', async () => {
   }
 });
 
+test('archived project upserts leave the active cache alone while new projects are inserted', async () => {
+  const fetch = installFetch([{ body: [project()] }]);
+  try {
+    const harness = renderHarness();
+    await waitFor(() => assert.equal(harness.getState().projects.length, 1));
+
+    act(() => harness.emit({
+      kind: 'session_upserted',
+      sessionId: 'archived-session',
+      provider: 'gjc',
+      session: { id: 'archived-session', summary: 'Archived update' },
+      project: {
+        projectId: 'project-archived',
+        path: '/workspace/archived',
+        fullPath: '/workspace/archived',
+        displayName: 'Archived project',
+        isStarred: false,
+        isArchived: true,
+      },
+      timestamp: new Date().toISOString(),
+    } as ServerEvent));
+    assert.deepEqual(harness.getState().projects.map((item) => item.projectId), ['project-1']);
+
+    act(() => harness.emit({
+      kind: 'session_upserted',
+      sessionId: 'new-session',
+      provider: 'gjc',
+      session: { id: 'new-session', summary: 'New project update' },
+      project: {
+        projectId: 'project-new',
+        path: '/workspace/new',
+        fullPath: '/workspace/new',
+        displayName: 'New project',
+        isStarred: false,
+        isArchived: false,
+      },
+      timestamp: new Date().toISOString(),
+    } as ServerEvent));
+    await waitFor(() => assert.deepEqual(harness.getState().projects.map((item) => item.projectId), ['project-1', 'project-new']));
+    assert.deepEqual(harness.getState().projects[1]?.sessions?.map((session) => session.id), ['new-session']);
+  } finally {
+    fetch.restore();
+  }
+});
+
+test('an archived upsert removes a stale cached row without dropping the selected project', async () => {
+  const fetch = installFetch([{ body: [project()] }]);
+  try {
+    const harness = renderHarness();
+    await waitFor(() => assert.equal(harness.getState().projects.length, 1));
+    await waitFor(() => assert.equal(harness.getState().selectedProject?.projectId, 'project-1'));
+
+    act(() => harness.emit({
+      kind: 'session_upserted',
+      sessionId: 'archived-session',
+      provider: 'gjc',
+      session: { id: 'archived-session', summary: 'Archived update' },
+      project: {
+        projectId: 'project-1',
+        path: '/workspace/project',
+        fullPath: '/workspace/project',
+        displayName: 'Project one',
+        isStarred: false,
+        isArchived: true,
+      },
+      timestamp: new Date().toISOString(),
+    } as ServerEvent));
+
+    await waitFor(() => assert.equal(harness.getState().projects.length, 0));
+    assert.equal(harness.getState().selectedProject?.projectId, 'project-1');
+    assert.equal(harness.getState().selectedProject?.isArchived, true);
+    assert.equal(harness.getState().selectedProject?.sessions?.[0]?.id, 'archived-session');
+
+    const archivedProject = harness.getState().selectedProject;
+    assert.ok(archivedProject);
+    act(() => {
+      harness.getState().registerOptimisticSession({
+        sessionId: 'archived-optimistic',
+        provider: 'gjc',
+        project: archivedProject,
+        summary: 'Archived optimistic update',
+      });
+    });
+    assert.equal(harness.getState().projects.length, 0);
+    assert.equal(harness.getState().selectedProject?.isArchived, true);
+    assert.equal(harness.getState().selectedSession?.id, 'archived-optimistic');
+  } finally {
+    fetch.restore();
+  }
+});
+
 test('an upsert carrying an origin promotes the cached project so the sidebar can show it', async () => {
   // The indexer had only discovered the repo ('auto', hidden); a workspace
   // descend registered it as explicit on the server and the session landed.

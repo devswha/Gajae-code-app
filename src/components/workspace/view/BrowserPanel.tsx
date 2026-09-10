@@ -37,7 +37,80 @@ type BrowserPanelProps = {
   onNavigationHandled?: () => void;
 };
 
+type BrowserInputResponse = {
+  accepted?: boolean;
+  text?: string;
+  editable?: boolean;
+  selectionId?: string;
+  deleted?: boolean;
+};
+
+type ClipboardShortcut = {
+  key: 'c' | 'x' | 'v';
+  modifier: 'Control' | 'Meta';
+};
+
+type PendingModifier = {
+  key: 'Control' | 'Meta';
+  code: string;
+  flushed: boolean;
+};
+
 const COMMON_LOCAL_URLS = ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:4173', 'http://localhost:8000'];
+const DEFAULT_BROWSER_DEVICE_SCALE_FACTOR = 1;
+const MAX_BROWSER_DEVICE_SCALE_FACTOR = 2;
+
+function browserDeviceScaleFactor(): number {
+  const value = typeof window === 'undefined' ? DEFAULT_BROWSER_DEVICE_SCALE_FACTOR : window.devicePixelRatio;
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_BROWSER_DEVICE_SCALE_FACTOR;
+  return Math.min(
+    Math.max(Math.round(value * 100) / 100, DEFAULT_BROWSER_DEVICE_SCALE_FACTOR),
+    MAX_BROWSER_DEVICE_SCALE_FACTOR,
+  );
+}
+
+function clipboardShortcutKey(event: Pick<KeyboardEvent<HTMLDivElement>, 'code' | 'key'>): ClipboardShortcut['key'] | null {
+  if (event.code === 'KeyC') return 'c';
+  if (event.code === 'KeyX') return 'x';
+  if (event.code === 'KeyV') return 'v';
+  const key = event.key.toLowerCase();
+  return key === 'c' || key === 'x' || key === 'v' ? key : null;
+}
+
+function modifierBit(key: PendingModifier['key']): number {
+  return key === 'Control' ? 2 : 4;
+}
+
+async function readLocalClipboard(): Promise<string> {
+  if (typeof navigator === 'undefined' || !navigator.clipboard?.readText) {
+    throw new Error('Clipboard read is unavailable in this browser.');
+  }
+  return navigator.clipboard.readText();
+}
+
+const NO_BROWSER_SELECTION = 'browser_clipboard_no_selection';
+
+function isNoBrowserSelectionError(error: unknown): boolean {
+  return error instanceof Error && error.message === NO_BROWSER_SELECTION;
+}
+
+function writeRemoteClipboard(selectionPromise: Promise<BrowserInputResponse>): Promise<void> {
+  if (typeof navigator === 'undefined' || !navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+    return Promise.reject(new Error('Clipboard write is unavailable in this browser.'));
+  }
+  const textPromise = selectionPromise.then((selection) => {
+    if (selection.text === '') throw new Error(NO_BROWSER_SELECTION);
+    if (typeof selection.text !== 'string') throw new Error('The browser returned no clipboard text.');
+    return new Blob([selection.text], { type: 'text/plain' });
+  });
+  const item = new ClipboardItem({ 'text/plain': textPromise });
+  // Start the write synchronously for transient user activation, while also
+  // awaiting the representation promise so a missing selection cannot commit
+  // (or become an unhandled rejection in a host clipboard shim).
+  const writePromise = navigator.clipboard.write([item]);
+  void writePromise.catch(() => {});
+  return textPromise.then(() => writePromise).then(() => undefined);
+}
 
 async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -71,9 +144,13 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
   const frameRef = useRef<HTMLImageElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const frameViewportRef = useRef<BrowserViewportSize>(DEFAULT_BROWSER_VIEWPORT);
-  const sentViewportRef = useRef<BrowserViewportSize | null>(null);
+  const sentViewportRef = useRef<(BrowserViewportSize & { deviceScaleFactor: number }) | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const pointerFrameRef = useRef<number | null>(null);
+  const clipboardShortcutRef = useRef<ClipboardShortcut | null>(null);
+  const pendingModifierRef = useRef<PendingModifier | null>(null);
+  const clipboardGenerationRef = useRef(0);
+  const activeTabIdRef = useRef<string | null>(null);
   const acceptFramesRef = useRef(false);
   const handledNavigationRef = useRef<number | null>(null);
 
@@ -206,12 +283,17 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
           sessionId?: string;
           tabId?: string;
           mimeType?: string;
-          metadata?: { deviceWidth?: unknown; deviceHeight?: unknown };
+          metadata?: {
+            cssWidth?: unknown;
+            cssHeight?: unknown;
+            deviceWidth?: unknown;
+            deviceHeight?: unknown;
+          };
         };
         if (header.type !== 'frame' || header.sessionId !== sessionId) return;
         const frameViewport = normalizeBrowserViewport(
-          header.metadata?.deviceWidth,
-          header.metadata?.deviceHeight,
+          header.metadata?.cssWidth ?? header.metadata?.deviceWidth,
+          header.metadata?.cssHeight ?? header.metadata?.deviceHeight,
         );
         const nextUrl = URL.createObjectURL(new Blob([packet.slice(4 + headerLength)], { type: header.mimeType ?? 'image/jpeg' }));
         replaceFrameUrl(nextUrl, frameViewport ?? DEFAULT_BROWSER_VIEWPORT, header.tabId);
@@ -272,15 +354,66 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
     }
   }, [sessionId, t]);
 
-  const sendInput = useCallback((input: Record<string, unknown>) => {
-    void jsonRequest(`/api/browser/${encodeURIComponent(sessionId)}/input`, {
+  const requestInput = useCallback((input: Record<string, unknown>) => jsonRequest<BrowserInputResponse>(
+    `/api/browser/${encodeURIComponent(sessionId)}/input`,
+    {
       method: 'POST',
       body: JSON.stringify({ input }),
-    }).catch((nextError) => setError(nextError instanceof Error ? nextError.message : t('workspace.browser.error')));
-  }, [sessionId, t]);
+    },
+  ), [sessionId]);
+
+  const sendInput = useCallback((input: Record<string, unknown>) => {
+    void requestInput(input).catch((nextError) => {
+      setError(nextError instanceof Error ? nextError.message : t('workspace.browser.error'));
+    });
+  }, [requestInput, t]);
 
   const activeTabId = activeTab?.id ?? null;
+  activeTabIdRef.current = activeTabId;
   const previewReady = Boolean(status?.supported && (status.browser.installed || state));
+  useEffect(() => {
+    clipboardGenerationRef.current += 1;
+    return () => { clipboardGenerationRef.current += 1; };
+  }, [sessionId]);
+
+  const clipboardAction = useCallback(async (action: ClipboardShortcut['key']) => {
+    if (!activeTabId) return;
+    const tabId = activeTabId;
+    const generation = clipboardGenerationRef.current;
+    const targetStillFocused = () => generation === clipboardGenerationRef.current && tabId === activeTabIdRef.current;
+    try {
+      if (action === 'v') {
+        const text = await readLocalClipboard();
+        if (text && targetStillFocused()) await requestInput({ kind: 'clipboard', event: 'paste', tabId, text });
+        return;
+      }
+      const selectionPromise = requestInput({
+        kind: 'clipboard',
+        event: 'read',
+        tabId,
+      });
+      await writeRemoteClipboard(selectionPromise);
+      const selection = await selectionPromise;
+      if (!selection.text) return;
+      if (action === 'x' && selection.editable && selection.selectionId && targetStillFocused()) {
+        const deletion = await requestInput({
+          kind: 'clipboard',
+          event: 'delete',
+          tabId,
+          text: selection.text,
+          selectionId: selection.selectionId,
+        });
+        if (!deletion.deleted) {
+          throw new Error('The browser selection changed before cut completed.');
+        }
+      }
+    } catch (nextError) {
+      if (!isNoBrowserSelectionError(nextError)) {
+        setError(nextError instanceof Error ? nextError.message : t('workspace.browser.error'));
+      }
+    }
+  }, [activeTabId, requestInput, t]);
+
   useEffect(() => {
     const surface = surfaceRef.current;
     if (!surface || !activeTabId) return undefined;
@@ -291,17 +424,26 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
       timer = setTimeout(() => {
         const bounds = surface.getBoundingClientRect();
         const viewport = normalizeBrowserViewport(bounds.width, bounds.height);
+        const deviceScaleFactor = browserDeviceScaleFactor();
         const previous = sentViewportRef.current;
-        if (!viewport || (previous?.width === viewport.width && previous.height === viewport.height)) return;
-        sentViewportRef.current = viewport;
-        sendInput({ kind: 'viewport', ...viewport });
+        if (!viewport || (previous?.width === viewport.width
+          && previous.height === viewport.height
+          && previous.deviceScaleFactor === deviceScaleFactor)) return;
+        sentViewportRef.current = { ...viewport, deviceScaleFactor };
+        sendInput({
+          kind: 'viewport',
+          ...viewport,
+          ...(deviceScaleFactor === DEFAULT_BROWSER_DEVICE_SCALE_FACTOR ? {} : { deviceScaleFactor }),
+        });
       }, 80);
     };
     syncViewport();
     const observer = new ResizeObserver(syncViewport);
     observer.observe(surface);
+    window.addEventListener('resize', syncViewport);
     return () => {
       observer.disconnect();
+      window.removeEventListener('resize', syncViewport);
       if (timer) clearTimeout(timer);
     };
   }, [activeTabId, connection, previewReady, sendInput]);
@@ -331,7 +473,38 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.nativeEvent.isComposing) return;
+    if (event.nativeEvent.isComposing || event.target !== event.currentTarget) return;
+    if (event.key === 'Control' || event.key === 'Meta') {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!event.repeat && pendingModifierRef.current?.key !== event.key) {
+        pendingModifierRef.current = { key: event.key, code: event.code, flushed: false };
+      }
+      return;
+    }
+    const key = clipboardShortcutKey(event);
+    const modifier = event.metaKey ? 'Meta' : event.ctrlKey ? 'Control' : null;
+    if (modifier && !event.altKey && !event.shiftKey && key) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.repeat) return;
+      clipboardShortcutRef.current = { key, modifier };
+      void clipboardAction(key);
+      return;
+    }
+    const pendingModifier = pendingModifierRef.current;
+    if (pendingModifier) {
+      if (!pendingModifier.flushed) {
+        pendingModifier.flushed = true;
+        sendInput({
+          kind: 'key',
+          event: 'down',
+          key: pendingModifier.key,
+          code: pendingModifier.code,
+          modifiers: modifierBit(pendingModifier.key),
+        });
+      }
+    }
     if (event.metaKey || event.ctrlKey || event.altKey || event.key.length !== 1) {
       event.preventDefault();
       sendInput({ kind: 'key', event: 'down', key: event.key, code: event.code, modifiers: (event.altKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.metaKey ? 4 : 0) | (event.shiftKey ? 8 : 0) });
@@ -342,6 +515,35 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
   };
 
   const handleKeyUp = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return;
+    const clipboardShortcut = clipboardShortcutRef.current;
+    const releasedShortcutKey = clipboardShortcutKey(event);
+    if (clipboardShortcut && releasedShortcutKey === clipboardShortcut.key) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (event.key === 'Control' || event.key === 'Meta') {
+      const pendingModifier = pendingModifierRef.current?.key === event.key
+        ? pendingModifierRef.current
+        : null;
+      const clipboardModifier = clipboardShortcut?.modifier === event.key;
+      if (!pendingModifier && !clipboardModifier) return;
+      event.preventDefault();
+      event.stopPropagation();
+      pendingModifierRef.current = null;
+      clipboardShortcutRef.current = null;
+      if (pendingModifier?.flushed) {
+        sendInput({
+          kind: 'key',
+          event: 'up',
+          key: pendingModifier.key,
+          code: pendingModifier.code,
+          modifiers: modifierBit(pendingModifier.key),
+        });
+      }
+      return;
+    }
     if (!event.metaKey && !event.ctrlKey && !event.altKey && event.key.length === 1) return;
     event.preventDefault();
     sendInput({
@@ -455,6 +657,10 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onKeyUp={handleKeyUp}
+        onBlur={() => {
+          clipboardShortcutRef.current = null;
+          pendingModifierRef.current = null;
+        }}
         className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-background outline-hidden focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset"
       >
         {frameUrl ? (
@@ -526,7 +732,7 @@ function BrowserSession({ sessionId, navigationRequest, onNavigationHandled }: B
           </div>
         )}
       </div>
-      {error && <div className="max-h-24 shrink-0 overflow-auto border-t border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-xs break-words text-destructive">{error}</div>}
+      {error && <div role="alert" className="max-h-24 shrink-0 overflow-auto border-t border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-xs break-words text-destructive">{error}</div>}
       {status?.cua && (
         <div className="flex shrink-0 items-center justify-between border-t border-border/60 px-2.5 py-1 text-[10px] text-muted-foreground">
           <span>{t('workspace.browser.cua')}</span>
