@@ -71,6 +71,21 @@ reported `published` for release ID `386022482`. A separate API read confirmed
 download URL (macOS DMG, Linux server archive, beta.12 Linux desktop
 packages, checksums) returned HTTP 200.
 
+## First public A-to-B observation
+
+The installed beta.12 (launched 14:37:29 KST, after publication) showed
+"Waiting for the next check / Release discovery is incomplete" and its
+**Check for updates** button did nothing. Cause: the anonymous GitHub API
+primary limit for this network's public IP was exhausted
+(`403`, `x-ratelimit-remaining: 0`, reset 15:16:49 KST) before the app's first
+check. beta.12 maps that to `RetryAfter(60s)` with no reason and refuses manual
+checks inside the window. The release itself was proven eligible by running the
+native discovery code against the live listing and manifests
+(`selected v2.0.0-beta.13 / 0.2.7`, complete scan). Follow-ups on `main`:
+`7c57956` waits for `x-ratelimit-reset` and reports `discovery_rate_limited`;
+`e2f761e` makes unchanged checks free with `If-None-Match` and a per-process
+manifest cache. Neither is in the beta.13 binary.
+
 ## Limitations
 
 - Public beta.12 to beta.13 in-app update is not yet observed; the sidebar
