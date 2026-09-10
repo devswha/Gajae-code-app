@@ -73,17 +73,17 @@ fn content(screen: &Screen) -> Value {
     let (kind, en_heading, ko_heading, en_body, ko_body) = match screen {
         Screen::Checking => (
             "checking",
-            "Checking the update".to_owned(),
-            "업데이트 확인 중".to_owned(),
-            format!("Verifying the {PRODUCT_NAME} update before installation. Keep this window open."),
-            format!("설치 전에 {PRODUCT_NAME} 업데이트를 확인하고 있습니다. 이 창을 열어 두세요."),
+            "Finishing the update".to_owned(),
+            "업데이트를 마무리하는 중".to_owned(),
+            format!("Verifying the {PRODUCT_NAME} update before installation. This takes a moment; the app opens by itself."),
+            format!("설치 전에 {PRODUCT_NAME} 업데이트를 확인하고 있습니다. 잠시 후 앱이 자동으로 열립니다."),
         ),
         Screen::Applying => (
             "applying",
-            "Applying the update".to_owned(),
+            "Installing the update".to_owned(),
             "업데이트 설치 중".to_owned(),
-            format!("Updating {PRODUCT_NAME}. Keep this window open while installation is in progress."),
-            format!("{PRODUCT_NAME}을(를) 업데이트하고 있습니다. 설치가 진행되는 동안 이 창을 열어 두세요."),
+            format!("Installing the new {PRODUCT_NAME}. Keep this window open; it closes and reopens on its own."),
+            format!("새 {PRODUCT_NAME}을(를) 설치하고 있습니다. 이 창을 열어 두세요. 설치가 끝나면 자동으로 닫혔다가 다시 열립니다."),
         ),
         Screen::Restarting => (
             "restarting",
@@ -94,10 +94,10 @@ fn content(screen: &Screen) -> Value {
         ),
         Screen::Recovery { .. } => (
             "recovery",
-            "Manual recovery is required".to_owned(),
-            "수동 복구가 필요합니다".to_owned(),
-            "The update result could not be confirmed. App startup is paused. No automatic retry or rollback will be attempted.".to_owned(),
-            "업데이트 결과를 확인할 수 없어 앱 시작을 중단했습니다. 자동으로 재시도하거나 이전 버전으로 되돌리지 않습니다.".to_owned(),
+            "The update could not be finished".to_owned(),
+            "업데이트를 마무리하지 못했습니다".to_owned(),
+            "The update result could not be confirmed, so the app stopped safely instead of guessing. No automatic retry or rollback will be attempted.".to_owned(),
+            "업데이트 결과를 확인할 수 없어 앱이 안전하게 멈췄습니다. 자동으로 재시도하거나 이전 버전으로 되돌리지 않습니다.".to_owned(),
         ),
     };
     let announce_authorization = matches!(screen, Screen::Checking | Screen::Applying);
@@ -117,7 +117,7 @@ fn content(screen: &Screen) -> Value {
             )),
             "data": recovery.then_some("Your existing user data is kept. Do not delete it during recovery."),
             "manual": recovery.then(|| format!(
-                "Quit {PRODUCT_NAME}, then manually reinstall it using a trusted official installer. If startup is still blocked, contact support for manual recovery."
+                "To continue: quit {PRODUCT_NAME} and manually reinstall it from the official download page. Your projects and settings are picked up as they were. If startup is still blocked, contact support for manual recovery."
             )),
             "details": "Diagnostic details (not instructions)",
         },
@@ -129,7 +129,7 @@ fn content(screen: &Screen) -> Value {
             )),
             "data": recovery.then_some("기존 사용자 데이터는 보존됩니다. 복구 중에도 사용자 데이터를 삭제하지 마세요."),
             "manual": recovery.then(|| format!(
-                "{PRODUCT_NAME}을(를) 종료한 다음, 신뢰할 수 있는 공식 설치 파일로 직접 재설치하세요. 계속 시작이 차단되면 지원팀에 수동 복구를 문의하세요."
+                "계속 사용하려면 {PRODUCT_NAME}을(를) 종료한 뒤 공식 다운로드 페이지의 설치 파일로 직접 재설치하세요. 프로젝트와 설정은 그대로 이어집니다. 계속 시작이 차단되면 지원팀에 수동 복구를 문의하세요."
             )),
             "details": "진단 정보(실행 지침이 아님)",
         },
