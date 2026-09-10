@@ -9,6 +9,13 @@ startup. beta.12 clients are offered 0.2.8 directly; beta.13 users need one
 manual DMG. PR #53 is merged; PR #44 (Windows) stays open with conflicts. See
 [RELEASE-BETA14-ACCEPTANCE.md](RELEASE-BETA14-ACCEPTANCE.md).
 
+Post-beta.14 follow-ups (2026-09-10): the updater key backup is now staged in
+iCloud Drive with hash-verified copies and recovery instructions
+(`scripts/release/UPDATER-KEY-CUSTODY.md`; restore/sign/verify test and an
+off-Mac password record remain owner-gated), and the website no longer
+advertises the Linux desktop app (deb/AppImage links removed; the Linux
+server archive stays).
+
 **Installed: v2.0.0-beta.12 / desktop 0.2.6**, source `48fffce`.
 Release `385189777` contains the signed/notarized macOS DMG and click-update
 archive/manifest plus same-source Linux server/desktop artifacts. The installed
@@ -96,11 +103,19 @@ app is complete. Consequences, all landed the same day:
   failure; "Get earlier / Get all messages" stay reachable while
   `hasMoreMessages`; pointer-down stops following only on the scrollbar
   track; scroll anchor re-observes only on row-set change; dead locale keys
-  and `sliceTailPage` removed. Known follow-ups: per-(path,size,mtime)
-  index cache for the three-pass read; measure a ~2k-row fully loaded
-  session now that `content-visibility` is gone.
+  and `sliceTailPage` removed. Both known follow-ups closed 2026-09-10:
+  the provider now keeps a 16-entry LRU lineage+descriptor index cache per
+  (path,size,mtime) — warm page reads skip the lineage/index passes
+  (measured 24 ms cold → 4-5 ms warm on a 1 MB / 2.2k-row transcript) — and
+  the ~2k-row fully loaded session was measured headless (Chrome for
+  Testing 152, 1440×900): 550 turns / ~2.2k visible rows / 21.7k DOM nodes
+  load in ~0.6 s with two longtasks (longest 527 ms at the load-all commit),
+  then scroll top→bottom (159k px) with zero frames over 50 ms (max 17 ms)
+  and 64 MB JS heap. Caveat: rows were plain text; syntax-highlight-heavy
+  sessions were not measured.
 - **CLA gap:** `@snowykr` has six merged PRs (#25, #27, #28, #35, #41, #43)
-  and no entry under `CLA.md` § Signatories; a request is on #43.
+  and no entry under `CLA.md` § Signatories; a request is on #43, and a
+  reminder was posted there 2026-09-10. Waiting on the contributor.
 - Still open: #44 (owner's draft Windows preview branch, 72 files,
   conflicting, 128 commits behind main, pinned at beta.9) and #3 (needs
   Cursor/Anthropic live skill qualification, which the owner excluded).

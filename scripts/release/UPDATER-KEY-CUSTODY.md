@@ -38,17 +38,23 @@ app change, or final release acceptance. The release verifier must still use
 official Minisign 0.12 as required by `LOCAL-RELEASE.md`. The original provisioning
 proof preceded the beta.12 publication recorded above.
 
-## Independent recovery backup remains pending
+## Independent recovery backup — partial (2026-09-10)
 
-The key and Keychain password currently reside on one Mac. A second folder on
-that Mac is not an independent backup. No external destination was selected,
-no external key copy was created, and no restore test was claimed.
+The encrypted private key, public key and recovery instructions were copied to
+iCloud Drive at `~/Library/Mobile Documents/com~apple~CloudDocs/gajae-release-backup/`
+(mode 700; key files mode 600) with a `SHA256SUMS` manifest. Copied bytes hash-match
+the source files (`updater.key` `22d01b6b…f4a45`, `updater.key.pub` `f4ac38b7…83e26`).
+The key file itself stays password-encrypted; no password is stored beside it.
 
-The operator must select encrypted external storage and retain the encrypted
-private key, matching public key and recovery instructions there. The password
-must also remain recoverable independently of this Mac, without storing it in
-plaintext beside the key. Verify copied bytes and a restore/sign/verify test
-before marking backup complete; never overwrite the original to test recovery.
+Still owner-gated before this backup counts as complete:
+
+- A restore/sign/verify test FROM the backup copy (official Tauri CLI sign +
+  Minisign 0.12 verify), which needs the Keychain password interactively. Never
+  overwrite the original to test recovery.
+- Recording the password in a password store independent of this Mac (the
+  Keychain item alone dies with the Mac).
+- Optionally a second destination (encrypted USB) if iCloud is not considered
+  sufficiently independent.
 
 Local key provisioning is now ready. Independent backup and remaining
 authorization/recovery/minimum-OS/public-release gates are still open. Do not
