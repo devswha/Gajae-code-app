@@ -123,7 +123,7 @@ export function renderLandingPage() {
             <div class="download-row" id="linux-download" tabindex="-1" role="region" aria-labelledby="linux-download-title">
               <div>
                 <h3 id="linux-download-title">Linux desktop</h3>
-                <p>x86_64 · Ubuntu 22.04 / 24.04</p>
+                <p>v${DOWNLOADS.linuxDesktopVersion} · x86_64 · Ubuntu 22.04 / 24.04</p>
                 <p>Node.js and Bun included.</p>
                 <a class="quiet-link" href="${DOCS_LINUX_INSTALL_URL}">Linux installation guide</a>
               </div>

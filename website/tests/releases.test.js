@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   DOWNLOADS,
+  LINUX_DESKTOP_RELEASE,
   RELEASE,
   RELEASES_URL,
   buildDownloads,
@@ -15,19 +16,19 @@ import {
 } from '../src/releases.js';
 
 /**
- * Reviewed public-release fixture: promote this with the verified beta.12 assets.
+ * Reviewed public-release fixture: promote this with the verified beta.13 assets.
  * A local/test candidate can advance package.json before publication; coupling
  * the page to that version would advertise download URLs that do not exist.
  * Update this fixture with RELEASE only after verifying the new public assets.
  */
-const publishedVersion = '2.0.0-beta.12';
+const publishedVersion = '2.0.0-beta.13';
+/** Last release that published Linux desktop packages (built on owner request only). */
+const linuxDesktopVersion = '2.0.0-beta.12';
 
 test('pins the published release and its GitHub URLs independently of local candidates', () => {
   assert.equal(RELEASE.version, publishedVersion);
   assert.equal(RELEASE.tag, `v${publishedVersion}`);
   assert.equal(desktopDmgName(), `gajae-app-desktop-${publishedVersion}-macos-arm64.dmg`);
-  assert.equal(desktopDebName(), `gajae-app-desktop-${publishedVersion}-linux-x64.deb`);
-  assert.equal(desktopAppImageName(), `gajae-app-desktop-${publishedVersion}-linux-x64.AppImage`);
   assert.equal(serverArchiveName(), `gajae-app-server-${publishedVersion}-linux-x64-node22.tar.gz`);
   assert.equal(
     downloadUrl(desktopDmgName()),
@@ -40,14 +41,19 @@ test('pins the published release and its GitHub URLs independently of local cand
   assert.match(DOWNLOADS.macosArm64.verifyCommand, /shasum -a 256 -c /);
 });
 
-test('publishes both Linux desktop formats with a matching checksum and verification command', () => {
+test('pins both Linux desktop formats to the last release that shipped them', () => {
+  assert.equal(LINUX_DESKTOP_RELEASE.version, linuxDesktopVersion);
+  assert.equal(LINUX_DESKTOP_RELEASE.tag, `v${linuxDesktopVersion}`);
+  assert.equal(DOWNLOADS.linuxDesktopVersion, linuxDesktopVersion);
+  assert.equal(desktopDebName(), `gajae-app-desktop-${linuxDesktopVersion}-linux-x64.deb`);
+  assert.equal(desktopAppImageName(), `gajae-app-desktop-${linuxDesktopVersion}-linux-x64.AppImage`);
   for (const [key, fileName] of [
     ['linuxDeb', desktopDebName()],
     ['linuxAppImage', desktopAppImageName()],
   ]) {
     const download = DOWNLOADS[key];
     assert.equal(download.label, fileName);
-    assert.equal(download.href, `${RELEASES_URL}/download/${RELEASE.tag}/${fileName}`);
+    assert.equal(download.href, `${RELEASES_URL}/download/${LINUX_DESKTOP_RELEASE.tag}/${fileName}`);
     assert.equal(download.checksumHref, `${download.href}.sha256`);
     assert.equal(download.checksumFile, `${fileName}.sha256`);
     assert.equal(download.verifyCommand, `sha256sum --check ${fileName}.sha256`);
@@ -56,7 +62,7 @@ test('publishes both Linux desktop formats with a matching checksum and verifica
 
 test('keeps every artifact and checksum on the supplied release when the version changes', () => {
   const release = { version: '9.9.9-test', tag: 'v9.9.9-test' };
-  const downloads = buildDownloads(release);
+  const downloads = buildDownloads(release, release);
   assert.equal(downloads.tagUrl, `${RELEASES_URL}/tag/${release.tag}`);
   for (const [key, suffix] of [
     ['macosArm64', 'desktop-9.9.9-test-macos-arm64.dmg'],
